@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hero-gnn"
+version = "0.1.0"
+description = "Heterophily-aware Evidence Reasoning over Fraud Graphs"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "pandas",
+  "scikit-learn",
+  "networkx",
+  "pyyaml",
+  "tqdm",
+  "torch",
+]
+
+[project.optional-dependencies]
+text = ["sentence-transformers"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = [
+  "src",
+  "src.data",
+  "src.features",
+  "src.graph",
+  "src.llm",
+  "src.models",
+  "src.training",
+  "src.utils",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+

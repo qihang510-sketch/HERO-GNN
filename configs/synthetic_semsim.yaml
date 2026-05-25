@@ -1,0 +1,19 @@
+experiment:
+  name: synthetic_semsim
+  seed: 42
+dataset:
+  name: synthetic
+  processed_dir: data/processed/synthetic
+  num_nodes: 200
+  num_edges: 800
+  feature_dim: 16
+model:
+  name: semsim_gnn
+  hidden_dim: 64
+  semantic_similarity: cosine
+training:
+  epochs: 10
+  lr: 0.001
+outputs:
+  root: outputs
+

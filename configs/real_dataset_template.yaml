@@ -1,0 +1,23 @@
+experiment:
+  name: real_dataset_template
+  seed: 42
+dataset:
+  name: yelp_academic
+  raw_dir: data/raw/yelp_academic
+  processed_dir: data/processed/yelp_academic
+  label_type: proxy
+features:
+  text_encoder: bag_of_words
+  optional_text_encoder: sentence-transformers
+model:
+  name: hero_gnn
+  hidden_dim: 64
+  use_heterophily: true
+  use_mechanism: true
+  use_chain: true
+training:
+  epochs: 10
+  lr: 0.001
+outputs:
+  root: outputs
+

@@ -1,0 +1,20 @@
+experiment:
+  name: synthetic_hero_wo_chain
+  seed: 42
+dataset:
+  name: synthetic
+  processed_dir: data/processed/synthetic
+  num_nodes: 200
+  num_edges: 800
+  feature_dim: 16
+model:
+  name: hero_wo_chain
+  hidden_dim: 64
+  use_heterophily: true
+  use_mechanism: true
+  use_chain: false
+training:
+  epochs: 10
+  lr: 0.001
+outputs:
+  root: outputs

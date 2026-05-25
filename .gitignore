@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+data/raw/
+data/processed/
+data/synthetic/
+*.json.gz
+*.gz
+*.zip
+*.tar
+*.tar.gz
+
+# Outputs
+outputs/checkpoints/
+outputs/logs/
+outputs/results/
+outputs/explanations/
+outputs/summary/
+
+# Model and cache
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.pkl
+*.pickle
+
+# OS
+.DS_Store
+Thumbs.db
