@@ -1,33 +1,45 @@
-# Python
+# Python cache
 __pycache__/
 *.pyc
 .pytest_cache/
-.venv/
-venv/
-.env
 
 # IDE
 .vscode/
 .idea/
 
-# Data
-data/raw/
-data/processed/
-data/synthetic/
+# Environment
+.venv/
+venv/
+.env
+
+# Data: ignore contents but keep directory structure
+data/raw/**
+!data/raw/
+!data/raw/**/
+!data/raw/**/.gitkeep
+
+data/processed/**
+!data/processed/
+!data/processed/**/
+!data/processed/**/.gitkeep
+
+data/synthetic/**
+!data/synthetic/
+!data/synthetic/**/
+!data/synthetic/**/.gitkeep
+
+# Outputs: ignore contents but keep directory structure
+outputs/**
+!outputs/
+!outputs/**/
+!outputs/**/.gitkeep
+
+# Large artifacts
 *.json.gz
 *.gz
 *.zip
 *.tar
 *.tar.gz
-
-# Outputs
-outputs/checkpoints/
-outputs/logs/
-outputs/results/
-outputs/explanations/
-outputs/summary/
-
-# Model and cache
 *.pt
 *.pth
 *.ckpt
