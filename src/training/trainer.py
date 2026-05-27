@@ -86,6 +86,26 @@ def _hero_variant_flags(model_name: str) -> dict[str, bool]:
     }
 
 
+def _hero_branch_masks(model_name: str) -> dict[str, int]:
+    if model_name == "hero_gnn":
+        values = (1, 1, 1, 1, 1)
+    elif model_name == "hero_wo_chain":
+        values = (1, 1, 1, 1, 0)
+    elif model_name == "hero_wo_hetero":
+        values = (1, 1, 0, 0, 0)
+    elif model_name == "hero_wo_mechanism":
+        values = (1, 1, 1, 0, 1)
+    else:
+        values = (0, 0, 0, 0, 0)
+    return {
+        "branch_mask_target": values[0],
+        "branch_mask_homo": values[1],
+        "branch_mask_hetero": values[2],
+        "branch_mask_mechanism": values[3],
+        "branch_mask_chain": values[4],
+    }
+
+
 def train_single_experiment(
     dataset: str = "synthetic",
     model_name: str = "mlp",
@@ -140,6 +160,7 @@ def train_single_experiment(
     print(f"[TRAIN-INFO] dataset={dataset} model={model_name} seed={seed}")
     print(f"[TRAIN-INFO] train_pos={class_stats['train_num_pos']} train_neg={class_stats['train_num_neg']} pos_weight={pos_weight:.6f}")
     variant_flags = _hero_variant_flags(model_name)
+    branch_masks = _hero_branch_masks(model_name)
     if model_name in HERO_MODEL_NAMES:
         variant_message = (
             f"[VARIANT] model={model_name} "
@@ -237,6 +258,7 @@ def train_single_experiment(
     metrics.update(class_stats)
     metrics["pos_weight"] = float(pos_weight)
     metrics.update({key: bool(value) for key, value in variant_flags.items()})
+    metrics.update(branch_masks)
     metrics.update(
         split_label_stats(
             {
@@ -386,6 +408,7 @@ def _prepare_hero_features(
     zero_chain = np.zeros((graph.features.shape[0], graph.features.shape[1] + len(schema.EVIDENCE_MECHANISMS) + 1), dtype=np.float32)
     base_debug = {
         **variant_flags,
+        **_hero_branch_masks(model_name),
         "num_homophilic_neighbors_used": int(homo_edges.shape[1]) if homo_edges.size else 0,
         "num_heterophilic_neighbors_used": 0,
         "num_chains_used": 0,
@@ -936,6 +959,11 @@ def _write_hero_explanations(
         "use_mechanism": bool(hero_artifacts.get("use_mechanism", False)),
         "use_chain_encoder": bool(hero_artifacts.get("use_chain_encoder", False)),
         "use_mock_llm_mechanism": bool(hero_artifacts.get("use_mock_llm_mechanism", False)),
+        "branch_mask_target": int(variant_debug.get("branch_mask_target", 0)),
+        "branch_mask_homo": int(variant_debug.get("branch_mask_homo", 0)),
+        "branch_mask_hetero": int(variant_debug.get("branch_mask_hetero", 0)),
+        "branch_mask_mechanism": int(variant_debug.get("branch_mask_mechanism", 0)),
+        "branch_mask_chain": int(variant_debug.get("branch_mask_chain", 0)),
         "num_homophilic_neighbors_used": int(variant_debug.get("num_homophilic_neighbors_used", 0)),
         "num_heterophilic_neighbors_used": int(variant_debug.get("num_heterophilic_neighbors_used", 0)),
         "num_chains_used": int(variant_debug.get("num_chains_used", 0)),
@@ -955,6 +983,15 @@ def _write_hero_explanations(
         "avg_chain_gate": float(model_diagnostics.get("avg_chain_gate", 0.0)),
         "avg_homo_gate": float(model_diagnostics.get("avg_homo_gate", 0.0)),
         "avg_target_gate": float(model_diagnostics.get("avg_target_gate", 0.0)),
+        "target_repr_norm": float(model_diagnostics.get("target_repr_norm", 0.0)),
+        "homo_repr_norm": float(model_diagnostics.get("homo_repr_norm", 0.0)),
+        "hetero_repr_norm": float(model_diagnostics.get("hetero_repr_norm", 0.0)),
+        "mechanism_repr_norm": float(model_diagnostics.get("mechanism_repr_norm", 0.0)),
+        "chain_repr_norm": float(model_diagnostics.get("chain_repr_norm", 0.0)),
+        "final_repr_norm": float(model_diagnostics.get("final_repr_norm", 0.0)),
+        "delta_zero_hetero": float(model_diagnostics.get("delta_zero_hetero", 0.0)),
+        "delta_zero_chain": float(model_diagnostics.get("delta_zero_chain", 0.0)),
+        "delta_zero_mechanism": float(model_diagnostics.get("delta_zero_mechanism", 0.0)),
         "lambda_chain_pos": float(model_diagnostics.get("lambda_chain_pos", 0.0)),
         "chain_pos_loss": float(model_diagnostics.get("chain_pos_loss", 0.0)),
     }
@@ -1012,6 +1049,11 @@ def _write_variant_debug(
         "use_hetero": bool(metrics.get("use_hetero", False)),
         "use_chain": bool(metrics.get("use_chain", False)),
         "use_mechanism": bool(metrics.get("use_mechanism", False)),
+        "branch_mask_target": int(metrics.get("branch_mask_target", 0)),
+        "branch_mask_homo": int(metrics.get("branch_mask_homo", 0)),
+        "branch_mask_hetero": int(metrics.get("branch_mask_hetero", 0)),
+        "branch_mask_mechanism": int(metrics.get("branch_mask_mechanism", 0)),
+        "branch_mask_chain": int(metrics.get("branch_mask_chain", 0)),
         "num_homophilic_neighbors_used": int(metrics.get("num_homophilic_neighbors_used", 0)),
         "num_heterophilic_neighbors_used": int(metrics.get("num_heterophilic_neighbors_used", 0)),
         "num_chains_used": int(metrics.get("num_chains_used", 0)),
@@ -1019,6 +1061,15 @@ def _write_variant_debug(
         "avg_chain_gate": float(metrics.get("avg_chain_gate", 0.0)),
         "avg_selected_neighbors": float(metrics.get("avg_selected_neighbors", 0.0)),
         "avg_num_chains": float(metrics.get("avg_num_chains", 0.0)),
+        "target_repr_norm": float(metrics.get("target_repr_norm", 0.0)),
+        "homo_repr_norm": float(metrics.get("homo_repr_norm", 0.0)),
+        "hetero_repr_norm": float(metrics.get("hetero_repr_norm", 0.0)),
+        "mechanism_repr_norm": float(metrics.get("mechanism_repr_norm", 0.0)),
+        "chain_repr_norm": float(metrics.get("chain_repr_norm", 0.0)),
+        "final_repr_norm": float(metrics.get("final_repr_norm", 0.0)),
+        "delta_zero_hetero": float(metrics.get("delta_zero_hetero", 0.0)),
+        "delta_zero_chain": float(metrics.get("delta_zero_chain", 0.0)),
+        "delta_zero_mechanism": float(metrics.get("delta_zero_mechanism", 0.0)),
     }
     write_json(path, payload)
 
@@ -1138,6 +1189,46 @@ def _torch_gate_diagnostics(gates: dict[str, Any], indices) -> dict[str, float]:
     return diagnostics
 
 
+def _torch_repr_diagnostics(details: dict[str, Any], indices) -> dict[str, float]:
+    diagnostics = {}
+    for metric_name, detail_key in [
+        ("target_repr_norm", "target_repr"),
+        ("homo_repr_norm", "homo_repr"),
+        ("hetero_repr_norm", "hetero_repr"),
+        ("mechanism_repr_norm", "mechanism_repr"),
+        ("chain_repr_norm", "chain_repr"),
+        ("final_repr_norm", "final_repr"),
+    ]:
+        value = details.get(detail_key)
+        if value is None:
+            diagnostics[metric_name] = 0.0
+            continue
+        selected = value[indices]
+        diagnostics[metric_name] = float(torch.linalg.norm(selected, dim=1).mean().detach().cpu().item()) if selected.numel() else 0.0
+    return diagnostics
+
+
+def _torch_branch_delta_diagnostics(
+    model,
+    target_x,
+    homo_x,
+    hetero_x,
+    mechanism_x,
+    chain_x,
+    test_tensor,
+    full_logits,
+) -> dict[str, float]:
+    prob_full = torch.sigmoid(full_logits[test_tensor])
+    zero_hetero = torch.sigmoid(model(target_x, homo_x, hetero_x, mechanism_x, chain_x, zero_hetero=True)[test_tensor])
+    zero_chain = torch.sigmoid(model(target_x, homo_x, hetero_x, mechanism_x, chain_x, zero_chain=True)[test_tensor])
+    zero_mechanism = torch.sigmoid(model(target_x, homo_x, hetero_x, mechanism_x, chain_x, zero_mechanism=True)[test_tensor])
+    return {
+        "delta_zero_hetero": float(torch.mean(torch.abs(prob_full - zero_hetero)).detach().cpu().item()) if prob_full.numel() else 0.0,
+        "delta_zero_chain": float(torch.mean(torch.abs(prob_full - zero_chain)).detach().cpu().item()) if prob_full.numel() else 0.0,
+        "delta_zero_mechanism": float(torch.mean(torch.abs(prob_full - zero_mechanism)).detach().cpu().item()) if prob_full.numel() else 0.0,
+    }
+
+
 def _fit_torch_feature_model(
     features: np.ndarray,
     features_without_chains: np.ndarray,
@@ -1234,12 +1325,25 @@ def _fit_torch_feature_model(
         model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        logits, gates = model(target_x, homo_x, hetero_x, mechanism_x, chain_x, return_gates=True)
-        logits_without = model(target_x, homo_x, hetero_x, mechanism_x, chain_x, force_no_chain=True)
+        logits, details = model(target_x, homo_x, hetero_x, mechanism_x, chain_x, return_details=True)
+        logits_without = model(target_x, homo_x, hetero_x, mechanism_x, chain_x, zero_chain=True)
         val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         test_scores = torch.sigmoid(logits[test_tensor]).cpu().numpy()
         scores_without_chains = torch.sigmoid(logits_without[test_tensor]).cpu().numpy()
-    diagnostics = _torch_gate_diagnostics(gates, test_tensor)
+        diagnostics = _torch_gate_diagnostics(details, test_tensor)
+        diagnostics.update(_torch_repr_diagnostics(details, test_tensor))
+        diagnostics.update(
+            _torch_branch_delta_diagnostics(
+                model=model,
+                target_x=target_x,
+                homo_x=homo_x,
+                hetero_x=hetero_x,
+                mechanism_x=mechanism_x,
+                chain_x=chain_x,
+                test_tensor=test_tensor,
+                full_logits=logits,
+            )
+        )
     diagnostics.update(
         {
             "lambda_chain_pos": float(active_lambda),
@@ -1300,6 +1404,10 @@ def _fit_numpy_feature_model(
     std = np.where(std < 1e-6, 1.0, std)
     x_scaled = (x - mean) / std
     x_without_scaled = (x_without - mean) / std
+    if feature_dims:
+        x_no_chain_scaled = _zero_hero_branch_scaled(x_scaled, feature_dims, "chain")
+    else:
+        x_no_chain_scaled = x_without_scaled
     weights = rng.normal(0.0, 0.01, size=x.shape[1]).astype(np.float32)
     bias = np.float32(0.0)
     train_y = y[train_idx]
@@ -1311,7 +1419,7 @@ def _fit_numpy_feature_model(
     for _epoch in range(max(1, epochs)):
         logits, grad_features = _numpy_full_logits_and_grad_features(
             x_full=x_scaled[train_idx],
-            x_without=x_without_scaled[train_idx],
+            x_without=x_no_chain_scaled[train_idx],
             weights=weights,
             bias=float(bias),
             use_chain=use_chain,
@@ -1326,7 +1434,7 @@ def _fit_numpy_feature_model(
                 weights=weights,
                 bias=float(bias),
                 x_full=x_scaled,
-                x_without=x_without_scaled,
+                x_without=x_no_chain_scaled,
                 labels=y,
                 train_idx=train_idx,
                 use_chain=use_chain,
@@ -1336,9 +1444,17 @@ def _fit_numpy_feature_model(
         weights -= step * grad_w.astype(np.float32)
         bias = np.float32(bias - step * grad_b)
 
-    scores = _sigmoid_np(_numpy_full_logits(x_scaled, x_without_scaled, weights, float(bias), use_chain)).astype(np.float32)
-    scores_without = _sigmoid_np(_numpy_no_chain_logits(x_without_scaled, weights, float(bias))).astype(np.float32)
+    scores = _numpy_predict_from_scaled(x_scaled, weights, float(bias), use_chain=use_chain, feature_dims=feature_dims).astype(np.float32)
+    scores_without = _numpy_predict_from_scaled(
+        x_no_chain_scaled,
+        weights,
+        float(bias),
+        use_chain=use_chain,
+        feature_dims=feature_dims,
+    ).astype(np.float32)
     diagnostics = _gate_diagnostics_for_indices(gate_diagnostics, test_idx)
+    diagnostics.update(_numpy_repr_diagnostics(x_scaled, feature_dims, test_idx))
+    diagnostics.update(_numpy_branch_delta_diagnostics(x_scaled, weights, float(bias), use_chain, feature_dims, test_idx))
     diagnostics.update(
         {
             "lambda_chain_pos": float(active_lambda),
@@ -1437,6 +1553,108 @@ def _gate_diagnostics_for_indices(gates: dict[str, np.ndarray], indices: np.ndar
         values = gates.get(key)
         diagnostics[name] = float(np.mean(values[indices])) if values is not None and indices.size else 0.0
     return diagnostics
+
+
+def _numpy_repr_diagnostics(
+    x_scaled: np.ndarray,
+    feature_dims: dict[str, int] | None,
+    indices: np.ndarray,
+) -> dict[str, float]:
+    diagnostics = {
+        "target_repr_norm": 0.0,
+        "homo_repr_norm": 0.0,
+        "hetero_repr_norm": 0.0,
+        "mechanism_repr_norm": 0.0,
+        "chain_repr_norm": 0.0,
+        "final_repr_norm": 0.0,
+    }
+    indices = np.asarray(indices, dtype=np.int64)
+    if not feature_dims or indices.size == 0:
+        if indices.size:
+            diagnostics["final_repr_norm"] = float(np.linalg.norm(x_scaled[indices], axis=1).mean())
+        return diagnostics
+    slices = _hero_branch_slices(feature_dims)
+    selected = x_scaled[indices]
+    diagnostics["target_repr_norm"] = _mean_row_norm(selected[:, slices["target"]])
+    diagnostics["homo_repr_norm"] = _mean_row_norm(selected[:, slices["homo"]])
+    diagnostics["hetero_repr_norm"] = _mean_row_norm(selected[:, slices["hetero"]])
+    diagnostics["mechanism_repr_norm"] = _mean_row_norm(selected[:, slices["mechanism"]])
+    diagnostics["chain_repr_norm"] = _mean_row_norm(selected[:, slices["chain"]])
+    diagnostics["final_repr_norm"] = _mean_row_norm(selected)
+    return diagnostics
+
+
+def _numpy_branch_delta_diagnostics(
+    x_scaled: np.ndarray,
+    weights: np.ndarray,
+    bias: float,
+    use_chain: bool,
+    feature_dims: dict[str, int] | None,
+    indices: np.ndarray,
+) -> dict[str, float]:
+    diagnostics = {
+        "delta_zero_hetero": 0.0,
+        "delta_zero_chain": 0.0,
+        "delta_zero_mechanism": 0.0,
+    }
+    indices = np.asarray(indices, dtype=np.int64)
+    if not feature_dims or indices.size == 0:
+        return diagnostics
+    prob_full = _numpy_predict_from_scaled(x_scaled, weights, bias, use_chain=use_chain, feature_dims=feature_dims)[indices]
+    for branch_name, metric_name in [
+        ("hetero", "delta_zero_hetero"),
+        ("chain", "delta_zero_chain"),
+        ("mechanism", "delta_zero_mechanism"),
+    ]:
+        x_zeroed = _zero_hero_branch_scaled(x_scaled, feature_dims, branch_name)
+        prob_zeroed = _numpy_predict_from_scaled(x_zeroed, weights, bias, use_chain=use_chain, feature_dims=feature_dims)[indices]
+        diagnostics[metric_name] = float(np.mean(np.abs(prob_full - prob_zeroed))) if prob_full.size else 0.0
+    return diagnostics
+
+
+def _numpy_predict_from_scaled(
+    x_scaled: np.ndarray,
+    weights: np.ndarray,
+    bias: float,
+    use_chain: bool,
+    feature_dims: dict[str, int] | None,
+) -> np.ndarray:
+    if feature_dims and use_chain:
+        x_without_chain = _zero_hero_branch_scaled(x_scaled, feature_dims, "chain")
+        return _sigmoid_np(_numpy_full_logits(x_scaled, x_without_chain, weights, bias, use_chain=True))
+    return _sigmoid_np(_numpy_no_chain_logits(x_scaled, weights, bias))
+
+
+def _zero_hero_branch_scaled(x_scaled: np.ndarray, feature_dims: dict[str, int], branch_name: str) -> np.ndarray:
+    out = np.array(x_scaled, copy=True)
+    out[:, _hero_branch_slices(feature_dims)[branch_name]] = 0.0
+    return out
+
+
+def _hero_branch_slices(feature_dims: dict[str, int]) -> dict[str, slice]:
+    target_dim = int(feature_dims["target_dim"])
+    homo_dim = int(feature_dims["homo_dim"])
+    hetero_dim = int(feature_dims["hetero_dim"])
+    mechanism_dim = int(feature_dims["mechanism_dim"])
+    chain_dim = int(feature_dims["chain_dim"])
+    target_start = 0
+    homo_start = target_start + target_dim
+    hetero_start = homo_start + homo_dim
+    mechanism_start = hetero_start + hetero_dim
+    chain_start = mechanism_start + mechanism_dim
+    return {
+        "target": slice(target_start, homo_start),
+        "homo": slice(homo_start, hetero_start),
+        "hetero": slice(hetero_start, mechanism_start),
+        "mechanism": slice(mechanism_start, chain_start),
+        "chain": slice(chain_start, chain_start + chain_dim),
+    }
+
+
+def _mean_row_norm(values: np.ndarray) -> float:
+    if values.size == 0:
+        return 0.0
+    return float(np.linalg.norm(values, axis=1).mean())
 
 
 def _numpy_chain_pos_loss_grad(

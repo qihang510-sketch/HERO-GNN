@@ -90,6 +90,28 @@ def _warn_if_variants_identical(metrics_by_model: dict) -> None:
     ]
     if all(left.get(key) == right.get(key) for key in keys):
         print("[WARNING] hero_wo_chain and hero_wo_hetero have identical metrics. Check variant implementation.")
+        branch_keys = [
+            "branch_mask_target",
+            "branch_mask_homo",
+            "branch_mask_hetero",
+            "branch_mask_mechanism",
+            "branch_mask_chain",
+        ]
+        diagnostic_keys = [
+            "hetero_repr_norm",
+            "delta_zero_hetero",
+            "final_repr_norm",
+        ]
+        masks_differ = any(left.get(key) != right.get(key) for key in branch_keys)
+        diagnostics_differ = any(left.get(key) != right.get(key) for key in diagnostic_keys)
+        if masks_differ:
+            print("[ERROR] hero_wo_chain and hero_wo_hetero have identical predictions despite different branch masks. Hetero branch may not affect classifier.")
+            print(
+                "[DEBUG] "
+                f"branch_masks_chain={[left.get(key) for key in branch_keys]} "
+                f"branch_masks_hetero={[right.get(key) for key in branch_keys]} "
+                f"diagnostics_differ={diagnostics_differ}"
+            )
 
 
 if __name__ == "__main__":

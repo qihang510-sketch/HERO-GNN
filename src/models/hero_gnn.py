@@ -44,15 +44,7 @@ if nn is not None:
                 self.chain_encoder = nn.Identity()
             else:
                 self.chain_encoder = nn.Sequential(nn.Linear(chain_input_dim, hidden_dim), nn.ReLU())
-            self.fusion_gate = nn.Linear(hidden_dim * 5, hidden_dim * 5)
-            with torch.no_grad():
-                self.fusion_gate.bias.zero_()
-                self.fusion_gate.bias[hidden_dim * 4 :].fill_(1.0)
-            self.base_classifier = nn.Linear(hidden_dim * 4, output_dim)
-            self.chain_classifier = nn.Linear(hidden_dim, output_dim)
-            self.chain_logit_scale = 0.2
-            with torch.no_grad():
-                self.chain_classifier.bias.fill_(-2.0)
+            self.classifier = nn.Linear(hidden_dim * 5, output_dim)
 
         def encode_chain(
             self,
@@ -73,58 +65,61 @@ if nn is not None:
             mechanism_features: torch.Tensor,
             chain_features: torch.Tensor,
             force_no_chain: bool = False,
+            zero_hetero: bool = False,
+            zero_mechanism: bool = False,
+            zero_chain: bool = False,
             return_gates: bool = False,
+            return_details: bool = False,
         ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
             target_repr = self.target_encoder(target_features)
             homo_repr = self.homo_encoder(homo_neighbor_features)
-            if self.use_heterophily:
+            if self.use_heterophily and not zero_hetero:
                 hetero_repr = self.hetero_encoder(hetero_neighbor_features)
             else:
                 hetero_repr = torch.zeros_like(target_repr)
-            if self.use_heterophily and self.use_mechanism:
+            if self.use_heterophily and self.use_mechanism and not zero_mechanism:
                 mechanism_repr = self.mechanism_encoder(mechanism_features)
             else:
                 mechanism_repr = torch.zeros_like(target_repr)
-            if self.use_chain and not force_no_chain:
+            if self.use_chain and not force_no_chain and not zero_chain:
                 chain_repr = self.chain_encoder(chain_features)
                 chain_presence = (chain_features.abs().sum(dim=1, keepdim=True) > 0).to(chain_repr.dtype)
+                chain_repr = chain_repr * chain_presence
             else:
                 chain_repr = torch.zeros_like(target_repr)
                 chain_presence = torch.zeros((target_repr.shape[0], 1), dtype=target_repr.dtype, device=target_repr.device)
-            gate_input = torch.cat([target_repr, homo_repr, hetero_repr, mechanism_repr, chain_repr], dim=1)
-            target_gate, homo_gate, hetero_gate, mechanism_gate, chain_gate = torch.chunk(torch.sigmoid(self.fusion_gate(gate_input)), 5, dim=1)
-            if not self.use_heterophily:
-                hetero_gate = torch.zeros_like(hetero_gate)
-            if not (self.use_heterophily and self.use_mechanism):
-                mechanism_gate = torch.zeros_like(mechanism_gate)
-            if self.use_chain and not force_no_chain:
-                chain_gate = chain_gate.clamp_min(self.min_chain_gate)
-                chain_gate = chain_gate * chain_presence
-            else:
-                chain_gate = torch.zeros_like(chain_gate)
-            base_repr = torch.cat(
+            final_repr = torch.cat(
                 [
-                    target_gate * target_repr,
-                    homo_gate * homo_repr,
-                    hetero_gate * hetero_repr,
-                    mechanism_gate * mechanism_repr,
+                    target_repr,
+                    homo_repr,
+                    hetero_repr,
+                    mechanism_repr,
+                    chain_repr,
                 ],
                 dim=1,
             )
-            base_logits = self.base_classifier(base_repr)
-            if self.use_chain and not force_no_chain:
-                chain_logits = torch.nn.functional.softplus(self.chain_classifier(chain_gate * chain_repr)) * self.chain_logit_scale * chain_presence
-            else:
-                chain_logits = torch.zeros_like(base_logits)
-            logits = (base_logits + chain_logits).squeeze(-1)
-            if return_gates:
+            logits = self.classifier(final_repr).squeeze(-1)
+            gates = {
+                "target_gate": torch.ones_like(target_repr),
+                "homo_gate": torch.ones_like(homo_repr),
+                "hetero_gate": torch.ones_like(hetero_repr) if self.use_heterophily and not zero_hetero else torch.zeros_like(hetero_repr),
+                "mechanism_gate": torch.ones_like(mechanism_repr)
+                if self.use_heterophily and self.use_mechanism and not zero_mechanism
+                else torch.zeros_like(mechanism_repr),
+                "chain_gate": torch.ones_like(chain_repr) * chain_presence if self.use_chain and not force_no_chain and not zero_chain else torch.zeros_like(chain_repr),
+            }
+            if return_details:
                 return logits, {
-                    "target_gate": target_gate,
-                    "homo_gate": homo_gate,
-                    "hetero_gate": hetero_gate,
-                    "mechanism_gate": mechanism_gate,
-                    "chain_gate": chain_gate,
+                    **gates,
+                    "target_repr": target_repr,
+                    "homo_repr": homo_repr,
+                    "hetero_repr": hetero_repr,
+                    "mechanism_repr": mechanism_repr,
+                    "chain_repr": chain_repr,
+                    "final_repr": final_repr,
                 }
+            if return_gates:
+                return logits, gates
             return logits
 
 else:
