@@ -42,6 +42,7 @@ def main() -> None:
     training_cfg = config.get("training", {})
     output_cfg = config.get("outputs", {})
     for seed in args.seeds:
+        metrics_by_model = {}
         for model_name in args.models:
             metrics = train_single_experiment(
                 dataset=args.dataset,
@@ -61,7 +62,9 @@ def main() -> None:
                 max_chain_length=int(_first_not_none(args.max_chain_length, chain_cfg.get("max_chain_length", 2))),
                 lambda_chain_pos=float(_first_not_none(args.lambda_chain_pos, training_cfg.get("lambda_chain_pos", 0.05))),
             )
+            metrics_by_model[model_name] = metrics
             print(metrics)
+        _warn_if_variants_identical(metrics_by_model)
 
 
 def _first_not_none(*values):
@@ -69,6 +72,24 @@ def _first_not_none(*values):
         if value is not None:
             return value
     return None
+
+
+def _warn_if_variants_identical(metrics_by_model: dict) -> None:
+    left = metrics_by_model.get("hero_wo_chain")
+    right = metrics_by_model.get("hero_wo_hetero")
+    if not left or not right:
+        return
+    keys = [
+        "macro_f1",
+        "auroc",
+        "auprc",
+        "pred_positive_rate",
+        "best_threshold",
+        "mean_pred_prob_pos",
+        "mean_pred_prob_neg",
+    ]
+    if all(left.get(key) == right.get(key) for key in keys):
+        print("[WARNING] hero_wo_chain and hero_wo_hetero have identical metrics. Check variant implementation.")
 
 
 if __name__ == "__main__":

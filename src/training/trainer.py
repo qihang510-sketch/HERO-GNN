@@ -44,6 +44,48 @@ HERO_MODEL_NAMES = ("hero_gnn", "hero_wo_hetero", "hero_wo_mechanism", "hero_wo_
 MODEL_NAMES = (*BASELINE_MODEL_NAMES, *HERO_MODEL_NAMES)
 
 
+def _hero_variant_flags(model_name: str) -> dict[str, bool]:
+    if model_name == "hero_gnn":
+        return {
+            "use_hetero": True,
+            "use_chain": True,
+            "use_mechanism": True,
+            "use_chain_encoder": True,
+            "use_mock_llm_mechanism": True,
+        }
+    if model_name == "hero_wo_chain":
+        return {
+            "use_hetero": True,
+            "use_chain": False,
+            "use_mechanism": True,
+            "use_chain_encoder": False,
+            "use_mock_llm_mechanism": True,
+        }
+    if model_name == "hero_wo_hetero":
+        return {
+            "use_hetero": False,
+            "use_chain": False,
+            "use_mechanism": False,
+            "use_chain_encoder": False,
+            "use_mock_llm_mechanism": False,
+        }
+    if model_name == "hero_wo_mechanism":
+        return {
+            "use_hetero": True,
+            "use_chain": True,
+            "use_mechanism": False,
+            "use_chain_encoder": True,
+            "use_mock_llm_mechanism": False,
+        }
+    return {
+        "use_hetero": False,
+        "use_chain": False,
+        "use_mechanism": False,
+        "use_chain_encoder": False,
+        "use_mock_llm_mechanism": False,
+    }
+
+
 def train_single_experiment(
     dataset: str = "synthetic",
     model_name: str = "mlp",
@@ -97,6 +139,16 @@ def train_single_experiment(
     pos_weight = _pos_weight_from_counts(class_stats["train_num_pos"], class_stats["train_num_neg"])
     print(f"[TRAIN-INFO] dataset={dataset} model={model_name} seed={seed}")
     print(f"[TRAIN-INFO] train_pos={class_stats['train_num_pos']} train_neg={class_stats['train_num_neg']} pos_weight={pos_weight:.6f}")
+    variant_flags = _hero_variant_flags(model_name)
+    if model_name in HERO_MODEL_NAMES:
+        variant_message = (
+            f"[VARIANT] model={model_name} "
+            f"use_hetero={variant_flags['use_hetero']} "
+            f"use_chain={variant_flags['use_chain']} "
+            f"use_mechanism={variant_flags['use_mechanism']}"
+        )
+        print(variant_message)
+        logger.info(variant_message)
     logger.info(
         "TRAIN-INFO train_pos=%s train_neg=%s pos_weight=%s",
         class_stats["train_num_pos"],
@@ -134,6 +186,8 @@ def train_single_experiment(
             pos_weight=pos_weight,
             model_name=model_name,
             feature_dims=hero_artifacts.get("feature_dims", {}),
+            use_hetero=bool(hero_artifacts.get("use_hetero", False)),
+            use_mechanism=bool(hero_artifacts.get("use_mechanism", False)),
             use_chain=bool(hero_artifacts.get("use_chain", False)),
             lambda_chain_pos=float(lambda_chain_pos),
         )
@@ -182,6 +236,7 @@ def train_single_experiment(
     metrics.update(prediction_probability_stats(graph.labels[test_idx], test_scores))
     metrics.update(class_stats)
     metrics["pos_weight"] = float(pos_weight)
+    metrics.update({key: bool(value) for key, value in variant_flags.items()})
     metrics.update(
         split_label_stats(
             {
@@ -312,24 +367,41 @@ def _prepare_hero_features(
         "time_training_sec": 0.0,
     }
     target_indices = _limit_target_indices(target_indices, max_target_nodes)
+    variant_flags = _hero_variant_flags(model_name)
+    use_hetero = bool(variant_flags["use_hetero"])
+    use_chain = bool(variant_flags["use_chain"])
+    use_mechanism = bool(variant_flags["use_mechanism"])
+    use_mock_llm_mechanism = bool(variant_flags["use_mock_llm_mechanism"])
     homo_edges = filter_topk_semantic_edges(graph.edge_index, graph.text_features, top_k=homophilic_topk)
     homo_agg = _neighbor_mean_features(graph.features, homo_edges)
     feature_dims = {
         "target_dim": int(graph.features.shape[1]),
         "homo_dim": int(homo_agg.shape[1]),
+        "hetero_dim": int(graph.features.shape[1]),
+        "mechanism_dim": int(len(schema.EVIDENCE_MECHANISMS)),
         "chain_dim": int(graph.features.shape[1] + len(schema.EVIDENCE_MECHANISMS) + 1),
     }
+    zero_hetero = np.zeros_like(graph.features, dtype=np.float32)
+    zero_mechanism = np.zeros((graph.features.shape[0], len(schema.EVIDENCE_MECHANISMS)), dtype=np.float32)
     zero_chain = np.zeros((graph.features.shape[0], graph.features.shape[1] + len(schema.EVIDENCE_MECHANISMS) + 1), dtype=np.float32)
+    base_debug = {
+        **variant_flags,
+        "num_homophilic_neighbors_used": int(homo_edges.shape[1]) if homo_edges.size else 0,
+        "num_heterophilic_neighbors_used": 0,
+        "num_chains_used": 0,
+        "num_mechanism_labels_used": 0,
+    }
 
-    if model_name == "hero_wo_hetero":
-        features = np.concatenate([graph.features, homo_agg, zero_chain], axis=1).astype(np.float32)
+    if not use_hetero:
+        features = np.concatenate([graph.features, homo_agg, zero_hetero, zero_mechanism, zero_chain], axis=1).astype(np.float32)
         return features, features.copy(), {
             "chains_by_idx": {},
             "labels_by_target": {},
             "candidates_by_target": {},
             "time": timings,
             "feature_dims": feature_dims,
-            "use_chain": False,
+            "variant_debug": base_debug,
+            **variant_flags,
         }
 
     print("[BUILD] hetero candidates")
@@ -343,21 +415,33 @@ def _prepare_hero_features(
     )
     candidates_by_target = _trim_candidates(candidates_by_target, heterophilic_topk)
     timings["time_retrieval_sec"] = time.perf_counter() - retrieval_start
-    if model_name == "hero_wo_chain":
-        features = np.concatenate([graph.features, homo_agg, zero_chain], axis=1).astype(np.float32)
+
+    print("[BUILD] mock LLM labels" if use_mock_llm_mechanism else "[BUILD] rule hetero labels")
+    labels_by_target, label_time = _label_candidates(data_dir, candidates_by_target, use_mechanism=use_mock_llm_mechanism)
+    timings["time_mock_labeling_sec"] = label_time
+    hetero_features, mechanism_features = _hetero_feature_matrix(
+        graph=graph,
+        labels_by_target=labels_by_target,
+        use_mechanism=use_mechanism,
+    )
+    usage_debug = {
+        **base_debug,
+        "num_heterophilic_neighbors_used": int(sum(len(labels) for labels in labels_by_target.values())),
+        "num_mechanism_labels_used": int(sum(len(labels) for labels in labels_by_target.values())) if use_mechanism else 0,
+    }
+
+    if not use_chain:
+        features = np.concatenate([graph.features, homo_agg, hetero_features, mechanism_features, zero_chain], axis=1).astype(np.float32)
         return features, features.copy(), {
             "chains_by_idx": {},
-            "labels_by_target": {},
+            "labels_by_target": labels_by_target,
             "candidates_by_target": candidates_by_target,
             "time": timings,
             "feature_dims": feature_dims,
-            "use_chain": False,
+            "variant_debug": usage_debug,
+            **variant_flags,
         }
 
-    use_mechanism = model_name != "hero_wo_mechanism"
-    print("[BUILD] mock LLM labels")
-    labels_by_target, label_time = _label_candidates(data_dir, candidates_by_target, use_mechanism=use_mechanism)
-    timings["time_mock_labeling_sec"] = label_time
     flat_labels = [label for labels in labels_by_target.values() for label in labels]
     print("[BUILD] evidence chains")
     chain_start = time.perf_counter()
@@ -368,19 +452,21 @@ def _prepare_hero_features(
         flat_labels=flat_labels,
         topk_chains=topk_chains,
         max_chain_length=max_chain_length,
-        use_cache=use_mechanism,
+        use_cache=use_mock_llm_mechanism,
     )
     timings["time_evidence_chain_sec"] = time.perf_counter() - chain_start
     chain_features = _chain_feature_matrix(graph, chains_by_idx, use_mechanism=use_mechanism)
-    features = np.concatenate([graph.features, homo_agg, chain_features], axis=1).astype(np.float32)
-    features_without_chains = np.concatenate([graph.features, homo_agg, zero_chain], axis=1).astype(np.float32)
+    features = np.concatenate([graph.features, homo_agg, hetero_features, mechanism_features, chain_features], axis=1).astype(np.float32)
+    features_without_chains = np.concatenate([graph.features, homo_agg, hetero_features, mechanism_features, zero_chain], axis=1).astype(np.float32)
+    usage_debug["num_chains_used"] = int(sum(len(chains) for chains in chains_by_idx.values()))
     return features, features_without_chains, {
         "chains_by_idx": chains_by_idx,
         "labels_by_target": labels_by_target,
         "candidates_by_target": candidates_by_target,
         "time": timings,
         "feature_dims": feature_dims,
-        "use_chain": True,
+        "variant_debug": usage_debug,
+        **variant_flags,
     }
 
 
@@ -589,9 +675,9 @@ def _label_candidates(
     use_mechanism: bool,
 ) -> tuple[dict[int, list[dict[str, Any]]], float]:
     label_start = time.perf_counter()
-    cache = LabelCache(data_dir / "llm_labels.jsonl")
+    cache = LabelCache(data_dir / "llm_labels.jsonl") if use_mechanism else None
     labels_by_target: dict[int, list[dict[str, Any]]] = {}
-    if cache.path.exists():
+    if cache is not None and cache.path.exists():
         print("[CACHE] loading llm_labels.jsonl")
     pairs = [
         (target_idx, candidate)
@@ -599,26 +685,33 @@ def _label_candidates(
         for candidate in candidates
     ]
     base_by_pair: dict[tuple[int, str, str, str], dict[str, Any]] = {}
-    for target_idx, candidate in tqdm(pairs, desc="mock_labeler", unit="pair"):
-        key = cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath)
-        cached_label = cache.get(key)
-        if cached_label is None or cached_label.get("labeler_version") != MOCK_LABELER_VERSION:
-            base_label = label_candidate_mechanism(candidate)
-            cache.set(key, base_label)
-        else:
-            base_label = dict(cached_label)
-        base_by_pair[(target_idx, candidate.target_id, candidate.neighbor_id, candidate.metapath)] = base_label
+    if use_mechanism:
+        for target_idx, candidate in tqdm(pairs, desc="mock_labeler", unit="pair"):
+            key = cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath)
+            cached_label = cache.get(key) if cache is not None else None
+            if cached_label is None or cached_label.get("labeler_version") != MOCK_LABELER_VERSION:
+                base_label = label_candidate_mechanism(candidate)
+                if cache is not None:
+                    cache.set(key, base_label)
+            else:
+                base_label = dict(cached_label)
+            base_by_pair[(target_idx, candidate.target_id, candidate.neighbor_id, candidate.metapath)] = base_label
 
     for target_idx, candidate in tqdm(pairs, desc="risk heterophily scoring", unit="pair"):
-        label = dict(base_by_pair[(target_idx, candidate.target_id, candidate.neighbor_id, candidate.metapath)])
+        if use_mechanism:
+            label = dict(base_by_pair[(target_idx, candidate.target_id, candidate.neighbor_id, candidate.metapath)])
+        else:
+            label = {
+                "target_id": candidate.target_id,
+                "neighbor_id": candidate.neighbor_id,
+                "metapath": candidate.metapath,
+                "mechanism": "irrelevant_heterophily",
+                "risk_relevance": int(candidate.candidate_score >= 0.55),
+                "confidence": float(candidate.candidate_score),
+                "rationale": "rule score only; mechanism labels disabled",
+            }
         label["candidate"] = asdict(candidate)
         label["risk_card"] = format_candidate_risk_card(candidate)
-        if not use_mechanism:
-            label = dict(label)
-            label["mechanism"] = "irrelevant_heterophily"
-            label["risk_relevance"] = int(candidate.candidate_score >= 0.55)
-            label["confidence"] = float(candidate.candidate_score)
-            label["rationale"] = "rule score only; mechanism labels disabled"
         score, mechanism_logits = risk_heterophily_score(
             candidate,
             mechanism=label.get("mechanism"),
@@ -628,14 +721,15 @@ def _label_candidates(
         label = dict(label)
         label["risk_score"] = score
         label["mechanism_logits"] = mechanism_logits.tolist()
-        if use_mechanism:
+        if use_mechanism and cache is not None:
             cache.set(cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath), label)
         labels_by_target.setdefault(target_idx, []).append(label)
 
     for target_idx in candidates_by_target:
         target_labels = labels_by_target.get(target_idx, [])
         labels_by_target[target_idx] = sorted(target_labels, key=lambda item: item["risk_score"], reverse=True)
-    cache.save()
+    if cache is not None:
+        cache.save()
     return labels_by_target, time.perf_counter() - label_start
 
 
@@ -665,6 +759,43 @@ def _chain_feature_matrix(
             reps.append(np.concatenate([node_repr, mechanism, score]))
         features[target_idx] = np.mean(reps, axis=0)
     return features
+
+
+def _hetero_feature_matrix(
+    graph: ProcessedGraphData,
+    labels_by_target: dict[int, list[dict[str, Any]]],
+    use_mechanism: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    hetero = np.zeros_like(graph.features, dtype=np.float32)
+    mechanisms = np.zeros((graph.features.shape[0], len(schema.EVIDENCE_MECHANISMS)), dtype=np.float32)
+    for target_idx, labels in labels_by_target.items():
+        node_reps = []
+        mechanism_reps = []
+        weights = []
+        for label in labels:
+            candidate = label.get("candidate", {})
+            neighbor_idx = candidate.get("neighbor_idx")
+            if neighbor_idx is None:
+                neighbor_id = label.get("neighbor_id")
+                neighbor_idx = graph.node_id_to_idx.get(neighbor_id)
+            if neighbor_idx is None or not (0 <= int(neighbor_idx) < graph.features.shape[0]):
+                continue
+            score = float(label.get("risk_score", label.get("confidence", 0.0)))
+            weight = max(score, 1e-3)
+            node_reps.append(graph.features[int(neighbor_idx)])
+            weights.append(weight)
+            if use_mechanism:
+                mechanism = np.zeros(len(schema.EVIDENCE_MECHANISMS), dtype=np.float32)
+                mechanism[mechanism_id(label.get("mechanism", "irrelevant_heterophily"))] = 1.0
+                mechanism_reps.append(mechanism)
+        if not node_reps:
+            continue
+        weight_array = np.asarray(weights, dtype=np.float32)
+        weight_array = weight_array / np.maximum(float(np.sum(weight_array)), 1e-6)
+        hetero[int(target_idx)] = np.sum(np.asarray(node_reps, dtype=np.float32) * weight_array[:, None], axis=0)
+        if use_mechanism and mechanism_reps:
+            mechanisms[int(target_idx)] = np.sum(np.asarray(mechanism_reps, dtype=np.float32) * weight_array[:, None], axis=0)
+    return hetero, mechanisms
 
 
 def _edge_index_for_model(graph: ProcessedGraphData, model_name: str, top_k: int) -> np.ndarray:
@@ -798,7 +929,17 @@ def _write_hero_explanations(
     necessity_gap = necessity_pos - necessity_neg
     avg_num_chains = float(np.mean(chain_counts)) if chain_counts else 0.0
     model_diagnostics = hero_artifacts.get("model_diagnostics", {})
+    variant_debug = hero_artifacts.get("variant_debug", {})
     metrics = {
+        "use_hetero": bool(hero_artifacts.get("use_hetero", False)),
+        "use_chain": bool(hero_artifacts.get("use_chain", False)),
+        "use_mechanism": bool(hero_artifacts.get("use_mechanism", False)),
+        "use_chain_encoder": bool(hero_artifacts.get("use_chain_encoder", False)),
+        "use_mock_llm_mechanism": bool(hero_artifacts.get("use_mock_llm_mechanism", False)),
+        "num_homophilic_neighbors_used": int(variant_debug.get("num_homophilic_neighbors_used", 0)),
+        "num_heterophilic_neighbors_used": int(variant_debug.get("num_heterophilic_neighbors_used", 0)),
+        "num_chains_used": int(variant_debug.get("num_chains_used", 0)),
+        "num_mechanism_labels_used": int(variant_debug.get("num_mechanism_labels_used", 0)),
         "evidence_recall_proxy": float(np.mean(evidence_recalls)) if evidence_recalls else 0.0,
         "evidence_necessity": necessity_all,
         "evidence_necessity_score": necessity_all,
@@ -818,6 +959,13 @@ def _write_hero_explanations(
         "chain_pos_loss": float(model_diagnostics.get("chain_pos_loss", 0.0)),
     }
     _write_hero_diagnostics(
+        output_root=output_root,
+        dataset=dataset,
+        model_name=model_name,
+        seed=seed,
+        metrics={**metrics, "avg_selected_neighbors": _hero_avg_selected_neighbors(hero_artifacts)},
+    )
+    _write_variant_debug(
         output_root=output_root,
         dataset=dataset,
         model_name=model_name,
@@ -845,6 +993,32 @@ def _write_hero_diagnostics(
         "avg_no_chain_prob_neg": float(metrics.get("avg_no_chain_prob_neg", 0.0)),
         "evidence_necessity": float(metrics.get("evidence_necessity", 0.0)),
         "evidence_necessity_gap": float(metrics.get("evidence_necessity_gap", 0.0)),
+    }
+    write_json(path, payload)
+
+
+def _write_variant_debug(
+    output_root: str | Path,
+    dataset: str,
+    model_name: str,
+    seed: int,
+    metrics: dict[str, Any],
+) -> None:
+    path = Path(output_root) / "diagnostics" / dataset / model_name / f"seed_{seed}" / "variant_debug.json"
+    payload = {
+        "dataset": dataset,
+        "model": model_name,
+        "seed": int(seed),
+        "use_hetero": bool(metrics.get("use_hetero", False)),
+        "use_chain": bool(metrics.get("use_chain", False)),
+        "use_mechanism": bool(metrics.get("use_mechanism", False)),
+        "num_homophilic_neighbors_used": int(metrics.get("num_homophilic_neighbors_used", 0)),
+        "num_heterophilic_neighbors_used": int(metrics.get("num_heterophilic_neighbors_used", 0)),
+        "num_chains_used": int(metrics.get("num_chains_used", 0)),
+        "num_mechanism_labels_used": int(metrics.get("num_mechanism_labels_used", 0)),
+        "avg_chain_gate": float(metrics.get("avg_chain_gate", 0.0)),
+        "avg_selected_neighbors": float(metrics.get("avg_selected_neighbors", 0.0)),
+        "avg_num_chains": float(metrics.get("avg_num_chains", 0.0)),
     }
     write_json(path, payload)
 
@@ -934,11 +1108,18 @@ def _model_logits(model, model_name: str, x, edge_index):
 def _split_hero_features_torch(x, feature_dims: dict[str, int]):
     target_dim = int(feature_dims["target_dim"])
     homo_dim = int(feature_dims["homo_dim"])
+    hetero_dim = int(feature_dims["hetero_dim"])
+    mechanism_dim = int(feature_dims["mechanism_dim"])
     chain_dim = int(feature_dims["chain_dim"])
     target_x = x[:, :target_dim]
     homo_x = x[:, target_dim : target_dim + homo_dim]
-    chain_x = x[:, target_dim + homo_dim : target_dim + homo_dim + chain_dim]
-    return target_x, homo_x, chain_x
+    hetero_start = target_dim + homo_dim
+    mechanism_start = hetero_start + hetero_dim
+    chain_start = mechanism_start + mechanism_dim
+    hetero_x = x[:, hetero_start:mechanism_start]
+    mechanism_x = x[:, mechanism_start:chain_start]
+    chain_x = x[:, chain_start : chain_start + chain_dim]
+    return target_x, homo_x, hetero_x, mechanism_x, chain_x
 
 
 def _torch_gate_diagnostics(gates: dict[str, Any], indices) -> dict[str, float]:
@@ -971,6 +1152,8 @@ def _fit_torch_feature_model(
     pos_weight: float,
     model_name: str,
     feature_dims: dict[str, int],
+    use_hetero: bool,
+    use_mechanism: bool,
     use_chain: bool,
     lambda_chain_pos: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
@@ -987,6 +1170,8 @@ def _fit_torch_feature_model(
             lr=lr,
             pos_weight=pos_weight,
             feature_dims=feature_dims,
+            use_hetero=use_hetero,
+            use_mechanism=use_mechanism,
             use_chain=use_chain,
             lambda_chain_pos=lambda_chain_pos if model_name == "hero_gnn" else 0.0,
         )
@@ -999,13 +1184,17 @@ def _fit_torch_feature_model(
     train_tensor = torch.tensor(train_idx, dtype=torch.long)
     val_tensor = torch.tensor(val_idx if val_idx.size else train_idx, dtype=torch.long)
     test_tensor = torch.tensor(test_idx, dtype=torch.long)
-    target_x, homo_x, chain_x = _split_hero_features_torch(x, feature_dims)
+    target_x, homo_x, hetero_x, mechanism_x, chain_x = _split_hero_features_torch(x, feature_dims)
     model = HEROGNN(
         input_dim=int(feature_dims["target_dim"]),
         hidden_dim=hidden_dim,
         output_dim=1,
         num_mechanisms=len(schema.EVIDENCE_MECHANISMS),
+        use_heterophily=use_hetero,
+        use_mechanism=use_mechanism,
         use_chain=use_chain,
+        hetero_input_dim=int(feature_dims["hetero_dim"]),
+        mechanism_input_dim=int(feature_dims["mechanism_dim"]),
         chain_input_dim=int(feature_dims["chain_dim"]),
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -1017,11 +1206,11 @@ def _fit_torch_feature_model(
     for _epoch in range(max(1, epochs)):
         model.train()
         optimizer.zero_grad()
-        logits = model(target_x, homo_x, chain_x)
+        logits = model(target_x, homo_x, hetero_x, mechanism_x, chain_x)
         loss = criterion(logits[train_tensor], y[train_tensor])
         chain_pos_loss = torch.tensor(0.0, dtype=loss.dtype)
         if active_lambda > 0.0:
-            no_chain_logits = model(target_x, homo_x, chain_x, force_no_chain=True)
+            no_chain_logits = model(target_x, homo_x, hetero_x, mechanism_x, chain_x, force_no_chain=True)
             pos_mask = y[train_tensor] == 1.0
             if torch.any(pos_mask):
                 full_prob = torch.sigmoid(logits[train_tensor][pos_mask])
@@ -1034,7 +1223,7 @@ def _fit_torch_feature_model(
 
         model.eval()
         with torch.no_grad():
-            logits = model(target_x, homo_x, chain_x)
+            logits = model(target_x, homo_x, hetero_x, mechanism_x, chain_x)
             val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         val_metrics = binary_classification_metrics(labels[val_tensor.numpy()], val_scores, k=100)
         if val_metrics["auprc"] >= best_score:
@@ -1045,8 +1234,8 @@ def _fit_torch_feature_model(
         model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        logits, gates = model(target_x, homo_x, chain_x, return_gates=True)
-        logits_without = model(target_x, homo_x, chain_x, force_no_chain=True)
+        logits, gates = model(target_x, homo_x, hetero_x, mechanism_x, chain_x, return_gates=True)
+        logits_without = model(target_x, homo_x, hetero_x, mechanism_x, chain_x, force_no_chain=True)
         val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         test_scores = torch.sigmoid(logits[test_tensor]).cpu().numpy()
         scores_without_chains = torch.sigmoid(logits_without[test_tensor]).cpu().numpy()
@@ -1077,6 +1266,8 @@ def _fit_numpy_feature_model(
     lr: float,
     pos_weight: float,
     feature_dims: dict[str, int] | None = None,
+    use_hetero: bool = False,
+    use_mechanism: bool = False,
     use_chain: bool = False,
     lambda_chain_pos: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
@@ -1087,6 +1278,8 @@ def _fit_numpy_feature_model(
             features=features,
             features_without_chains=features_without_chains,
             feature_dims=feature_dims,
+            use_hetero=use_hetero,
+            use_mechanism=use_mechanism,
             use_chain=use_chain,
         )
     else:
@@ -1170,32 +1363,58 @@ def _numpy_hero_fused_features(
     features: np.ndarray,
     features_without_chains: np.ndarray,
     feature_dims: dict[str, int],
+    use_hetero: bool,
+    use_mechanism: bool,
     use_chain: bool,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    target, homo, chain = _split_hero_features_np(features, feature_dims)
-    target_without, homo_without, _chain_without = _split_hero_features_np(features_without_chains, feature_dims)
+    target, homo, hetero, mechanism, chain = _split_hero_features_np(features, feature_dims)
+    target_without, homo_without, hetero_without, mechanism_without, _chain_without = _split_hero_features_np(features_without_chains, feature_dims)
     target_gate = np.ones((features.shape[0], 1), dtype=np.float32)
     homo_gate = np.ones((features.shape[0], 1), dtype=np.float32)
+    hetero_gate = np.ones((features.shape[0], 1), dtype=np.float32) if use_hetero else np.zeros((features.shape[0], 1), dtype=np.float32)
+    mechanism_gate = np.ones((features.shape[0], 1), dtype=np.float32) if use_mechanism else np.zeros((features.shape[0], 1), dtype=np.float32)
     chain_gate = _chain_gate_np(chain) if use_chain else np.zeros((features.shape[0], 1), dtype=np.float32)
+    gated_hetero = hetero * hetero_gate
+    gated_mechanism = mechanism * mechanism_gate
     gated_chain = chain * chain_gate
+    zero_hetero = np.zeros_like(gated_hetero, dtype=np.float32)
+    zero_mechanism = np.zeros_like(gated_mechanism, dtype=np.float32)
     zero_chain = np.zeros_like(gated_chain, dtype=np.float32)
-    fused = np.concatenate([target * target_gate, homo * homo_gate, gated_chain], axis=1).astype(np.float32)
-    fused_without = np.concatenate([target_without * target_gate, homo_without * homo_gate, zero_chain], axis=1).astype(np.float32)
+    fused = np.concatenate([target * target_gate, homo * homo_gate, gated_hetero, gated_mechanism, gated_chain], axis=1).astype(np.float32)
+    fused_without = np.concatenate(
+        [
+            target_without * target_gate,
+            homo_without * homo_gate,
+            hetero_without * hetero_gate if use_hetero else zero_hetero,
+            mechanism_without * mechanism_gate if use_mechanism else zero_mechanism,
+            zero_chain,
+        ],
+        axis=1,
+    ).astype(np.float32)
     return fused, fused_without, {
         "target_gate": target_gate,
         "homo_gate": homo_gate,
+        "hetero_gate": hetero_gate,
+        "mechanism_gate": mechanism_gate,
         "chain_gate": chain_gate,
     }
 
 
-def _split_hero_features_np(features: np.ndarray, feature_dims: dict[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _split_hero_features_np(features: np.ndarray, feature_dims: dict[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     target_dim = int(feature_dims["target_dim"])
     homo_dim = int(feature_dims["homo_dim"])
+    hetero_dim = int(feature_dims["hetero_dim"])
+    mechanism_dim = int(feature_dims["mechanism_dim"])
     chain_dim = int(feature_dims["chain_dim"])
     target = features[:, :target_dim]
     homo = features[:, target_dim : target_dim + homo_dim]
-    chain = features[:, target_dim + homo_dim : target_dim + homo_dim + chain_dim]
-    return target, homo, chain
+    hetero_start = target_dim + homo_dim
+    mechanism_start = hetero_start + hetero_dim
+    chain_start = mechanism_start + mechanism_dim
+    hetero = features[:, hetero_start:mechanism_start]
+    mechanism = features[:, mechanism_start:chain_start]
+    chain = features[:, chain_start : chain_start + chain_dim]
+    return target, homo, hetero, mechanism, chain
 
 
 def _chain_gate_np(chain: np.ndarray) -> np.ndarray:
