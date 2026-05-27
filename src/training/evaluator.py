@@ -60,3 +60,25 @@ def split_label_stats(labels_by_split: dict[str, np.ndarray]) -> dict[str, float
         stats[f"positive_count_{split_name}"] = positive
         stats[f"total_count_{split_name}"] = total
     return stats
+
+
+def prediction_probability_stats(labels: np.ndarray, scores: np.ndarray) -> dict[str, float]:
+    labels = np.asarray(labels, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float32)
+    if scores.size == 0:
+        return {
+            "mean_pred_prob_pos": 0.0,
+            "mean_pred_prob_neg": 0.0,
+            "std_pred_prob": 0.0,
+            "min_pred_prob": 0.0,
+            "max_pred_prob": 0.0,
+        }
+    pos_scores = scores[labels == 1]
+    neg_scores = scores[labels == 0]
+    return {
+        "mean_pred_prob_pos": float(np.mean(pos_scores)) if pos_scores.size else 0.0,
+        "mean_pred_prob_neg": float(np.mean(neg_scores)) if neg_scores.size else 0.0,
+        "std_pred_prob": float(np.std(scores)),
+        "min_pred_prob": float(np.min(scores)),
+        "max_pred_prob": float(np.max(scores)),
+    }

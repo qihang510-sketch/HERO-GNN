@@ -63,7 +63,16 @@ def _ablation_table(frame: pd.DataFrame) -> pd.DataFrame:
     subset = frame[frame["method"].isin(methods)].copy()
     if subset.empty:
         return _empty_ablation()
-    cols = ["dataset", "method", "macro_f1", "auroc", "auprc", "evidence_recall_proxy", "evidence_necessity_score"]
+    cols = [
+        "dataset",
+        "method",
+        "macro_f1",
+        "auroc",
+        "auprc",
+        "evidence_recall_proxy",
+        "evidence_necessity_score",
+        "evidence_necessity_gap",
+    ]
     for col in cols:
         if col not in subset:
             subset[col] = 0.0
@@ -76,6 +85,7 @@ def _ablation_table(frame: pd.DataFrame) -> pd.DataFrame:
             auprc_mean=("auprc", "mean"),
             evidence_recall_proxy=("evidence_recall_proxy", "mean"),
             evidence_necessity=("evidence_necessity_score", "mean"),
+            evidence_necessity_gap=("evidence_necessity_gap", "mean"),
         )
         .fillna(0.0)
     )
@@ -145,6 +155,7 @@ def _empty_ablation() -> pd.DataFrame:
             "auprc_mean",
             "evidence_recall_proxy",
             "evidence_necessity",
+            "evidence_necessity_gap",
         ]
     )
 
@@ -175,8 +186,20 @@ def _diagnostic_columns() -> list[str]:
         "positive_rate_train",
         "positive_rate_val",
         "positive_rate_test",
+        "train_num_pos",
+        "train_num_neg",
+        "val_num_pos",
+        "val_num_neg",
+        "test_num_pos",
+        "test_num_neg",
+        "pos_weight",
         "pred_positive_rate",
         "best_threshold",
+        "mean_pred_prob_pos",
+        "mean_pred_prob_neg",
+        "std_pred_prob",
+        "min_pred_prob",
+        "max_pred_prob",
         "tn",
         "fp",
         "fn",
@@ -190,6 +213,7 @@ def _diagnostic_columns() -> list[str]:
         "avg_evidence_necessity_all",
         "avg_evidence_necessity_pos",
         "avg_evidence_necessity_neg",
+        "evidence_necessity_gap",
         "avg_num_chains",
     ]
 

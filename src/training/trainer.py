@@ -25,7 +25,7 @@ from src.graph.neighbor_retrieval import (
 from src.llm.label_cache import LabelCache, cache_key
 from src.llm.mock_labeler import MOCK_LABELER_VERSION, label_candidate_mechanism
 from src.llm.risk_card import format_candidate_risk_card
-from src.training.evaluator import binary_classification_metrics, split_label_stats, tune_threshold
+from src.training.evaluator import binary_classification_metrics, prediction_probability_stats, split_label_stats, tune_threshold
 from src.utils.io import write_json
 from src.utils.seed import set_seed
 
@@ -83,6 +83,21 @@ def train_single_experiment(
     if train_idx.size == 0 or test_idx.size == 0:
         raise ValueError("Processed data must contain labeled train and test review nodes.")
 
+    class_stats = _split_class_stats(
+        train_labels=graph.labels[train_idx],
+        val_labels=graph.labels[val_idx],
+        test_labels=graph.labels[test_idx],
+    )
+    pos_weight = _pos_weight_from_counts(class_stats["train_num_pos"], class_stats["train_num_neg"])
+    print(f"[TRAIN-INFO] dataset={dataset} model={model_name} seed={seed}")
+    print(f"[TRAIN-INFO] train_pos={class_stats['train_num_pos']} train_neg={class_stats['train_num_neg']} pos_weight={pos_weight:.6f}")
+    logger.info(
+        "TRAIN-INFO train_pos=%s train_neg=%s pos_weight=%s",
+        class_stats["train_num_pos"],
+        class_stats["train_num_neg"],
+        pos_weight,
+    )
+
     if model_name in HERO_MODEL_NAMES:
         features, features_without_chains, hero_artifacts = _prepare_hero_features(
             graph=graph,
@@ -99,12 +114,21 @@ def train_single_experiment(
         stage_times.update(hero_artifacts.get("time", {}))
         print(f"[TRAIN] {model_name}")
         train_start = time.perf_counter()
-        classifier = _fit_classifier(features[train_idx], graph.labels[train_idx], seed=seed)
-        val_scores = _positive_scores(classifier, features[val_idx]) if val_idx.size else _positive_scores(classifier, features[train_idx])
-        test_scores = _positive_scores(classifier, features[test_idx])
-        scores_without_chains = _positive_scores(classifier, features_without_chains[test_idx])
+        val_scores, test_scores, scores_without_chains, checkpoint = _fit_torch_feature_model(
+            features=features,
+            features_without_chains=features_without_chains,
+            labels=graph.labels,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            seed=seed,
+            epochs=epochs,
+            lr=lr,
+            hidden_dim=hidden_dim,
+            pos_weight=pos_weight,
+        )
         stage_times["time_training_sec"] += time.perf_counter() - train_start
-        checkpoint = {"classifier": classifier, "hero_artifacts": hero_artifacts}
+        checkpoint["hero_artifacts"] = hero_artifacts
     elif torch is not None:
         train_start = time.perf_counter()
         val_scores, test_scores, checkpoint = _fit_torch_model(
@@ -118,20 +142,32 @@ def train_single_experiment(
             lr=lr,
             hidden_dim=hidden_dim,
             top_k=top_k,
+            pos_weight=pos_weight,
         )
         stage_times["time_training_sec"] = time.perf_counter() - train_start
     else:
         train_start = time.perf_counter()
         features = _prepare_features(graph, model_name, top_k=top_k)
-        classifier = _fit_classifier(features[train_idx], graph.labels[train_idx], seed=seed)
-        val_scores = _positive_scores(classifier, features[val_idx]) if val_idx.size else _positive_scores(classifier, features[train_idx])
-        test_scores = _positive_scores(classifier, features[test_idx])
+        val_scores, test_scores, _scores_without, checkpoint = _fit_numpy_feature_model(
+            features=features,
+            features_without_chains=features,
+            labels=graph.labels,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            seed=seed,
+            epochs=epochs,
+            lr=lr,
+            pos_weight=pos_weight,
+        )
         stage_times["time_training_sec"] = time.perf_counter() - train_start
-        checkpoint = {"classifier": classifier}
 
     threshold_labels = graph.labels[val_idx] if val_idx.size else graph.labels[train_idx]
     best_threshold = tune_threshold(threshold_labels, val_scores)
     metrics = binary_classification_metrics(graph.labels[test_idx], test_scores, k=100, threshold=best_threshold)
+    metrics.update(prediction_probability_stats(graph.labels[test_idx], test_scores))
+    metrics.update(class_stats)
+    metrics["pos_weight"] = float(pos_weight)
     metrics.update(
         split_label_stats(
             {
@@ -140,6 +176,12 @@ def train_single_experiment(
                 "test": graph.labels[test_idx],
             }
         )
+    )
+    print(f"[EVAL-INFO] best_threshold={best_threshold:.6f} pred_positive_rate={metrics['pred_positive_rate']:.6f}")
+    print(
+        "[EVAL-INFO] "
+        f"mean_pred_prob_pos={metrics['mean_pred_prob_pos']:.6f} "
+        f"mean_pred_prob_neg={metrics['mean_pred_prob_neg']:.6f}"
     )
     if model_name in HERO_MODEL_NAMES:
         explanation_metrics = _write_hero_explanations(
@@ -186,6 +228,35 @@ def write_placeholder_result(output_dir: str | Path, experiment_name: str) -> Pa
     path = output_dir / f"{experiment_name}.json"
     path.write_text('{"status": "placeholder", "metric": null}\n', encoding="utf-8")
     return path
+
+
+def _split_class_stats(
+    train_labels: np.ndarray,
+    val_labels: np.ndarray,
+    test_labels: np.ndarray,
+) -> dict[str, int]:
+    return {
+        "train_num_pos": _num_pos(train_labels),
+        "train_num_neg": _num_neg(train_labels),
+        "val_num_pos": _num_pos(val_labels),
+        "val_num_neg": _num_neg(val_labels),
+        "test_num_pos": _num_pos(test_labels),
+        "test_num_neg": _num_neg(test_labels),
+    }
+
+
+def _num_pos(labels: np.ndarray) -> int:
+    labels = np.asarray(labels, dtype=np.int64)
+    return int(np.sum(labels == 1))
+
+
+def _num_neg(labels: np.ndarray) -> int:
+    labels = np.asarray(labels, dtype=np.int64)
+    return int(np.sum(labels == 0))
+
+
+def _pos_weight_from_counts(num_pos: int, num_neg: int) -> float:
+    return float(num_neg / max(num_pos, 1))
 
 
 def _prepare_features(graph: ProcessedGraphData, model_name: str, top_k: int) -> np.ndarray:
@@ -681,6 +752,7 @@ def _write_hero_explanations(
     necessity_all = float(np.mean(necessities_all)) if necessities_all else 0.0
     necessity_pos = float(np.mean(necessities_pos)) if necessities_pos else 0.0
     necessity_neg = float(np.mean(necessities_neg)) if necessities_neg else 0.0
+    necessity_gap = necessity_pos - necessity_neg
     return {
         "evidence_recall_proxy": float(np.mean(evidence_recalls)) if evidence_recalls else 0.0,
         "evidence_necessity": necessity_all,
@@ -688,6 +760,7 @@ def _write_hero_explanations(
         "avg_evidence_necessity_all": necessity_all,
         "avg_evidence_necessity_pos": necessity_pos,
         "avg_evidence_necessity_neg": necessity_neg,
+        "evidence_necessity_gap": necessity_gap,
         "avg_num_chains": float(np.mean(chain_counts)) if chain_counts else 0.0,
     }
 
@@ -716,6 +789,7 @@ def _fit_torch_model(
     lr: float,
     hidden_dim: int,
     top_k: int,
+    pos_weight: float,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     from src.models.graphsage import GraphSAGE
     from src.models.mlp import MLP
@@ -729,28 +803,30 @@ def _fit_torch_model(
         "semsim_gnn": SemSimGNN,
         "rulehetero_gnn": RuleHeteroGNN,
     }[model_name]
-    model = model_cls(input_dim=graph.features.shape[1], hidden_dim=hidden_dim, output_dim=2)
+    model = model_cls(input_dim=graph.features.shape[1], hidden_dim=hidden_dim, output_dim=1)
     x = torch.tensor(graph.features, dtype=torch.float32)
-    labels = torch.tensor(graph.labels, dtype=torch.long)
+    labels = torch.tensor(graph.labels, dtype=torch.float32)
     edge_index = torch.tensor(_edge_index_for_model(graph, model_name, top_k), dtype=torch.long)
     train_tensor = torch.tensor(train_idx, dtype=torch.long)
     val_tensor = torch.tensor(val_idx if val_idx.size else train_idx, dtype=torch.long)
+    test_tensor = torch.tensor(test_idx, dtype=torch.long)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32))
     best_state = None
     best_score = -1.0
     for _epoch in range(max(1, epochs)):
         model.train()
         optimizer.zero_grad()
-        logits = model(x) if model_name == "mlp" else model(x, edge_index)
-        loss = torch.nn.functional.cross_entropy(logits[train_tensor], labels[train_tensor])
+        logits = _model_logits(model, model_name, x, edge_index)
+        loss = criterion(logits[train_tensor], labels[train_tensor])
         loss.backward()
         optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            logits = model(x) if model_name == "mlp" else model(x, edge_index)
-            val_scores = torch.softmax(logits[val_tensor], dim=1)[:, 1].cpu().numpy()
+            logits = _model_logits(model, model_name, x, edge_index)
+            val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         val_metrics = binary_classification_metrics(graph.labels[val_tensor.numpy()], val_scores, k=100)
         if val_metrics["auprc"] >= best_score:
             best_score = val_metrics["auprc"]
@@ -760,10 +836,153 @@ def _fit_torch_model(
         model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        logits = model(x) if model_name == "mlp" else model(x, edge_index)
-        val_scores = torch.softmax(logits[val_tensor], dim=1)[:, 1].cpu().numpy()
-        test_scores = torch.softmax(logits[torch.tensor(test_idx, dtype=torch.long)], dim=1)[:, 1].cpu().numpy()
-    return val_scores, test_scores, {"model_state_dict": best_state, "model_name": model_name}
+        logits = _model_logits(model, model_name, x, edge_index)
+        val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
+        test_scores = torch.sigmoid(logits[test_tensor]).cpu().numpy()
+    return val_scores, test_scores, {"model_state_dict": best_state, "model_name": model_name, "pos_weight": float(pos_weight)}
+
+
+def _model_logits(model, model_name: str, x, edge_index):
+    logits = model(x) if model_name == "mlp" else model(x, edge_index)
+    return logits.squeeze(-1)
+
+
+def _fit_torch_feature_model(
+    features: np.ndarray,
+    features_without_chains: np.ndarray,
+    labels: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    seed: int,
+    epochs: int,
+    lr: float,
+    hidden_dim: int,
+    pos_weight: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    if torch is None:
+        return _fit_numpy_feature_model(
+            features=features,
+            features_without_chains=features_without_chains,
+            labels=labels,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            seed=seed,
+            epochs=epochs,
+            lr=lr,
+            pos_weight=pos_weight,
+        )
+
+    torch.manual_seed(seed)
+    x = torch.tensor(features, dtype=torch.float32)
+    x_without = torch.tensor(features_without_chains, dtype=torch.float32)
+    y = torch.tensor(labels, dtype=torch.float32)
+    train_tensor = torch.tensor(train_idx, dtype=torch.long)
+    val_tensor = torch.tensor(val_idx if val_idx.size else train_idx, dtype=torch.long)
+    test_tensor = torch.tensor(test_idx, dtype=torch.long)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(features.shape[1], hidden_dim),
+        torch.nn.ReLU(),
+        torch.nn.Linear(hidden_dim, 1),
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32))
+    best_state = None
+    best_score = -1.0
+    for _epoch in range(max(1, epochs)):
+        model.train()
+        optimizer.zero_grad()
+        logits = model(x).squeeze(-1)
+        loss = criterion(logits[train_tensor], y[train_tensor])
+        loss.backward()
+        optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            logits = model(x).squeeze(-1)
+            val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
+        val_metrics = binary_classification_metrics(labels[val_tensor.numpy()], val_scores, k=100)
+        if val_metrics["auprc"] >= best_score:
+            best_score = val_metrics["auprc"]
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        logits = model(x).squeeze(-1)
+        logits_without = model(x_without).squeeze(-1)
+        val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
+        test_scores = torch.sigmoid(logits[test_tensor]).cpu().numpy()
+        scores_without_chains = torch.sigmoid(logits_without[test_tensor]).cpu().numpy()
+    return val_scores, test_scores, scores_without_chains, {
+        "model_state_dict": best_state,
+        "model_name": "hero_feature_mlp",
+        "pos_weight": float(pos_weight),
+    }
+
+
+def _fit_numpy_feature_model(
+    features: np.ndarray,
+    features_without_chains: np.ndarray,
+    labels: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    seed: int,
+    epochs: int,
+    lr: float,
+    pos_weight: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    rng = np.random.default_rng(seed)
+    x = np.asarray(features, dtype=np.float32)
+    x_without = np.asarray(features_without_chains, dtype=np.float32)
+    y = np.asarray(labels, dtype=np.float32)
+    train_idx = np.asarray(train_idx, dtype=np.int64)
+    val_idx_eval = np.asarray(val_idx if val_idx.size else train_idx, dtype=np.int64)
+    test_idx = np.asarray(test_idx, dtype=np.int64)
+
+    mean = x[train_idx].mean(axis=0, keepdims=True)
+    std = x[train_idx].std(axis=0, keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)
+    x_scaled = (x - mean) / std
+    x_without_scaled = (x_without - mean) / std
+    weights = rng.normal(0.0, 0.01, size=x.shape[1]).astype(np.float32)
+    bias = np.float32(0.0)
+    train_y = y[train_idx]
+    sample_weights = np.where(train_y == 1.0, float(pos_weight), 1.0).astype(np.float32)
+    step = float(lr) if lr > 0 else 0.001
+    # This is the same weighted logistic objective as BCEWithLogitsLoss(pos_weight);
+    # it keeps the repo runnable in environments where torch is unavailable.
+    for _epoch in range(max(1, epochs)):
+        logits = x_scaled[train_idx] @ weights + bias
+        probs = _sigmoid_np(logits)
+        errors = (probs - train_y) * sample_weights
+        denom = max(float(train_idx.size), 1.0)
+        grad_w = (x_scaled[train_idx].T @ errors) / denom + 1e-4 * weights
+        grad_b = np.sum(errors) / denom
+        weights -= step * grad_w.astype(np.float32)
+        bias = np.float32(bias - step * grad_b)
+
+    scores = _sigmoid_np(x_scaled @ weights + bias).astype(np.float32)
+    scores_without = _sigmoid_np(x_without_scaled @ weights + bias).astype(np.float32)
+    return (
+        scores[val_idx_eval],
+        scores[test_idx],
+        scores_without[test_idx],
+        {
+            "model_name": "numpy_weighted_logistic",
+            "weights": weights,
+            "bias": float(bias),
+            "pos_weight": float(pos_weight),
+        },
+    )
+
+
+def _sigmoid_np(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    return 1.0 / (1.0 + np.exp(-np.clip(values, -40.0, 40.0)))
 
 
 def _graphsage_features(features: np.ndarray, edge_index: np.ndarray) -> np.ndarray:
