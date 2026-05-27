@@ -17,6 +17,7 @@ neighbor_retrieval:
 evidence_chain:
   topk_chains: 3
   max_chain_length: 2
+  min_chain_quality: 0.45
 model:
   name: hero_gnn
   hidden_dim: 64
@@ -26,6 +27,7 @@ model:
 training:
   epochs: 10
   lr: 0.001
-  lambda_chain_pos: 0.05
+  lambda_chain_pos: 0.03
+  lambda_chain_neg: 0.01
 outputs:
   root: outputs

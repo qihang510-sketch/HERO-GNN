@@ -31,13 +31,16 @@ def build_evidence_chains(
                 if second["neighbor_id"] == target_id:
                     continue
                 chains.append(_two_hop_chain(first, second))
-    return sorted(chains, key=lambda item: item["chain_score"], reverse=True)[:top_k]
+    for chain in chains:
+        _with_chain_quality(chain)
+    return sorted(chains, key=lambda item: (item["chain_quality"], item["chain_score"]), reverse=True)[:top_k]
 
 
 def _one_hop_chain(label: dict[str, Any]) -> dict[str, Any]:
     candidate = label.get("candidate", {})
     score = float(label.get("risk_score", label.get("confidence", 0.0)))
-    return {
+    signals = _chain_signals(label)
+    return _with_chain_quality({
         "target_id": label["target_id"],
         "chain_nodes": [label["target_id"], label["neighbor_id"]],
         "chain_edges": [label["metapath"]],
@@ -47,13 +50,15 @@ def _one_hop_chain(label: dict[str, Any]) -> dict[str, Any]:
         "confidence": float(label.get("confidence", 0.0)),
         "rationale": label["rationale"],
         "neighbor_idx": candidate.get("neighbor_idx"),
-    }
+        **signals,
+    })
 
 
 def _two_hop_chain(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
     first_score = float(first.get("risk_score", first.get("confidence", 0.0)))
     second_score = float(second.get("risk_score", second.get("confidence", 0.0)))
-    return {
+    signals = _average_signals(first, second)
+    return _with_chain_quality({
         "target_id": first["target_id"],
         "chain_nodes": [first["target_id"], first["neighbor_id"], second["neighbor_id"]],
         "chain_edges": [first["metapath"], second["metapath"]],
@@ -63,4 +68,60 @@ def _two_hop_chain(first: dict[str, Any], second: dict[str, Any]) -> dict[str, A
         "confidence": float(first.get("confidence", 0.0)),
         "rationale": f"{first['rationale']}; then {second['rationale']}",
         "neighbor_idx": first.get("candidate", {}).get("neighbor_idx"),
+        **signals,
+    })
+
+
+def _with_chain_quality(chain: dict[str, Any]) -> dict[str, Any]:
+    confidence = _bounded(chain.get("confidence", 0.0))
+    risk_relevance = int(chain.get("risk_relevance", 0))
+    chain_score = _bounded(chain.get("chain_score", 0.0))
+    structural_score = _bounded(chain.get("structural_score", 0.0))
+    numeric_deviation = _bounded(chain.get("numeric_deviation", 0.0))
+    chain["confidence"] = confidence
+    chain["chain_score"] = chain_score
+    chain["structural_score"] = structural_score
+    chain["numeric_deviation"] = numeric_deviation
+    chain["time_deviation"] = _bounded(chain.get("time_deviation", 0.0))
+    chain["semantic_dissimilarity"] = _bounded(chain.get("semantic_dissimilarity", 0.0))
+    chain["chain_quality"] = _bounded(
+        0.30 * confidence
+        + 0.25 * float(risk_relevance)
+        + 0.20 * chain_score
+        + 0.15 * structural_score
+        + 0.10 * numeric_deviation
+    )
+    return chain
+
+
+def _chain_signals(label: dict[str, Any]) -> dict[str, float]:
+    candidate = label.get("candidate", {}) or {}
+    risk_card = label.get("risk_card", {}) or {}
+    semantic_similarity = _first_numeric(candidate, risk_card, "semantic_similarity", default=1.0)
+    return {
+        "structural_score": _first_numeric(candidate, risk_card, "structural_score", default=0.0),
+        "numeric_deviation": _first_numeric(candidate, risk_card, "numeric_deviation", default=0.0),
+        "time_deviation": _first_numeric(candidate, risk_card, "time_deviation", default=0.0),
+        "semantic_dissimilarity": _first_numeric(candidate, risk_card, "semantic_distance", default=1.0 - semantic_similarity),
     }
+
+
+def _average_signals(first: dict[str, Any], second: dict[str, Any]) -> dict[str, float]:
+    left = _chain_signals(first)
+    right = _chain_signals(second)
+    return {key: (left.get(key, 0.0) + right.get(key, 0.0)) / 2.0 for key in left}
+
+
+def _first_numeric(primary: dict[str, Any], secondary: dict[str, Any], key: str, default: float = 0.0) -> float:
+    for container in (primary, secondary):
+        if key in container and container[key] is not None:
+            return _bounded(container[key])
+    return _bounded(default)
+
+
+def _bounded(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = 0.0
+    return float(min(max(numeric, 0.0), 1.0))
