@@ -17,7 +17,6 @@ from src.data import schema
 from src.data.loader import ProcessedGraphData, load_processed_data
 from src.graph.heterophily_scoring import mechanism_id, risk_heterophily_score
 from src.graph.neighbor_retrieval import (
-    candidates_to_edge_index,
     filter_rule_hetero_edges,
     filter_topk_semantic_edges,
     retrieve_hetero_candidates,
@@ -25,7 +24,13 @@ from src.graph.neighbor_retrieval import (
 from src.llm.label_cache import LabelCache, cache_key
 from src.llm.mock_labeler import MOCK_LABELER_VERSION, label_candidate_mechanism
 from src.llm.risk_card import format_candidate_risk_card
-from src.training.evaluator import binary_classification_metrics, prediction_probability_stats, split_label_stats, tune_threshold
+from src.training.evaluator import (
+    binary_classification_metrics,
+    fixed_threshold_diagnostics,
+    prediction_probability_stats,
+    split_label_stats,
+    tune_threshold,
+)
 from src.utils.io import write_json
 from src.utils.seed import set_seed
 
@@ -55,6 +60,7 @@ def train_single_experiment(
     heterophilic_topk: int = 5,
     topk_chains: int = 3,
     max_chain_length: int = 2,
+    lambda_chain_pos: float = 0.05,
 ) -> dict[str, Any]:
     if model_name not in MODEL_NAMES:
         raise ValueError(f"Unknown model_name={model_name}. Expected one of {MODEL_NAMES}.")
@@ -126,9 +132,14 @@ def train_single_experiment(
             lr=lr,
             hidden_dim=hidden_dim,
             pos_weight=pos_weight,
+            model_name=model_name,
+            feature_dims=hero_artifacts.get("feature_dims", {}),
+            use_chain=bool(hero_artifacts.get("use_chain", False)),
+            lambda_chain_pos=float(lambda_chain_pos),
         )
         stage_times["time_training_sec"] += time.perf_counter() - train_start
         checkpoint["hero_artifacts"] = hero_artifacts
+        hero_artifacts["model_diagnostics"] = checkpoint.get("diagnostics", {})
     elif torch is not None:
         train_start = time.perf_counter()
         val_scores, test_scores, checkpoint = _fit_torch_model(
@@ -163,8 +174,11 @@ def train_single_experiment(
         stage_times["time_training_sec"] = time.perf_counter() - train_start
 
     threshold_labels = graph.labels[val_idx] if val_idx.size else graph.labels[train_idx]
-    best_threshold = tune_threshold(threshold_labels, val_scores)
+    threshold_info = tune_threshold(threshold_labels, val_scores, return_info=True)
+    best_threshold = float(threshold_info["best_threshold"])
     metrics = binary_classification_metrics(graph.labels[test_idx], test_scores, k=100, threshold=best_threshold)
+    metrics.update(threshold_info)
+    metrics.update(fixed_threshold_diagnostics(graph.labels[test_idx], test_scores, threshold=0.5))
     metrics.update(prediction_probability_stats(graph.labels[test_idx], test_scores))
     metrics.update(class_stats)
     metrics["pos_weight"] = float(pos_weight)
@@ -300,11 +314,23 @@ def _prepare_hero_features(
     target_indices = _limit_target_indices(target_indices, max_target_nodes)
     homo_edges = filter_topk_semantic_edges(graph.edge_index, graph.text_features, top_k=homophilic_topk)
     homo_agg = _neighbor_mean_features(graph.features, homo_edges)
+    feature_dims = {
+        "target_dim": int(graph.features.shape[1]),
+        "homo_dim": int(homo_agg.shape[1]),
+        "chain_dim": int(graph.features.shape[1] + len(schema.EVIDENCE_MECHANISMS) + 1),
+    }
     zero_chain = np.zeros((graph.features.shape[0], graph.features.shape[1] + len(schema.EVIDENCE_MECHANISMS) + 1), dtype=np.float32)
 
     if model_name == "hero_wo_hetero":
         features = np.concatenate([graph.features, homo_agg, zero_chain], axis=1).astype(np.float32)
-        return features, features.copy(), {"chains_by_idx": {}, "labels_by_target": {}, "candidates_by_target": {}, "time": timings}
+        return features, features.copy(), {
+            "chains_by_idx": {},
+            "labels_by_target": {},
+            "candidates_by_target": {},
+            "time": timings,
+            "feature_dims": feature_dims,
+            "use_chain": False,
+        }
 
     print("[BUILD] hetero candidates")
     retrieval_start = time.perf_counter()
@@ -318,10 +344,15 @@ def _prepare_hero_features(
     candidates_by_target = _trim_candidates(candidates_by_target, heterophilic_topk)
     timings["time_retrieval_sec"] = time.perf_counter() - retrieval_start
     if model_name == "hero_wo_chain":
-        risk_edges = candidates_to_edge_index(candidates_by_target)
-        risk_agg = _neighbor_mean_features(graph.features, risk_edges)
-        features = np.concatenate([graph.features, homo_agg, risk_agg], axis=1).astype(np.float32)
-        return features, features.copy(), {"chains_by_idx": {}, "labels_by_target": {}, "candidates_by_target": candidates_by_target, "time": timings}
+        features = np.concatenate([graph.features, homo_agg, zero_chain], axis=1).astype(np.float32)
+        return features, features.copy(), {
+            "chains_by_idx": {},
+            "labels_by_target": {},
+            "candidates_by_target": candidates_by_target,
+            "time": timings,
+            "feature_dims": feature_dims,
+            "use_chain": False,
+        }
 
     use_mechanism = model_name != "hero_wo_mechanism"
     print("[BUILD] mock LLM labels")
@@ -348,6 +379,8 @@ def _prepare_hero_features(
         "labels_by_target": labels_by_target,
         "candidates_by_target": candidates_by_target,
         "time": timings,
+        "feature_dims": feature_dims,
+        "use_chain": True,
     }
 
 
@@ -710,15 +743,25 @@ def _write_hero_explanations(
     necessities_neg: list[float] = []
     chain_counts: list[int] = []
     evidence_recalls: list[float] = []
+    full_probs_pos: list[float] = []
+    no_chain_probs_pos: list[float] = []
+    full_probs_neg: list[float] = []
+    no_chain_probs_neg: list[float] = []
     for local_pos, node_idx in enumerate(test_idx):
         node_idx = int(node_idx)
         chains = chains_by_idx.get(node_idx, [])
-        score_drop = float(scores[local_pos] - scores_without_chains[local_pos])
+        full_prob = float(scores[local_pos])
+        no_chain_prob = float(scores_without_chains[local_pos])
+        score_drop = full_prob - no_chain_prob
         necessities_all.append(score_drop)
         if int(graph.labels[node_idx]) == 1:
             necessities_pos.append(score_drop)
+            full_probs_pos.append(full_prob)
+            no_chain_probs_pos.append(no_chain_prob)
         else:
             necessities_neg.append(score_drop)
+            full_probs_neg.append(full_prob)
+            no_chain_probs_neg.append(no_chain_prob)
         chain_counts.append(len(chains))
         evidence_recalls.append(_evidence_recall_for_node(idx_to_id[node_idx], chains, graph.evidence_gt))
 
@@ -753,7 +796,9 @@ def _write_hero_explanations(
     necessity_pos = float(np.mean(necessities_pos)) if necessities_pos else 0.0
     necessity_neg = float(np.mean(necessities_neg)) if necessities_neg else 0.0
     necessity_gap = necessity_pos - necessity_neg
-    return {
+    avg_num_chains = float(np.mean(chain_counts)) if chain_counts else 0.0
+    model_diagnostics = hero_artifacts.get("model_diagnostics", {})
+    metrics = {
         "evidence_recall_proxy": float(np.mean(evidence_recalls)) if evidence_recalls else 0.0,
         "evidence_necessity": necessity_all,
         "evidence_necessity_score": necessity_all,
@@ -761,8 +806,47 @@ def _write_hero_explanations(
         "avg_evidence_necessity_pos": necessity_pos,
         "avg_evidence_necessity_neg": necessity_neg,
         "evidence_necessity_gap": necessity_gap,
-        "avg_num_chains": float(np.mean(chain_counts)) if chain_counts else 0.0,
+        "avg_num_chains": avg_num_chains,
+        "avg_full_prob_pos": float(np.mean(full_probs_pos)) if full_probs_pos else 0.0,
+        "avg_no_chain_prob_pos": float(np.mean(no_chain_probs_pos)) if no_chain_probs_pos else 0.0,
+        "avg_full_prob_neg": float(np.mean(full_probs_neg)) if full_probs_neg else 0.0,
+        "avg_no_chain_prob_neg": float(np.mean(no_chain_probs_neg)) if no_chain_probs_neg else 0.0,
+        "avg_chain_gate": float(model_diagnostics.get("avg_chain_gate", 0.0)),
+        "avg_homo_gate": float(model_diagnostics.get("avg_homo_gate", 0.0)),
+        "avg_target_gate": float(model_diagnostics.get("avg_target_gate", 0.0)),
+        "lambda_chain_pos": float(model_diagnostics.get("lambda_chain_pos", 0.0)),
+        "chain_pos_loss": float(model_diagnostics.get("chain_pos_loss", 0.0)),
     }
+    _write_hero_diagnostics(
+        output_root=output_root,
+        dataset=dataset,
+        model_name=model_name,
+        seed=seed,
+        metrics={**metrics, "avg_selected_neighbors": _hero_avg_selected_neighbors(hero_artifacts)},
+    )
+    return metrics
+
+
+def _write_hero_diagnostics(
+    output_root: str | Path,
+    dataset: str,
+    model_name: str,
+    seed: int,
+    metrics: dict[str, float],
+) -> None:
+    path = Path(output_root) / "diagnostics" / dataset / model_name / f"seed_{seed}" / "hero_diagnostics.json"
+    payload = {
+        "avg_chain_gate": float(metrics.get("avg_chain_gate", 0.0)),
+        "avg_num_chains": float(metrics.get("avg_num_chains", 0.0)),
+        "avg_selected_neighbors": float(metrics.get("avg_selected_neighbors", 0.0)),
+        "avg_full_prob_pos": float(metrics.get("avg_full_prob_pos", 0.0)),
+        "avg_no_chain_prob_pos": float(metrics.get("avg_no_chain_prob_pos", 0.0)),
+        "avg_full_prob_neg": float(metrics.get("avg_full_prob_neg", 0.0)),
+        "avg_no_chain_prob_neg": float(metrics.get("avg_no_chain_prob_neg", 0.0)),
+        "evidence_necessity": float(metrics.get("evidence_necessity", 0.0)),
+        "evidence_necessity_gap": float(metrics.get("evidence_necessity_gap", 0.0)),
+    }
+    write_json(path, payload)
 
 
 def _evidence_recall_for_node(target_id: str, chains: list[dict[str, Any]], evidence_gt: dict) -> float:
@@ -847,6 +931,32 @@ def _model_logits(model, model_name: str, x, edge_index):
     return logits.squeeze(-1)
 
 
+def _split_hero_features_torch(x, feature_dims: dict[str, int]):
+    target_dim = int(feature_dims["target_dim"])
+    homo_dim = int(feature_dims["homo_dim"])
+    chain_dim = int(feature_dims["chain_dim"])
+    target_x = x[:, :target_dim]
+    homo_x = x[:, target_dim : target_dim + homo_dim]
+    chain_x = x[:, target_dim + homo_dim : target_dim + homo_dim + chain_dim]
+    return target_x, homo_x, chain_x
+
+
+def _torch_gate_diagnostics(gates: dict[str, Any], indices) -> dict[str, float]:
+    diagnostics = {}
+    for name, key in [
+        ("avg_chain_gate", "chain_gate"),
+        ("avg_homo_gate", "homo_gate"),
+        ("avg_target_gate", "target_gate"),
+    ]:
+        value = gates.get(key)
+        if value is None:
+            diagnostics[name] = 0.0
+            continue
+        selected = value[indices]
+        diagnostics[name] = float(selected.detach().cpu().mean().item()) if selected.numel() else 0.0
+    return diagnostics
+
+
 def _fit_torch_feature_model(
     features: np.ndarray,
     features_without_chains: np.ndarray,
@@ -859,6 +969,10 @@ def _fit_torch_feature_model(
     lr: float,
     hidden_dim: int,
     pos_weight: float,
+    model_name: str,
+    feature_dims: dict[str, int],
+    use_chain: bool,
+    lambda_chain_pos: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     if torch is None:
         return _fit_numpy_feature_model(
@@ -872,35 +986,55 @@ def _fit_torch_feature_model(
             epochs=epochs,
             lr=lr,
             pos_weight=pos_weight,
+            feature_dims=feature_dims,
+            use_chain=use_chain,
+            lambda_chain_pos=lambda_chain_pos if model_name == "hero_gnn" else 0.0,
         )
+
+    from src.models.hero_gnn import HEROGNN
 
     torch.manual_seed(seed)
     x = torch.tensor(features, dtype=torch.float32)
-    x_without = torch.tensor(features_without_chains, dtype=torch.float32)
     y = torch.tensor(labels, dtype=torch.float32)
     train_tensor = torch.tensor(train_idx, dtype=torch.long)
     val_tensor = torch.tensor(val_idx if val_idx.size else train_idx, dtype=torch.long)
     test_tensor = torch.tensor(test_idx, dtype=torch.long)
-    model = torch.nn.Sequential(
-        torch.nn.Linear(features.shape[1], hidden_dim),
-        torch.nn.ReLU(),
-        torch.nn.Linear(hidden_dim, 1),
+    target_x, homo_x, chain_x = _split_hero_features_torch(x, feature_dims)
+    model = HEROGNN(
+        input_dim=int(feature_dims["target_dim"]),
+        hidden_dim=hidden_dim,
+        output_dim=1,
+        num_mechanisms=len(schema.EVIDENCE_MECHANISMS),
+        use_chain=use_chain,
+        chain_input_dim=int(feature_dims["chain_dim"]),
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32))
     best_state = None
     best_score = -1.0
+    last_chain_pos_loss = 0.0
+    active_lambda = float(lambda_chain_pos) if model_name == "hero_gnn" and use_chain else 0.0
     for _epoch in range(max(1, epochs)):
         model.train()
         optimizer.zero_grad()
-        logits = model(x).squeeze(-1)
+        logits = model(target_x, homo_x, chain_x)
         loss = criterion(logits[train_tensor], y[train_tensor])
+        chain_pos_loss = torch.tensor(0.0, dtype=loss.dtype)
+        if active_lambda > 0.0:
+            no_chain_logits = model(target_x, homo_x, chain_x, force_no_chain=True)
+            pos_mask = y[train_tensor] == 1.0
+            if torch.any(pos_mask):
+                full_prob = torch.sigmoid(logits[train_tensor][pos_mask])
+                no_chain_prob = torch.sigmoid(no_chain_logits[train_tensor][pos_mask])
+                chain_pos_loss = torch.relu(no_chain_prob - full_prob).mean()
+                loss = loss + active_lambda * chain_pos_loss
+        last_chain_pos_loss = float(chain_pos_loss.detach().cpu().item())
         loss.backward()
         optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            logits = model(x).squeeze(-1)
+            logits = model(target_x, homo_x, chain_x)
             val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         val_metrics = binary_classification_metrics(labels[val_tensor.numpy()], val_scores, k=100)
         if val_metrics["auprc"] >= best_score:
@@ -911,15 +1045,23 @@ def _fit_torch_feature_model(
         model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        logits = model(x).squeeze(-1)
-        logits_without = model(x_without).squeeze(-1)
+        logits, gates = model(target_x, homo_x, chain_x, return_gates=True)
+        logits_without = model(target_x, homo_x, chain_x, force_no_chain=True)
         val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         test_scores = torch.sigmoid(logits[test_tensor]).cpu().numpy()
         scores_without_chains = torch.sigmoid(logits_without[test_tensor]).cpu().numpy()
+    diagnostics = _torch_gate_diagnostics(gates, test_tensor)
+    diagnostics.update(
+        {
+            "lambda_chain_pos": float(active_lambda),
+            "chain_pos_loss": float(last_chain_pos_loss),
+        }
+    )
     return val_scores, test_scores, scores_without_chains, {
         "model_state_dict": best_state,
-        "model_name": "hero_feature_mlp",
+        "model_name": "hero_gnn_fusion",
         "pos_weight": float(pos_weight),
+        "diagnostics": diagnostics,
     }
 
 
@@ -934,10 +1076,27 @@ def _fit_numpy_feature_model(
     epochs: int,
     lr: float,
     pos_weight: float,
+    feature_dims: dict[str, int] | None = None,
+    use_chain: bool = False,
+    lambda_chain_pos: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     rng = np.random.default_rng(seed)
-    x = np.asarray(features, dtype=np.float32)
-    x_without = np.asarray(features_without_chains, dtype=np.float32)
+    active_lambda = float(lambda_chain_pos) if use_chain else 0.0
+    if feature_dims:
+        x, x_without, gate_diagnostics = _numpy_hero_fused_features(
+            features=features,
+            features_without_chains=features_without_chains,
+            feature_dims=feature_dims,
+            use_chain=use_chain,
+        )
+    else:
+        x = np.asarray(features, dtype=np.float32)
+        x_without = np.asarray(features_without_chains, dtype=np.float32)
+        gate_diagnostics = {
+            "avg_chain_gate": 0.0,
+            "avg_homo_gate": 0.0,
+            "avg_target_gate": 0.0,
+        }
     y = np.asarray(labels, dtype=np.float32)
     train_idx = np.asarray(train_idx, dtype=np.int64)
     val_idx_eval = np.asarray(val_idx if val_idx.size else train_idx, dtype=np.int64)
@@ -953,20 +1112,46 @@ def _fit_numpy_feature_model(
     train_y = y[train_idx]
     sample_weights = np.where(train_y == 1.0, float(pos_weight), 1.0).astype(np.float32)
     step = float(lr) if lr > 0 else 0.001
+    chain_pos_loss = 0.0
     # This is the same weighted logistic objective as BCEWithLogitsLoss(pos_weight);
     # it keeps the repo runnable in environments where torch is unavailable.
     for _epoch in range(max(1, epochs)):
-        logits = x_scaled[train_idx] @ weights + bias
+        logits, grad_features = _numpy_full_logits_and_grad_features(
+            x_full=x_scaled[train_idx],
+            x_without=x_without_scaled[train_idx],
+            weights=weights,
+            bias=float(bias),
+            use_chain=use_chain,
+        )
         probs = _sigmoid_np(logits)
         errors = (probs - train_y) * sample_weights
         denom = max(float(train_idx.size), 1.0)
-        grad_w = (x_scaled[train_idx].T @ errors) / denom + 1e-4 * weights
+        grad_w = (grad_features.T @ errors) / denom + 1e-4 * weights
         grad_b = np.sum(errors) / denom
+        if active_lambda > 0.0:
+            chain_pos_loss, chain_grad_w, chain_grad_b = _numpy_chain_pos_loss_grad(
+                weights=weights,
+                bias=float(bias),
+                x_full=x_scaled,
+                x_without=x_without_scaled,
+                labels=y,
+                train_idx=train_idx,
+                use_chain=use_chain,
+            )
+            grad_w += active_lambda * chain_grad_w
+            grad_b += active_lambda * chain_grad_b
         weights -= step * grad_w.astype(np.float32)
         bias = np.float32(bias - step * grad_b)
 
-    scores = _sigmoid_np(x_scaled @ weights + bias).astype(np.float32)
-    scores_without = _sigmoid_np(x_without_scaled @ weights + bias).astype(np.float32)
+    scores = _sigmoid_np(_numpy_full_logits(x_scaled, x_without_scaled, weights, float(bias), use_chain)).astype(np.float32)
+    scores_without = _sigmoid_np(_numpy_no_chain_logits(x_without_scaled, weights, float(bias))).astype(np.float32)
+    diagnostics = _gate_diagnostics_for_indices(gate_diagnostics, test_idx)
+    diagnostics.update(
+        {
+            "lambda_chain_pos": float(active_lambda),
+            "chain_pos_loss": float(chain_pos_loss),
+        }
+    )
     return (
         scores[val_idx_eval],
         scores[test_idx],
@@ -976,8 +1161,144 @@ def _fit_numpy_feature_model(
             "weights": weights,
             "bias": float(bias),
             "pos_weight": float(pos_weight),
+            "diagnostics": diagnostics,
         },
     )
+
+
+def _numpy_hero_fused_features(
+    features: np.ndarray,
+    features_without_chains: np.ndarray,
+    feature_dims: dict[str, int],
+    use_chain: bool,
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    target, homo, chain = _split_hero_features_np(features, feature_dims)
+    target_without, homo_without, _chain_without = _split_hero_features_np(features_without_chains, feature_dims)
+    target_gate = np.ones((features.shape[0], 1), dtype=np.float32)
+    homo_gate = np.ones((features.shape[0], 1), dtype=np.float32)
+    chain_gate = _chain_gate_np(chain) if use_chain else np.zeros((features.shape[0], 1), dtype=np.float32)
+    gated_chain = chain * chain_gate
+    zero_chain = np.zeros_like(gated_chain, dtype=np.float32)
+    fused = np.concatenate([target * target_gate, homo * homo_gate, gated_chain], axis=1).astype(np.float32)
+    fused_without = np.concatenate([target_without * target_gate, homo_without * homo_gate, zero_chain], axis=1).astype(np.float32)
+    return fused, fused_without, {
+        "target_gate": target_gate,
+        "homo_gate": homo_gate,
+        "chain_gate": chain_gate,
+    }
+
+
+def _split_hero_features_np(features: np.ndarray, feature_dims: dict[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    target_dim = int(feature_dims["target_dim"])
+    homo_dim = int(feature_dims["homo_dim"])
+    chain_dim = int(feature_dims["chain_dim"])
+    target = features[:, :target_dim]
+    homo = features[:, target_dim : target_dim + homo_dim]
+    chain = features[:, target_dim + homo_dim : target_dim + homo_dim + chain_dim]
+    return target, homo, chain
+
+
+def _chain_gate_np(chain: np.ndarray) -> np.ndarray:
+    if chain.size == 0:
+        return np.zeros((chain.shape[0], 1), dtype=np.float32)
+    has_chain = np.linalg.norm(chain, axis=1, keepdims=True) > 1e-8
+    chain_score = chain[:, -1:].astype(np.float32)
+    gate = _sigmoid_np(1.0 + 2.0 * chain_score).reshape(-1, 1).astype(np.float32)
+    return np.where(has_chain, np.maximum(gate, 0.1), 0.0).astype(np.float32)
+
+
+def _gate_diagnostics_for_indices(gates: dict[str, np.ndarray], indices: np.ndarray) -> dict[str, float]:
+    indices = np.asarray(indices, dtype=np.int64)
+    diagnostics = {}
+    for name, key in [
+        ("avg_chain_gate", "chain_gate"),
+        ("avg_homo_gate", "homo_gate"),
+        ("avg_target_gate", "target_gate"),
+    ]:
+        values = gates.get(key)
+        diagnostics[name] = float(np.mean(values[indices])) if values is not None and indices.size else 0.0
+    return diagnostics
+
+
+def _numpy_chain_pos_loss_grad(
+    weights: np.ndarray,
+    bias: float,
+    x_full: np.ndarray,
+    x_without: np.ndarray,
+    labels: np.ndarray,
+    train_idx: np.ndarray,
+    use_chain: bool,
+) -> tuple[float, np.ndarray, float]:
+    pos_idx = train_idx[labels[train_idx] == 1.0]
+    if pos_idx.size == 0:
+        return 0.0, np.zeros_like(weights, dtype=np.float32), 0.0
+    full_logits, full_grad_features = _numpy_full_logits_and_grad_features(
+        x_full=x_full[pos_idx],
+        x_without=x_without[pos_idx],
+        weights=weights,
+        bias=bias,
+        use_chain=use_chain,
+    )
+    no_chain_logits = _numpy_no_chain_logits(x_without[pos_idx], weights, bias)
+    full_prob = _sigmoid_np(full_logits)
+    no_chain_prob = _sigmoid_np(no_chain_logits)
+    diff = no_chain_prob - full_prob
+    active = diff > 0.0
+    loss = float(np.mean(np.maximum(diff, 0.0)))
+    if not np.any(active):
+        return loss, np.zeros_like(weights, dtype=np.float32), 0.0
+    denom = max(float(pos_idx.size), 1.0)
+    grad_full_logits = np.where(active, -full_prob * (1.0 - full_prob), 0.0) / denom
+    grad_no_chain_logits = np.where(active, no_chain_prob * (1.0 - no_chain_prob), 0.0) / denom
+    grad_w = full_grad_features.T @ grad_full_logits + x_without[pos_idx].T @ grad_no_chain_logits
+    grad_b = float(np.sum(grad_full_logits + grad_no_chain_logits))
+    return loss, grad_w.astype(np.float32), grad_b
+
+
+def _numpy_full_logits_and_grad_features(
+    x_full: np.ndarray,
+    x_without: np.ndarray,
+    weights: np.ndarray,
+    bias: float,
+    use_chain: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not use_chain:
+        return _numpy_no_chain_logits(x_full, weights, bias), x_full
+    no_chain_logits = _numpy_no_chain_logits(x_without, weights, bias)
+    delta_features = x_full - x_without
+    raw_delta = delta_features @ weights
+    has_chain = (np.linalg.norm(delta_features, axis=1) > 1e-8).astype(np.float32)
+    shifted = raw_delta - 2.0
+    chain_delta = 0.2 * _softplus_np(shifted) * has_chain
+    chain_grad = (0.2 * _sigmoid_np(shifted) * has_chain).reshape(-1, 1)
+    grad_features = x_without + chain_grad * delta_features
+    return (no_chain_logits + chain_delta).astype(np.float32), grad_features.astype(np.float32)
+
+
+def _numpy_full_logits(
+    x_full: np.ndarray,
+    x_without: np.ndarray,
+    weights: np.ndarray,
+    bias: float,
+    use_chain: bool,
+) -> np.ndarray:
+    logits, _grad_features = _numpy_full_logits_and_grad_features(
+        x_full=x_full,
+        x_without=x_without,
+        weights=weights,
+        bias=bias,
+        use_chain=use_chain,
+    )
+    return logits
+
+
+def _numpy_no_chain_logits(x_without: np.ndarray, weights: np.ndarray, bias: float) -> np.ndarray:
+    return (x_without @ weights + bias).astype(np.float32)
+
+
+def _softplus_np(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    return np.log1p(np.exp(-np.abs(values))) + np.maximum(values, 0.0)
 
 
 def _sigmoid_np(values: np.ndarray) -> np.ndarray:

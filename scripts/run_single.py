@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heterophilic_topk", type=int, default=None, help="Top-k heterophilous candidates used downstream.")
     parser.add_argument("--topk_chains", type=int, default=None, help="Top-k evidence chains per target.")
     parser.add_argument("--max_chain_length", type=int, default=None, help="Maximum evidence chain length.")
+    parser.add_argument("--lambda_chain_pos", type=float, default=None, help="Positive-sample chain contribution loss weight.")
     return parser.parse_args()
 
 
@@ -64,6 +65,7 @@ def main() -> None:
         heterophilic_topk=int(_first_not_none(args.heterophilic_topk, neighbor_cfg.get("heterophilic_topk", 5))),
         topk_chains=int(_first_not_none(args.topk_chains, chain_cfg.get("topk_chains", 3))),
         max_chain_length=int(_first_not_none(args.max_chain_length, chain_cfg.get("max_chain_length", 2))),
+        lambda_chain_pos=float(_first_not_none(args.lambda_chain_pos, training_cfg.get("lambda_chain_pos", 0.05))),
     )
     print(metrics)
 

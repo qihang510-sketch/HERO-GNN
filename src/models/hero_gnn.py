@@ -20,18 +20,33 @@ if nn is not None:
             use_heterophily: bool = True,
             use_mechanism: bool = True,
             use_chain: bool = True,
+            chain_input_dim: int | None = None,
+            min_chain_gate: float = 0.05,
         ) -> None:
             super().__init__()
             self.use_heterophily = use_heterophily
             self.use_mechanism = use_mechanism
             self.use_chain = use_chain
+            self.min_chain_gate = float(min_chain_gate)
             self.target_encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
             self.homo_encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
             self.mechanism_embedding = nn.Embedding(num_mechanisms, hidden_dim)
             self.score_encoder = nn.Sequential(nn.Linear(1, hidden_dim), nn.ReLU())
-            self.chain_encoder = nn.Sequential(nn.Linear(input_dim + hidden_dim * 2, hidden_dim), nn.ReLU())
-            self.gate = nn.Sequential(nn.Linear(hidden_dim * 3, hidden_dim * 3), nn.Sigmoid())
-            self.classifier = nn.Linear(hidden_dim * 3, output_dim)
+            self.chain_component_encoder = nn.Sequential(nn.Linear(input_dim + hidden_dim * 2, hidden_dim), nn.ReLU())
+            chain_input_dim = hidden_dim if chain_input_dim is None else int(chain_input_dim)
+            if chain_input_dim == hidden_dim:
+                self.chain_encoder = nn.Identity()
+            else:
+                self.chain_encoder = nn.Sequential(nn.Linear(chain_input_dim, hidden_dim), nn.ReLU())
+            self.fusion_gate = nn.Linear(hidden_dim * 3, hidden_dim * 3)
+            with torch.no_grad():
+                self.fusion_gate.bias.zero_()
+                self.fusion_gate.bias[hidden_dim * 2 :].fill_(1.0)
+            self.base_classifier = nn.Linear(hidden_dim * 2, output_dim)
+            self.chain_classifier = nn.Linear(hidden_dim, output_dim)
+            self.chain_logit_scale = 0.2
+            with torch.no_grad():
+                self.chain_classifier.bias.fill_(-2.0)
 
         def encode_chain(
             self,
@@ -42,21 +57,45 @@ if nn is not None:
             pooled = chain_node_features.mean(dim=1)
             mech = self.mechanism_embedding(mechanism_ids)
             score = self.score_encoder(chain_scores.view(-1, 1))
-            return self.chain_encoder(torch.cat([pooled, mech, score], dim=1))
+            return self.chain_component_encoder(torch.cat([pooled, mech, score], dim=1))
 
         def forward(
             self,
             target_features: torch.Tensor,
             homo_neighbor_features: torch.Tensor,
-            chain_repr: torch.Tensor,
-        ) -> torch.Tensor:
+            chain_features: torch.Tensor,
+            force_no_chain: bool = False,
+            return_gates: bool = False,
+        ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
             target_repr = self.target_encoder(target_features)
             homo_repr = self.homo_encoder(homo_neighbor_features)
-            if not self.use_chain:
-                chain_repr = torch.zeros_like(chain_repr)
-            final_repr = torch.cat([target_repr, homo_repr, chain_repr], dim=1)
-            final_repr = final_repr * self.gate(final_repr)
-            return self.classifier(final_repr).squeeze(-1)
+            if self.use_chain and not force_no_chain:
+                chain_repr = self.chain_encoder(chain_features)
+                chain_presence = (chain_features.abs().sum(dim=1, keepdim=True) > 0).to(chain_repr.dtype)
+            else:
+                chain_repr = torch.zeros_like(target_repr)
+                chain_presence = torch.zeros((target_repr.shape[0], 1), dtype=target_repr.dtype, device=target_repr.device)
+            gate_input = torch.cat([target_repr, homo_repr, chain_repr], dim=1)
+            target_gate, homo_gate, chain_gate = torch.chunk(torch.sigmoid(self.fusion_gate(gate_input)), 3, dim=1)
+            if self.use_chain and not force_no_chain:
+                chain_gate = chain_gate.clamp_min(self.min_chain_gate)
+                chain_gate = chain_gate * chain_presence
+            else:
+                chain_gate = torch.zeros_like(chain_gate)
+            base_repr = torch.cat([target_gate * target_repr, homo_gate * homo_repr], dim=1)
+            base_logits = self.base_classifier(base_repr)
+            if self.use_chain and not force_no_chain:
+                chain_logits = torch.nn.functional.softplus(self.chain_classifier(chain_gate * chain_repr)) * self.chain_logit_scale * chain_presence
+            else:
+                chain_logits = torch.zeros_like(base_logits)
+            logits = (base_logits + chain_logits).squeeze(-1)
+            if return_gates:
+                return logits, {
+                    "target_gate": target_gate,
+                    "homo_gate": homo_gate,
+                    "chain_gate": chain_gate,
+                }
+            return logits
 
 else:
 

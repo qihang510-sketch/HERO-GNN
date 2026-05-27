@@ -26,5 +26,6 @@ model:
 training:
   epochs: 10
   lr: 0.001
+  lambda_chain_pos: 0.05
 outputs:
   root: outputs
