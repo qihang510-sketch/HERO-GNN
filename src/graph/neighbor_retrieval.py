@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from src.data import schema
 
@@ -58,6 +59,7 @@ class HeteroCandidate:
     same_user: bool
     same_device: bool
     same_item: bool
+    same_item_or_business: bool
     time_gap_is_short: bool
     burst_score: float
     neighbor_risk_prior: float
@@ -72,6 +74,7 @@ def retrieve_hetero_candidates(
     numeric_features: np.ndarray,
     target_indices: np.ndarray | list[int] | None = None,
     top_k: int = 10,
+    max_candidates_per_node: int | None = None,
     w_struct: float = 0.35,
     w_numeric: float = 0.25,
     w_time: float = 0.20,
@@ -86,16 +89,17 @@ def retrieve_hetero_candidates(
     """
     if target_indices is None:
         target_indices = np.unique(edge_index[0]) if edge_index.size else np.array([], dtype=np.int64)
+    top_k = int(max_candidates_per_node if max_candidates_per_node is not None else top_k)
     target_set = {int(index) for index in target_indices}
     idx_to_node_id = {idx: node_id for node_id, idx in node_id_to_idx.items()}
-    node_meta = nodes.set_index(schema.NODE_ID).to_dict(orient="index")
     timestamps = _timestamps(nodes, node_id_to_idx, len(node_id_to_idx))
     max_time_gap = max(float(np.ptp(timestamps)), 1.0)
     max_numeric = _max_pair_l1(numeric_features, edge_index)
     edge_type_by_pair = _edge_type_lookup(edges, node_id_to_idx)
+    burst_by_idx = _normalized_out_degree(edge_index, len(node_id_to_idx))
 
     by_target: dict[int, list[HeteroCandidate]] = {target: [] for target in target_set}
-    for src, dst in edge_index.T:
+    for src, dst in tqdm(edge_index.T, desc="neighbor_retrieval", unit="edge"):
         src = int(src)
         dst = int(dst)
         if src not in target_set:
@@ -119,8 +123,12 @@ def retrieve_hetero_candidates(
             + w_time * time_deviation
             + w_semantic * semantic_distance
         )
-        target_meta = node_meta.get(target_id, {})
-        neighbor_meta = node_meta.get(neighbor_id, {})
+        same_item_or_business = metapath in {
+            "review-item-review",
+            "review-business-review",
+            "review-product-review",
+            "review-rating-review",
+        }
         candidate = HeteroCandidate(
             target_idx=src,
             neighbor_idx=dst,
@@ -137,9 +145,10 @@ def retrieve_hetero_candidates(
             same_user=metapath == "review-user-review",
             same_device=metapath == "review-device-review",
             same_item=metapath == "review-item-review",
+            same_item_or_business=same_item_or_business,
             time_gap_is_short=time_deviation > 0.7,
-            burst_score=float(max(_feat(target_meta, "feat_1"), _feat(neighbor_meta, "feat_1"))),
-            neighbor_risk_prior=float(neighbor_meta.get(schema.LABEL, 0) == 1),
+            burst_score=float(max(burst_by_idx[src], burst_by_idx[dst])),
+            neighbor_risk_prior=0.0,
         )
         by_target[src].append(candidate)
 
@@ -190,6 +199,11 @@ def _metapath_proximity(metapath: str) -> float:
         "review-device-review": 0.90,
         "review-time-review": 0.75,
         "review-item-review": 0.65,
+        "review-business-review": 0.65,
+        "review-product-review": 0.65,
+        "review-rating-review": 0.60,
+        "review-month-review": 0.55,
+        "review-week-review": 0.55,
     }.get(metapath, 0.50)
 
 
@@ -217,16 +231,19 @@ def _max_pair_l1(numeric_features: np.ndarray, edge_index: np.ndarray) -> float:
     return float(max(np.max(deltas), 1.0))
 
 
+def _normalized_out_degree(edge_index: np.ndarray, size: int) -> np.ndarray:
+    if edge_index.size == 0 or size == 0:
+        return np.zeros(size, dtype=np.float32)
+    degree = np.bincount(edge_index[0], minlength=size).astype(np.float32)
+    max_degree = float(np.max(degree))
+    if max_degree <= 0:
+        return np.zeros(size, dtype=np.float32)
+    return degree / max_degree
+
+
 def _edge_type_lookup(edges: pd.DataFrame, node_id_to_idx: dict[str, int]) -> dict[tuple[int, int], str]:
     lookup: dict[tuple[int, int], str] = {}
     for src, dst, edge_type in edges[[schema.SRC, schema.DST, schema.EDGE_TYPE]].itertuples(index=False, name=None):
         if src in node_id_to_idx and dst in node_id_to_idx:
             lookup[(node_id_to_idx[src], node_id_to_idx[dst])] = str(edge_type)
     return lookup
-
-
-def _feat(meta: dict, key: str) -> float:
-    try:
-        return float(meta.get(key, 0.0))
-    except (TypeError, ValueError):
-        return 0.0

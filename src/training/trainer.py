@@ -3,16 +3,18 @@ from __future__ import annotations
 import logging
 import pickle
 import json
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
+from tqdm import tqdm
 
 from src.data import schema
 from src.data.loader import ProcessedGraphData, load_processed_data
-from src.graph.evidence_chain import build_evidence_chains
 from src.graph.heterophily_scoring import mechanism_id, risk_heterophily_score
 from src.graph.neighbor_retrieval import (
     candidates_to_edge_index,
@@ -21,8 +23,9 @@ from src.graph.neighbor_retrieval import (
     retrieve_hetero_candidates,
 )
 from src.llm.label_cache import LabelCache, cache_key
-from src.llm.mock_labeler import label_candidate_mechanism
-from src.training.evaluator import binary_classification_metrics
+from src.llm.mock_labeler import MOCK_LABELER_VERSION, label_candidate_mechanism
+from src.llm.risk_card import format_candidate_risk_card
+from src.training.evaluator import binary_classification_metrics, split_label_stats, tune_threshold
 from src.utils.io import write_json
 from src.utils.seed import set_seed
 
@@ -46,6 +49,12 @@ def train_single_experiment(
     lr: float = 0.001,
     hidden_dim: int = 64,
     top_k: int = 10,
+    max_target_nodes: int | None = None,
+    max_candidates_per_node: int = 20,
+    homophilic_topk: int = 5,
+    heterophilic_topk: int = 5,
+    topk_chains: int = 3,
+    max_chain_length: int = 2,
 ) -> dict[str, Any]:
     if model_name not in MODEL_NAMES:
         raise ValueError(f"Unknown model_name={model_name}. Expected one of {MODEL_NAMES}.")
@@ -55,6 +64,16 @@ def train_single_experiment(
     graph = load_processed_data(data_dir)
     paths = _experiment_paths(output_root, dataset, model_name, seed)
     logger = _make_logger(paths["log"], dataset, model_name, seed)
+    time_total_start = time.perf_counter()
+    stage_times = {
+        "time_retrieval_sec": 0.0,
+        "time_mock_labeling_sec": 0.0,
+        "time_evidence_chain_sec": 0.0,
+        "time_training_sec": 0.0,
+    }
+    start_message = f"[START] dataset={dataset} model={model_name} seed={seed}"
+    print(start_message)
+    logger.info(start_message)
     logger.info("Starting experiment dataset=%s model=%s seed=%s", dataset, model_name, seed)
     logger.info("Training knobs epochs=%s lr=%s hidden_dim=%s top_k=%s", epochs, lr, hidden_dim, top_k)
 
@@ -70,14 +89,25 @@ def train_single_experiment(
             data_dir=data_dir,
             model_name=model_name,
             target_indices=np.concatenate([train_idx, val_idx, test_idx]),
-            top_k=top_k,
+            homophilic_topk=homophilic_topk,
+            heterophilic_topk=heterophilic_topk,
+            max_target_nodes=max_target_nodes,
+            max_candidates_per_node=max_candidates_per_node,
+            topk_chains=topk_chains,
+            max_chain_length=max_chain_length,
         )
+        stage_times.update(hero_artifacts.get("time", {}))
+        print(f"[TRAIN] {model_name}")
+        train_start = time.perf_counter()
         classifier = _fit_classifier(features[train_idx], graph.labels[train_idx], seed=seed)
-        scores = _positive_scores(classifier, features[test_idx])
+        val_scores = _positive_scores(classifier, features[val_idx]) if val_idx.size else _positive_scores(classifier, features[train_idx])
+        test_scores = _positive_scores(classifier, features[test_idx])
         scores_without_chains = _positive_scores(classifier, features_without_chains[test_idx])
+        stage_times["time_training_sec"] += time.perf_counter() - train_start
         checkpoint = {"classifier": classifier, "hero_artifacts": hero_artifacts}
     elif torch is not None:
-        scores, checkpoint = _fit_torch_model(
+        train_start = time.perf_counter()
+        val_scores, test_scores, checkpoint = _fit_torch_model(
             graph=graph,
             model_name=model_name,
             train_idx=train_idx,
@@ -89,13 +119,28 @@ def train_single_experiment(
             hidden_dim=hidden_dim,
             top_k=top_k,
         )
+        stage_times["time_training_sec"] = time.perf_counter() - train_start
     else:
+        train_start = time.perf_counter()
         features = _prepare_features(graph, model_name, top_k=top_k)
         classifier = _fit_classifier(features[train_idx], graph.labels[train_idx], seed=seed)
-        scores = _positive_scores(classifier, features[test_idx])
+        val_scores = _positive_scores(classifier, features[val_idx]) if val_idx.size else _positive_scores(classifier, features[train_idx])
+        test_scores = _positive_scores(classifier, features[test_idx])
+        stage_times["time_training_sec"] = time.perf_counter() - train_start
         checkpoint = {"classifier": classifier}
 
-    metrics = binary_classification_metrics(graph.labels[test_idx], scores, k=100)
+    threshold_labels = graph.labels[val_idx] if val_idx.size else graph.labels[train_idx]
+    best_threshold = tune_threshold(threshold_labels, val_scores)
+    metrics = binary_classification_metrics(graph.labels[test_idx], test_scores, k=100, threshold=best_threshold)
+    metrics.update(
+        split_label_stats(
+            {
+                "train": graph.labels[train_idx],
+                "val": graph.labels[val_idx],
+                "test": graph.labels[test_idx],
+            }
+        )
+    )
     if model_name in HERO_MODEL_NAMES:
         explanation_metrics = _write_hero_explanations(
             graph=graph,
@@ -104,7 +149,7 @@ def train_single_experiment(
             seed=seed,
             output_root=output_root,
             test_idx=test_idx,
-            scores=scores,
+            scores=test_scores,
             scores_without_chains=scores_without_chains,
             hero_artifacts=hero_artifacts,
         )
@@ -118,9 +163,19 @@ def train_single_experiment(
         "seed": seed,
         **metrics,
     }
+    payload.update(stage_times)
+    payload["time_total_sec"] = time.perf_counter() - time_total_start
 
     write_json(paths["metrics"], payload)
     _write_checkpoint(paths["checkpoint"], checkpoint, payload)
+    done_message = f"[DONE] dataset={dataset} model={model_name} seed={seed} metrics={payload}"
+    print(done_message)
+    print(f"[TIME] model={model_name} total={payload['time_total_sec']:.3f}")
+    print(f"[TIME] retrieval={payload['time_retrieval_sec']:.3f}")
+    print(f"[TIME] mock_labeling={payload['time_mock_labeling_sec']:.3f}")
+    print(f"[TIME] evidence_chain={payload['time_evidence_chain_sec']:.3f}")
+    print(f"[TIME] training={payload['time_training_sec']:.3f}")
+    logger.info(done_message)
     logger.info("Finished experiment metrics=%s", payload)
     return payload
 
@@ -157,45 +212,63 @@ def _prepare_hero_features(
     data_dir: Path,
     model_name: str,
     target_indices: np.ndarray,
-    top_k: int,
+    homophilic_topk: int,
+    heterophilic_topk: int,
+    max_target_nodes: int | None,
+    max_candidates_per_node: int,
+    topk_chains: int,
+    max_chain_length: int,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    homo_edges = filter_topk_semantic_edges(graph.edge_index, graph.text_features, top_k=top_k)
+    print(f"[START] {model_name}")
+    timings = {
+        "time_retrieval_sec": 0.0,
+        "time_mock_labeling_sec": 0.0,
+        "time_evidence_chain_sec": 0.0,
+        "time_training_sec": 0.0,
+    }
+    target_indices = _limit_target_indices(target_indices, max_target_nodes)
+    homo_edges = filter_topk_semantic_edges(graph.edge_index, graph.text_features, top_k=homophilic_topk)
     homo_agg = _neighbor_mean_features(graph.features, homo_edges)
     zero_chain = np.zeros((graph.features.shape[0], graph.features.shape[1] + len(schema.EVIDENCE_MECHANISMS) + 1), dtype=np.float32)
 
     if model_name == "hero_wo_hetero":
         features = np.concatenate([graph.features, homo_agg, zero_chain], axis=1).astype(np.float32)
-        return features, features.copy(), {"chains_by_idx": {}, "labels_by_target": {}, "candidates_by_target": {}}
+        return features, features.copy(), {"chains_by_idx": {}, "labels_by_target": {}, "candidates_by_target": {}, "time": timings}
 
-    candidates_by_target = retrieve_hetero_candidates(
-        edge_index=graph.edge_index,
-        edges=graph.edges,
-        nodes=graph.nodes,
-        node_id_to_idx=graph.node_id_to_idx,
-        text_features=graph.text_features,
-        numeric_features=graph.numeric_features,
+    print("[BUILD] hetero candidates")
+    retrieval_start = time.perf_counter()
+    candidates_by_target = _load_or_build_hetero_candidates(
+        data_dir=data_dir,
+        graph=graph,
         target_indices=target_indices,
-        top_k=top_k,
+        max_target_nodes=max_target_nodes,
+        max_candidates_per_node=max_candidates_per_node,
     )
+    candidates_by_target = _trim_candidates(candidates_by_target, heterophilic_topk)
+    timings["time_retrieval_sec"] = time.perf_counter() - retrieval_start
     if model_name == "hero_wo_chain":
         risk_edges = candidates_to_edge_index(candidates_by_target)
         risk_agg = _neighbor_mean_features(graph.features, risk_edges)
         features = np.concatenate([graph.features, homo_agg, risk_agg], axis=1).astype(np.float32)
-        return features, features.copy(), {"chains_by_idx": {}, "labels_by_target": {}, "candidates_by_target": candidates_by_target}
+        return features, features.copy(), {"chains_by_idx": {}, "labels_by_target": {}, "candidates_by_target": candidates_by_target, "time": timings}
 
     use_mechanism = model_name != "hero_wo_mechanism"
-    labels_by_target = _label_candidates(data_dir, candidates_by_target, use_mechanism=use_mechanism)
+    print("[BUILD] mock LLM labels")
+    labels_by_target, label_time = _label_candidates(data_dir, candidates_by_target, use_mechanism=use_mechanism)
+    timings["time_mock_labeling_sec"] = label_time
     flat_labels = [label for labels in labels_by_target.values() for label in labels]
-    chains_by_idx: dict[int, list[dict[str, Any]]] = {}
-    for target_idx, labels in labels_by_target.items():
-        target_id = labels[0]["target_id"] if labels else _idx_to_node_id(graph)[target_idx]
-        chains_by_idx[target_idx] = build_evidence_chains(
-            target_id=target_id,
-            labels=labels,
-            all_labels=flat_labels,
-            top_k=3,
-            include_two_hop=True,
-        )
+    print("[BUILD] evidence chains")
+    chain_start = time.perf_counter()
+    chains_by_idx = _load_or_build_evidence_chains(
+        data_dir=data_dir,
+        graph=graph,
+        labels_by_target=labels_by_target,
+        flat_labels=flat_labels,
+        topk_chains=topk_chains,
+        max_chain_length=max_chain_length,
+        use_cache=use_mechanism,
+    )
+    timings["time_evidence_chain_sec"] = time.perf_counter() - chain_start
     chain_features = _chain_feature_matrix(graph, chains_by_idx, use_mechanism=use_mechanism)
     features = np.concatenate([graph.features, homo_agg, chain_features], axis=1).astype(np.float32)
     features_without_chains = np.concatenate([graph.features, homo_agg, zero_chain], axis=1).astype(np.float32)
@@ -203,45 +276,263 @@ def _prepare_hero_features(
         "chains_by_idx": chains_by_idx,
         "labels_by_target": labels_by_target,
         "candidates_by_target": candidates_by_target,
+        "time": timings,
     }
+
+
+def _limit_target_indices(target_indices: np.ndarray, max_target_nodes: int | None) -> np.ndarray:
+    target_indices = np.asarray(target_indices, dtype=np.int64)
+    if max_target_nodes is None or max_target_nodes <= 0 or target_indices.size <= max_target_nodes:
+        return target_indices
+    return target_indices[: int(max_target_nodes)]
+
+
+def _load_or_build_hetero_candidates(
+    data_dir: Path,
+    graph: ProcessedGraphData,
+    target_indices: np.ndarray,
+    max_target_nodes: int | None,
+    max_candidates_per_node: int,
+) -> dict[int, list[Any]]:
+    path = data_dir / "hetero_candidates.pkl"
+    expected = {
+        "num_nodes": int(graph.features.shape[0]),
+        "num_edges": int(graph.edge_index.shape[1]),
+        "max_target_nodes": int(max_target_nodes) if max_target_nodes is not None else None,
+        "max_candidates_per_node": int(max_candidates_per_node),
+    }
+    if path.exists():
+        with path.open("rb") as handle:
+            payload = pickle.load(handle)
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        candidates = payload.get("candidates_by_target", payload) if isinstance(payload, dict) else payload
+        if _hetero_cache_is_compatible(metadata, expected):
+            print("[CACHE] loading hetero_candidates.pkl")
+            return _filter_candidate_targets(candidates, target_indices)
+        print("[BUILD] building hetero candidates")
+    else:
+        print("[BUILD] building hetero candidates")
+    candidates = retrieve_hetero_candidates(
+        edge_index=graph.edge_index,
+        edges=graph.edges,
+        nodes=graph.nodes,
+        node_id_to_idx=graph.node_id_to_idx,
+        text_features=graph.text_features,
+        numeric_features=graph.numeric_features,
+        target_indices=target_indices,
+        max_candidates_per_node=max_candidates_per_node,
+    )
+    with path.open("wb") as handle:
+        pickle.dump({"metadata": expected, "candidates_by_target": candidates}, handle)
+    return candidates
+
+
+def _hetero_cache_is_compatible(metadata: dict[str, Any], expected: dict[str, Any]) -> bool:
+    if metadata.get("num_nodes") != expected["num_nodes"] or metadata.get("num_edges") != expected["num_edges"]:
+        return False
+    cached_candidates = metadata.get("max_candidates_per_node")
+    if cached_candidates is not None and int(cached_candidates) < int(expected["max_candidates_per_node"]):
+        return False
+    cached_targets = metadata.get("max_target_nodes")
+    expected_targets = expected.get("max_target_nodes")
+    if expected_targets is None:
+        return cached_targets is None
+    if cached_targets is None:
+        return True
+    return int(cached_targets) >= int(expected_targets)
+
+
+def _filter_candidate_targets(candidates_by_target: dict[int, list[Any]], target_indices: np.ndarray) -> dict[int, list[Any]]:
+    target_set = {int(index) for index in target_indices}
+    return {target: candidates for target, candidates in candidates_by_target.items() if int(target) in target_set}
+
+
+def _trim_candidates(candidates_by_target: dict[int, list[Any]], limit: int) -> dict[int, list[Any]]:
+    if limit <= 0:
+        return {target: [] for target in candidates_by_target}
+    return {target: candidates[:limit] for target, candidates in candidates_by_target.items()}
+
+
+def _load_or_build_evidence_chains(
+    data_dir: Path,
+    graph: ProcessedGraphData,
+    labels_by_target: dict[int, list[dict[str, Any]]],
+    flat_labels: list[dict[str, Any]],
+    topk_chains: int,
+    max_chain_length: int,
+    use_cache: bool,
+) -> dict[int, list[dict[str, Any]]]:
+    path = data_dir / "evidence_chains.jsonl"
+    if use_cache and path.exists():
+        print("[CACHE] loading evidence_chains.jsonl")
+        cached = _read_evidence_chains(path)
+        if all(0 <= target_idx < graph.features.shape[0] for target_idx in cached):
+            return cached
+        print("[BUILD] building evidence chains")
+    else:
+        print("[BUILD] building evidence chains")
+    chains_by_idx = _build_evidence_chains_for_targets(
+        graph=graph,
+        labels_by_target=labels_by_target,
+        flat_labels=flat_labels,
+        topk_chains=topk_chains,
+        max_chain_length=max_chain_length,
+    )
+    if use_cache:
+        _write_evidence_chains(path, chains_by_idx)
+    return chains_by_idx
+
+
+def _build_evidence_chains_for_targets(
+    graph: ProcessedGraphData,
+    labels_by_target: dict[int, list[dict[str, Any]]],
+    flat_labels: list[dict[str, Any]],
+    topk_chains: int,
+    max_chain_length: int,
+) -> dict[int, list[dict[str, Any]]]:
+    idx_to_id = _idx_to_node_id(graph)
+    include_two_hop = max_chain_length >= 2
+    labels_by_target_id: dict[str, list[dict[str, Any]]] = {}
+    for label in flat_labels:
+        if label.get("risk_relevance", 0) == 1:
+            labels_by_target_id.setdefault(label["target_id"], []).append(label)
+    chains_by_idx: dict[int, list[dict[str, Any]]] = {}
+    iterator = tqdm(labels_by_target.items(), desc="evidence_chain building", unit="node")
+    for target_idx, labels in iterator:
+        target_id = labels[0]["target_id"] if labels else idx_to_id[target_idx]
+        chains_by_idx[target_idx] = _build_evidence_chains_indexed(
+            target_id=target_id,
+            labels=labels,
+            labels_by_target_id=labels_by_target_id,
+            top_k=topk_chains,
+            include_two_hop=include_two_hop,
+        )
+    return chains_by_idx
+
+
+def _build_evidence_chains_indexed(
+    target_id: str,
+    labels: list[dict[str, Any]],
+    labels_by_target_id: dict[str, list[dict[str, Any]]],
+    top_k: int,
+    include_two_hop: bool,
+) -> list[dict[str, Any]]:
+    direct = [label for label in labels if label.get("risk_relevance", 0) == 1]
+    chains = [_one_hop_chain_from_label(label) for label in direct]
+    if include_two_hop:
+        for first in direct:
+            for second in labels_by_target_id.get(first["neighbor_id"], [])[:2]:
+                if second["neighbor_id"] == target_id:
+                    continue
+                chains.append(_two_hop_chain_from_labels(first, second))
+    return sorted(chains, key=lambda item: item["chain_score"], reverse=True)[:top_k]
+
+
+def _one_hop_chain_from_label(label: dict[str, Any]) -> dict[str, Any]:
+    candidate = label.get("candidate", {})
+    score = float(label.get("risk_score", label.get("confidence", 0.0)))
+    return {
+        "target_id": label["target_id"],
+        "chain_nodes": [label["target_id"], label["neighbor_id"]],
+        "chain_edges": [label["metapath"]],
+        "mechanism": label["mechanism"],
+        "risk_relevance": int(label.get("risk_relevance", 0)),
+        "chain_score": score,
+        "confidence": float(label.get("confidence", 0.0)),
+        "rationale": label["rationale"],
+        "neighbor_idx": candidate.get("neighbor_idx"),
+    }
+
+
+def _two_hop_chain_from_labels(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    first_score = float(first.get("risk_score", first.get("confidence", 0.0)))
+    second_score = float(second.get("risk_score", second.get("confidence", 0.0)))
+    return {
+        "target_id": first["target_id"],
+        "chain_nodes": [first["target_id"], first["neighbor_id"], second["neighbor_id"]],
+        "chain_edges": [first["metapath"], second["metapath"]],
+        "mechanism": first["mechanism"],
+        "risk_relevance": int(first.get("risk_relevance", 0)),
+        "chain_score": (first_score + second_score) / 2.0,
+        "confidence": float(first.get("confidence", 0.0)),
+        "rationale": f"{first['rationale']}; then {second['rationale']}",
+        "neighbor_idx": first.get("candidate", {}).get("neighbor_idx"),
+    }
+
+
+def _write_evidence_chains(path: Path, chains_by_idx: dict[int, list[dict[str, Any]]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for target_idx in sorted(chains_by_idx):
+            payload = {"target_idx": int(target_idx), "chains": chains_by_idx[target_idx]}
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _read_evidence_chains(path: Path) -> dict[int, list[dict[str, Any]]]:
+    chains_by_idx: dict[int, list[dict[str, Any]]] = {}
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return chains_by_idx
+    for line in text.splitlines():
+        payload = json.loads(line)
+        chains_by_idx[int(payload["target_idx"])] = payload.get("chains", [])
+    return chains_by_idx
 
 
 def _label_candidates(
     data_dir: Path,
     candidates_by_target: dict[int, list[Any]],
     use_mechanism: bool,
-) -> dict[int, list[dict[str, Any]]]:
+) -> tuple[dict[int, list[dict[str, Any]]], float]:
+    label_start = time.perf_counter()
     cache = LabelCache(data_dir / "llm_labels.jsonl")
     labels_by_target: dict[int, list[dict[str, Any]]] = {}
-    for target_idx, candidates in candidates_by_target.items():
-        target_labels = []
-        for candidate in candidates:
-            key = cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath)
-            label = cache.get(key)
-            if label is None or "candidate" not in label:
-                label = label_candidate_mechanism(candidate)
-            if not use_mechanism:
-                label = dict(label)
-                label["mechanism"] = "irrelevant_heterophily"
-                label["risk_relevance"] = int(candidate.candidate_score >= 0.55)
-                label["confidence"] = float(candidate.candidate_score)
-                label["rationale"] = "rule score only; mechanism labels disabled"
-                label["candidate"] = getattr(candidate, "__dict__", label.get("candidate", {}))
-            score, mechanism_logits = risk_heterophily_score(
-                candidate,
-                mechanism=label.get("mechanism"),
-                risk_relevance_label=int(label.get("risk_relevance", 0)),
-                use_mechanism=use_mechanism,
-            )
+    if cache.path.exists():
+        print("[CACHE] loading llm_labels.jsonl")
+    pairs = [
+        (target_idx, candidate)
+        for target_idx, candidates in candidates_by_target.items()
+        for candidate in candidates
+    ]
+    base_by_pair: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    for target_idx, candidate in tqdm(pairs, desc="mock_labeler", unit="pair"):
+        key = cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath)
+        cached_label = cache.get(key)
+        if cached_label is None or cached_label.get("labeler_version") != MOCK_LABELER_VERSION:
+            base_label = label_candidate_mechanism(candidate)
+            cache.set(key, base_label)
+        else:
+            base_label = dict(cached_label)
+        base_by_pair[(target_idx, candidate.target_id, candidate.neighbor_id, candidate.metapath)] = base_label
+
+    for target_idx, candidate in tqdm(pairs, desc="risk heterophily scoring", unit="pair"):
+        label = dict(base_by_pair[(target_idx, candidate.target_id, candidate.neighbor_id, candidate.metapath)])
+        label["candidate"] = asdict(candidate)
+        label["risk_card"] = format_candidate_risk_card(candidate)
+        if not use_mechanism:
             label = dict(label)
-            label["risk_score"] = score
-            label["mechanism_logits"] = mechanism_logits.tolist()
-            label["candidate"] = getattr(candidate, "__dict__", label.get("candidate", {}))
-            cache.set(key, label)
-            target_labels.append(label)
+            label["mechanism"] = "irrelevant_heterophily"
+            label["risk_relevance"] = int(candidate.candidate_score >= 0.55)
+            label["confidence"] = float(candidate.candidate_score)
+            label["rationale"] = "rule score only; mechanism labels disabled"
+        score, mechanism_logits = risk_heterophily_score(
+            candidate,
+            mechanism=label.get("mechanism"),
+            risk_relevance_label=int(label.get("risk_relevance", 0)),
+            use_mechanism=use_mechanism,
+        )
+        label = dict(label)
+        label["risk_score"] = score
+        label["mechanism_logits"] = mechanism_logits.tolist()
+        if use_mechanism:
+            cache.set(cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath), label)
+        labels_by_target.setdefault(target_idx, []).append(label)
+
+    for target_idx in candidates_by_target:
+        target_labels = labels_by_target.get(target_idx, [])
         labels_by_target[target_idx] = sorted(target_labels, key=lambda item: item["risk_score"], reverse=True)
     cache.save()
-    return labels_by_target
+    return labels_by_target, time.perf_counter() - label_start
 
 
 def _chain_feature_matrix(
@@ -343,39 +634,60 @@ def _write_hero_explanations(
     path.parent.mkdir(parents=True, exist_ok=True)
     idx_to_id = _idx_to_node_id(graph)
     chains_by_idx = hero_artifacts.get("chains_by_idx", {})
-    necessities: list[float] = []
+    necessities_all: list[float] = []
+    necessities_pos: list[float] = []
+    necessities_neg: list[float] = []
     chain_counts: list[int] = []
     evidence_recalls: list[float] = []
+    for local_pos, node_idx in enumerate(test_idx):
+        node_idx = int(node_idx)
+        chains = chains_by_idx.get(node_idx, [])
+        score_drop = float(scores[local_pos] - scores_without_chains[local_pos])
+        necessities_all.append(score_drop)
+        if int(graph.labels[node_idx]) == 1:
+            necessities_pos.append(score_drop)
+        else:
+            necessities_neg.append(score_drop)
+        chain_counts.append(len(chains))
+        evidence_recalls.append(_evidence_recall_for_node(idx_to_id[node_idx], chains, graph.evidence_gt))
+
     with path.open("w", encoding="utf-8") as handle:
         for local_pos, node_idx in enumerate(test_idx[:50]):
             node_idx = int(node_idx)
             chains = chains_by_idx.get(node_idx, [])
             pred_prob = float(scores[local_pos])
             score_without = float(scores_without_chains[local_pos])
-            necessity = max(pred_prob - score_without, 0.0)
-            necessities.append(necessity)
-            chain_counts.append(len(chains))
-            evidence_recalls.append(_evidence_recall_for_node(idx_to_id[node_idx], chains, graph.evidence_gt))
+            score_drop = pred_prob - score_without
             payload = {
                 "target_id": idx_to_id[node_idx],
                 "label": int(graph.labels[node_idx]),
                 "pred_prob": pred_prob,
+                "pred_without_chains": score_without,
+                "score_drop": score_drop,
                 "top_chains": [
                     {
                         "chain_nodes": chain["chain_nodes"],
                         "mechanism": chain["mechanism"],
+                        "risk_relevance": int(chain.get("risk_relevance", 0)),
                         "chain_score": float(chain["chain_score"]),
                         "rationale": chain["rationale"],
                     }
                     for chain in chains
                 ],
                 "score_without_chains": score_without,
-                "necessity": necessity,
+                "necessity": score_drop,
             }
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    necessity_all = float(np.mean(necessities_all)) if necessities_all else 0.0
+    necessity_pos = float(np.mean(necessities_pos)) if necessities_pos else 0.0
+    necessity_neg = float(np.mean(necessities_neg)) if necessities_neg else 0.0
     return {
         "evidence_recall_proxy": float(np.mean(evidence_recalls)) if evidence_recalls else 0.0,
-        "evidence_necessity_score": float(np.mean(necessities)) if necessities else 0.0,
+        "evidence_necessity": necessity_all,
+        "evidence_necessity_score": necessity_all,
+        "avg_evidence_necessity_all": necessity_all,
+        "avg_evidence_necessity_pos": necessity_pos,
+        "avg_evidence_necessity_neg": necessity_neg,
         "avg_num_chains": float(np.mean(chain_counts)) if chain_counts else 0.0,
     }
 
@@ -404,7 +716,7 @@ def _fit_torch_model(
     lr: float,
     hidden_dim: int,
     top_k: int,
-) -> tuple[np.ndarray, dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     from src.models.graphsage import GraphSAGE
     from src.models.mlp import MLP
     from src.models.rulehetero_gnn import RuleHeteroGNN
@@ -449,8 +761,9 @@ def _fit_torch_model(
     model.eval()
     with torch.no_grad():
         logits = model(x) if model_name == "mlp" else model(x, edge_index)
-        scores = torch.softmax(logits[torch.tensor(test_idx, dtype=torch.long)], dim=1)[:, 1].cpu().numpy()
-    return scores, {"model_state_dict": best_state, "model_name": model_name}
+        val_scores = torch.softmax(logits[val_tensor], dim=1)[:, 1].cpu().numpy()
+        test_scores = torch.softmax(logits[torch.tensor(test_idx, dtype=torch.long)], dim=1)[:, 1].cpu().numpy()
+    return val_scores, test_scores, {"model_state_dict": best_state, "model_name": model_name}
 
 
 def _graphsage_features(features: np.ndarray, edge_index: np.ndarray) -> np.ndarray:

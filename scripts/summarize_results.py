@@ -30,6 +30,7 @@ def main() -> None:
         _empty_main().to_csv(table_path, index=False)
         _empty_ablation().to_csv(out_dir / "ablation_table.csv", index=False)
         _empty_neighbor().to_csv(out_dir / "neighbor_strategy_table.csv", index=False)
+        _empty_diagnostic().to_csv(out_dir / "diagnostic_table.csv", index=False)
         print(f"Wrote empty summary to {table_path}")
         return
 
@@ -38,6 +39,7 @@ def main() -> None:
     summary.to_csv(table_path, index=False)
     _ablation_table(frame).to_csv(out_dir / "ablation_table.csv", index=False)
     _neighbor_strategy_table(frame).to_csv(out_dir / "neighbor_strategy_table.csv", index=False)
+    _diagnostic_table(frame).to_csv(out_dir / "diagnostic_table.csv", index=False)
     print(f"Wrote summary to {table_path}")
 
 
@@ -103,6 +105,22 @@ def _neighbor_strategy_table(frame: pd.DataFrame) -> pd.DataFrame:
     return table.rename(columns={"method": "strategy"})
 
 
+def _diagnostic_table(frame: pd.DataFrame) -> pd.DataFrame:
+    table = frame.copy()
+    if "method" in table:
+        table = table.rename(columns={"method": "model"})
+    if "evidence_necessity_score" in table and "evidence_necessity" not in table:
+        table["evidence_necessity"] = table["evidence_necessity_score"]
+    if "avg_evidence_necessity_all" not in table and "evidence_necessity" in table:
+        table["avg_evidence_necessity_all"] = table["evidence_necessity"]
+
+    columns = _diagnostic_columns()
+    for col in columns:
+        if col not in table:
+            table[col] = 0.0
+    return table[columns].fillna(0.0)
+
+
 def _selected_neighbor_value(row: pd.Series) -> float:
     if float(row.get("avg_selected_neighbors", 0.0)) > 0:
         return float(row["avg_selected_neighbors"])
@@ -143,6 +161,37 @@ def _empty_neighbor() -> pd.DataFrame:
             "evidence_recall_proxy",
         ]
     )
+
+
+def _empty_diagnostic() -> pd.DataFrame:
+    return pd.DataFrame(columns=_diagnostic_columns())
+
+
+def _diagnostic_columns() -> list[str]:
+    return [
+        "dataset",
+        "model",
+        "seed",
+        "positive_rate_train",
+        "positive_rate_val",
+        "positive_rate_test",
+        "pred_positive_rate",
+        "best_threshold",
+        "tn",
+        "fp",
+        "fn",
+        "tp",
+        "macro_f1",
+        "auroc",
+        "auprc",
+        "avg_selected_neighbors",
+        "evidence_recall_proxy",
+        "evidence_necessity",
+        "avg_evidence_necessity_all",
+        "avg_evidence_necessity_pos",
+        "avg_evidence_necessity_neg",
+        "avg_num_chains",
+    ]
 
 
 if __name__ == "__main__":

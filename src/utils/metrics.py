@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import numpy as np
-from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
+from sklearn.metrics import average_precision_score, confusion_matrix, f1_score, roc_auc_score
 
 
 def macro_f1(labels: np.ndarray, preds: np.ndarray) -> float:
     if labels.size == 0:
         return 0.0
     return float(f1_score(labels, preds, average="macro", zero_division=0))
+
+
+def confusion_counts(labels: np.ndarray, preds: np.ndarray) -> dict[str, int]:
+    if labels.size == 0:
+        return {"tn": 0, "fp": 0, "fn": 0, "tp": 0}
+    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    return {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
 
 
 def safe_auroc(labels: np.ndarray, scores: np.ndarray) -> float:

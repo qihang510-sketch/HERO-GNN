@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Any
 
 from src.graph.neighbor_retrieval import HeteroCandidate
+from src.llm.risk_card import format_candidate_risk_card
+
+MOCK_LABELER_VERSION = "risk_card_v2"
 
 
 def mock_risk_label(text: str) -> str:
@@ -14,44 +16,59 @@ def mock_risk_label(text: str) -> str:
 
 
 def label_candidate_mechanism(candidate: HeteroCandidate) -> dict[str, Any]:
+    card = format_candidate_risk_card(candidate)
+    return label_risk_card_mechanism(card)
+
+
+def label_risk_card_mechanism(card: dict[str, Any]) -> dict[str, Any]:
     mechanism = "irrelevant_heterophily"
-    confidence = 0.45
-    rationale = "heterophilous neighbor without enough risk context"
+    confidence = 0.35
+    rationale = "pair lacks the combined semantic, structural, and behavioral evidence required for risk relevance"
 
-    if candidate.semantic_similarity < 0.35 and candidate.same_user and candidate.rating_diff > 0.6:
-        mechanism = "behavioral_contradiction"
-        confidence = 0.83
-        rationale = "same user, low semantic similarity, high rating deviation"
-    elif candidate.semantic_similarity < 0.45 and candidate.same_device:
-        mechanism = "identity_sharing"
-        confidence = 0.80
-        rationale = "same device links semantically different reviews"
-    elif (
-        candidate.semantic_similarity < 0.50
-        and candidate.same_item
-        and candidate.time_gap_is_short
-        and candidate.burst_score > 0.5
-    ):
-        mechanism = "coordinated_burst"
-        confidence = 0.78
-        rationale = "same item, short time gap, bursty behavior"
-    elif candidate.structural_score > 0.7 and candidate.neighbor_risk_prior > 0.5:
-        mechanism = "counterparty_risk"
-        confidence = 0.76
-        rationale = "close metapath neighbor has high risk prior"
-    elif candidate.semantic_similarity < 0.55 and candidate.structural_score > 0.8:
-        mechanism = "camouflage_bridge"
-        confidence = 0.68
-        rationale = "semantically normal-looking review bridges to risky structure"
+    semantic_dissimilar = float(card["semantic_similarity"]) <= 0.55
+    structurally_close = float(card["structural_score"]) >= 0.60
+    numeric_signal = float(card["numeric_deviation"]) >= 0.45 or float(card["rating_diff"]) >= 0.45
+    time_signal = bool(card["same_time_window"]) and float(card["time_deviation"]) >= 0.65
+    burst_signal = float(card["burst_score"]) >= 0.55
+    identity_signal = bool(card["same_user"]) and float(card["rating_diff"]) >= 0.45
+    counterparty_signal = bool(card["same_item_or_business"]) and (numeric_signal or burst_signal or time_signal)
+    has_behavior_signal = numeric_signal or time_signal or burst_signal or identity_signal or counterparty_signal
 
-    risk_relevance = 0 if mechanism == "irrelevant_heterophily" else 1
+    risk_relevance = int(semantic_dissimilar and structurally_close and has_behavior_signal)
+    if risk_relevance:
+        if bool(card["same_user"]) and numeric_signal:
+            mechanism = "behavioral_contradiction"
+            confidence = 0.83
+            rationale = "same user pair is semantically dissimilar, structurally close, and has rating or numeric contradiction"
+        elif bool(card["same_item_or_business"]) and burst_signal and time_signal:
+            mechanism = "coordinated_burst"
+            confidence = 0.81
+            rationale = "same item/business pair combines semantic mismatch, short-time proximity, and burst behavior"
+        elif bool(card["same_user"]) and burst_signal:
+            mechanism = "identity_sharing"
+            confidence = 0.77
+            rationale = "shared identity context has semantic mismatch plus burst-like behavior"
+        elif bool(card["same_item_or_business"]) and numeric_signal:
+            mechanism = "counterparty_risk"
+            confidence = 0.75
+            rationale = "same item/business neighborhood shows semantic mismatch with numeric or rating deviation"
+        elif structurally_close and numeric_signal and time_signal:
+            mechanism = "camouflage_bridge"
+            confidence = 0.72
+            rationale = "structurally close pair bridges semantic mismatch with time and numeric anomalies"
+        else:
+            mechanism = "camouflage_bridge"
+            confidence = 0.68
+            rationale = "heterophilous pair has structural support and at least one behavioral anomaly"
+
     return {
-        "target_id": candidate.target_id,
-        "neighbor_id": candidate.neighbor_id,
-        "metapath": candidate.metapath,
+        "target_id": card["target_id"],
+        "neighbor_id": card["neighbor_id"],
+        "metapath": card["metapath"],
         "mechanism": mechanism,
         "risk_relevance": risk_relevance,
         "confidence": confidence,
         "rationale": rationale,
-        "candidate": asdict(candidate),
+        "risk_card": card,
+        "labeler_version": MOCK_LABELER_VERSION,
     }

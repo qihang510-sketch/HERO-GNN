@@ -6,6 +6,17 @@ dataset:
   raw_dir: data/raw/yelp_academic
   processed_dir: data/processed/yelp_academic
   label_type: proxy
+preprocess:
+  proxy_label_mode: hard
+  remove_label_features: true
+neighbor_retrieval:
+  max_target_nodes: null
+  max_candidates_per_node: 20
+  homophilic_topk: 5
+  heterophilic_topk: 5
+evidence_chain:
+  topk_chains: 3
+  max_chain_length: 2
 model:
   name: hero_gnn
   hidden_dim: 64
@@ -17,4 +28,3 @@ training:
   lr: 0.001
 outputs:
   root: outputs
-

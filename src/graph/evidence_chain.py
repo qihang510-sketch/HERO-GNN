@@ -42,7 +42,9 @@ def _one_hop_chain(label: dict[str, Any]) -> dict[str, Any]:
         "chain_nodes": [label["target_id"], label["neighbor_id"]],
         "chain_edges": [label["metapath"]],
         "mechanism": label["mechanism"],
+        "risk_relevance": int(label.get("risk_relevance", 0)),
         "chain_score": score,
+        "confidence": float(label.get("confidence", 0.0)),
         "rationale": label["rationale"],
         "neighbor_idx": candidate.get("neighbor_idx"),
     }
@@ -56,7 +58,9 @@ def _two_hop_chain(first: dict[str, Any], second: dict[str, Any]) -> dict[str, A
         "chain_nodes": [first["target_id"], first["neighbor_id"], second["neighbor_id"]],
         "chain_edges": [first["metapath"], second["metapath"]],
         "mechanism": first["mechanism"],
+        "risk_relevance": int(first.get("risk_relevance", 0)),
         "chain_score": (first_score + second_score) / 2.0,
+        "confidence": float(first.get("confidence", 0.0)),
         "rationale": f"{first['rationale']}; then {second['rationale']}",
         "neighbor_idx": first.get("candidate", {}).get("neighbor_idx"),
     }

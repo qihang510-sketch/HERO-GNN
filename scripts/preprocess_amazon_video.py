@@ -18,6 +18,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_reviews", type=int, default=None, help="Maximum number of reviews to read.")
     parser.add_argument("--max_neighbors_per_type", type=int, default=30, help="Neighbor cap per review and relation.")
     parser.add_argument("--text_dim", type=int, default=128, help="Fixed TF-IDF text feature dimension.")
+    parser.add_argument("--proxy_label_mode", choices=["simple", "hard"], default=None, help="Proxy label construction mode.")
+    parser.add_argument("--remove_label_features", action=argparse.BooleanOptionalAction, default=None, help="Remove direct proxy-label features from model inputs.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     return parser.parse_args()
 
@@ -26,6 +28,7 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config)
     dataset = config.get("dataset", {})
+    preprocess_cfg = config.get("preprocess", {})
     seed = args.seed if args.seed is not None else int(config.get("experiment", {}).get("seed", 42))
     set_seed(seed)
     output = preprocess_amazon_video(
@@ -35,6 +38,12 @@ def main() -> None:
         max_reviews=args.max_reviews,
         max_neighbors_per_type=args.max_neighbors_per_type,
         text_dim=args.text_dim,
+        proxy_label_mode=args.proxy_label_mode or preprocess_cfg.get("proxy_label_mode", "simple"),
+        remove_label_features=bool(
+            args.remove_label_features
+            if args.remove_label_features is not None
+            else preprocess_cfg.get("remove_label_features", False)
+        ),
     )
     print(f"Wrote processed Amazon Video data to {output}")
 

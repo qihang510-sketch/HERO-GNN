@@ -52,6 +52,8 @@ if nn is not None:
         ) -> torch.Tensor:
             target_repr = self.target_encoder(target_features)
             homo_repr = self.homo_encoder(homo_neighbor_features)
+            if not self.use_chain:
+                chain_repr = torch.zeros_like(chain_repr)
             final_repr = torch.cat([target_repr, homo_repr, chain_repr], dim=1)
             final_repr = final_repr * self.gate(final_repr)
             return self.classifier(final_repr).squeeze(-1)

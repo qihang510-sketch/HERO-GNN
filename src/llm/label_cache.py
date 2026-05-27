@@ -32,6 +32,10 @@ class LabelCache:
                     "confidence": float(value["confidence"]),
                     "rationale": value["rationale"],
                 }
+                if "risk_card" in value:
+                    payload["risk_card"] = value["risk_card"]
+                if "labeler_version" in value:
+                    payload["labeler_version"] = value["labeler_version"]
                 handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
     def _load(self) -> None:
