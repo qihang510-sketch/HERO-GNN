@@ -4,7 +4,7 @@ HERO-GNN is short for **Heterophily-aware Evidence Reasoning over Fraud Graphs**
 
 The project studies fraud and anomaly detection on review graphs. Its core idea is that semantically dissimilar heterophilous neighbors are not always noise. Some of them are risk-related neighbors: for example, reviews that look textually normal but share a user, product, device-like identity, business, or short-time burst pattern with suspicious reviews. HERO-GNN recalls these candidates, labels their risk mechanism, builds evidence chains, and uses those chains for explainable graph prediction.
 
-The current implementation supports synthetic experiments, Yelp Academic preprocessing, Amazon Instant Video 5-core preprocessing, four baselines, HERO-GNN, and three HERO ablations.
+The current implementation supports synthetic experiments, Yelp Academic preprocessing, Amazon Instant Video 5-core preprocessing, official DGL FraudYelp/FraudAmazon preprocessing, seven baselines, HERO-GNN, and three HERO ablations.
 
 ## Installation
 
@@ -102,6 +102,68 @@ python scripts/run_real_suite.py \
   --seeds 0 1 2
 ```
 
+## AAAI Experiments
+
+1. Main hard proxy experiments
+
+```bash
+python scripts/run_aaai_main_suite.py \
+  --datasets yelp_academic amazon_video \
+  --seeds 0 1 2 \
+  --max_reviews_yelp 30000 \
+  --max_reviews_amazon 15000
+```
+
+2. Official fraud benchmark experiments
+
+```bash
+python scripts/run_official_fraud_suite.py \
+  --datasets fraud_yelp_official fraud_amazon_official \
+  --seeds 0 1 2
+```
+
+3. Real LLM labeler comparison
+
+```bash
+python scripts/build_llm_labels.py \
+  --dataset yelp_academic \
+  --labeler mock \
+  --max_cards 2000 \
+  --out_file data/processed/yelp_academic/llm_labels_mock.jsonl
+
+python scripts/run_labeler_comparison.py \
+  --dataset yelp_academic \
+  --label_files \
+    data/processed/yelp_academic/llm_labels_mock.jsonl \
+    data/processed/yelp_academic/llm_labels_openai.jsonl
+```
+
+4. Scalability experiments
+
+```bash
+python scripts/run_scalability_suite.py \
+  --datasets yelp_academic amazon_video \
+  --seed 0 \
+  --max_reviews_yelp 50000 \
+  --max_reviews_amazon 30000
+```
+
+5. Paper table export
+
+```bash
+python scripts/summarize_results.py \
+  --result_dir outputs/results \
+  --out_dir outputs/summary
+
+python scripts/run_significance_test.py \
+  --result_dir outputs/results \
+  --out_file outputs/summary/significance_table.csv
+
+python scripts/export_paper_tables.py \
+  --summary_dir outputs/summary \
+  --out_dir outputs/paper_tables
+```
+
 ## Models
 
 The default suites run:
@@ -110,10 +172,15 @@ The default suites run:
 - `graphsage`: full graph neighbor aggregation.
 - `semsim_gnn`: semantic-similarity top-k neighbor aggregation.
 - `rulehetero_gnn`: rule-selected heterophilous neighbor aggregation.
+- `sec_gfd_lite`: low-pass and high-pass heterophily-aware gated fusion.
+- `dga_gnn_lite`: dynamic attribute and neighbor group aggregation.
+- `flag_lite`: semantic-neighbor enhanced node representations without real LLM calls.
 - `hero_gnn`: full HERO-GNN pipeline.
+- `hero_wo_chain`: HERO without evidence chains.
 - `hero_wo_hetero`: HERO without risk heterophilous neighbors.
 - `hero_wo_mechanism`: HERO without mechanism labels.
-- `hero_wo_chain`: HERO without evidence chains.
+
+These are controlled lite implementations inspired by recent methods, implemented under the same data format, split, features, and training protocol for fair comparison.
 
 ## Outputs
 
@@ -177,7 +244,10 @@ Synthetic additionally includes `evidence_gt.json`.
 
 ## Real LLM Labelers
 
-The default implementation uses `src/llm/mock_labeler.py`. Reserved extension files are provided:
+Full experiments use mock LLM labeler for reproducibility.
+A small-scale real LLM labeler comparison is provided to validate whether real LLM annotations align with the designed mechanism labels.
+
+The default implementation uses `src/llm/mock_labeler.py`. Optional real labeler interfaces are provided:
 
 ```text
 src/llm/openai_labeler.py
@@ -202,6 +272,51 @@ The pipeline caches mechanism labels in:
 ```text
 data/processed/{dataset}/llm_labels.jsonl
 ```
+
+Build small-sample label files from HERO risk cards:
+
+```bash
+python scripts/build_llm_labels.py \
+  --dataset yelp_academic \
+  --labeler mock \
+  --max_cards 2000 \
+  --out_file data/processed/yelp_academic/llm_labels_mock.jsonl
+
+python scripts/build_llm_labels.py \
+  --dataset yelp_academic \
+  --labeler openai \
+  --max_cards 500 \
+  --out_file data/processed/yelp_academic/llm_labels_openai.jsonl
+
+python scripts/build_llm_labels.py \
+  --dataset yelp_academic \
+  --labeler local_qwen \
+  --max_cards 500 \
+  --out_file data/processed/yelp_academic/llm_labels_qwen.jsonl
+```
+
+Real LLM labelers are optional. Set `OPENAI_API_KEY` for the OpenAI labeler, or pass a local model path with `--local_model_path` / `LOCAL_QWEN_MODEL_PATH` for the local Qwen labeler.
+
+Compare label files:
+
+```bash
+python scripts/run_labeler_comparison.py \
+  --dataset yelp_academic \
+  --label_files \
+    data/processed/yelp_academic/llm_labels_mock.jsonl \
+    data/processed/yelp_academic/llm_labels_openai.jsonl
+```
+
+Run HERO with a prebuilt small-sample label file:
+
+```bash
+python scripts/run_real_suite.py \
+  --dataset yelp_academic \
+  --seeds 0 \
+  --llm_label_file data/processed/yelp_academic/llm_labels_openai.jsonl
+```
+
+If `--llm_label_file` is omitted, HERO uses the reproducible mock LLM labeler. A small label file is read only for matching risk cards; missing cards fall back to mock labels and do not trigger real LLM calls.
 
 ## Replacing Labels
 

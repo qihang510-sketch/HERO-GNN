@@ -1,0 +1,32 @@
+experiment:
+  name: fraud_amazon_official_hero
+  seed: 42
+dataset:
+  name: fraud_amazon_official
+  raw_dir: data/raw/fraud_amazon_official
+  processed_dir: data/processed/fraud_amazon_official
+  label_type: official
+preprocess:
+  label_source: official
+neighbor_retrieval:
+  max_target_nodes: null
+  max_candidates_per_node: 20
+  homophilic_topk: 5
+  heterophilic_topk: 5
+evidence_chain:
+  topk_chains: 3
+  max_chain_length: 2
+  min_chain_quality: 0.45
+model:
+  name: hero_gnn
+  hidden_dim: 64
+  use_heterophily: true
+  use_mechanism: true
+  use_chain: true
+training:
+  epochs: 10
+  lr: 0.001
+  lambda_chain_pos: 0.03
+  lambda_chain_neg: 0.01
+outputs:
+  root: outputs

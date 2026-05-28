@@ -39,9 +39,18 @@ try:
 except ImportError:  # pragma: no cover
     torch = None
 
-BASELINE_MODEL_NAMES = ("mlp", "graphsage", "semsim_gnn", "rulehetero_gnn")
-HERO_MODEL_NAMES = ("hero_gnn", "hero_wo_hetero", "hero_wo_mechanism", "hero_wo_chain")
+BASELINE_MODEL_NAMES = (
+    "mlp",
+    "graphsage",
+    "semsim_gnn",
+    "rulehetero_gnn",
+    "sec_gfd_lite",
+    "dga_gnn_lite",
+    "flag_lite",
+)
+HERO_MODEL_NAMES = ("hero_gnn", "hero_wo_chain", "hero_wo_hetero", "hero_wo_mechanism")
 MODEL_NAMES = (*BASELINE_MODEL_NAMES, *HERO_MODEL_NAMES)
+LITE_MODEL_NAMES = ("sec_gfd_lite", "dga_gnn_lite", "flag_lite")
 
 
 def _hero_variant_flags(model_name: str) -> dict[str, bool]:
@@ -124,6 +133,26 @@ def _default_chain_diagnostics() -> dict[str, float | int]:
     }
 
 
+def _model_metadata(model_name: str) -> dict[str, Any]:
+    if model_name == "sec_gfd_lite":
+        return {
+            "model_family": "sec_gfd_lite",
+            "uses_heterophily_filter": True,
+        }
+    if model_name == "dga_gnn_lite":
+        return {
+            "model_family": "dga_gnn_lite",
+            "num_attribute_groups": 4,
+            "num_neighbor_groups": 4,
+        }
+    if model_name == "flag_lite":
+        return {
+            "model_family": "flag_lite",
+            "uses_semantic_enhancement": True,
+        }
+    return {}
+
+
 def train_single_experiment(
     dataset: str = "synthetic",
     model_name: str = "mlp",
@@ -143,6 +172,7 @@ def train_single_experiment(
     min_chain_quality: float = 0.45,
     lambda_chain_pos: float = 0.03,
     lambda_chain_neg: float = 0.01,
+    llm_label_file: str | Path | None = None,
 ) -> dict[str, Any]:
     if model_name not in MODEL_NAMES:
         raise ValueError(f"Unknown model_name={model_name}. Expected one of {MODEL_NAMES}.")
@@ -210,6 +240,7 @@ def train_single_experiment(
             topk_chains=topk_chains,
             max_chain_length=max_chain_length,
             min_chain_quality=min_chain_quality,
+            llm_label_file=llm_label_file,
         )
         stage_times.update(hero_artifacts.get("time", {}))
         print(f"[TRAIN] {model_name}")
@@ -280,6 +311,7 @@ def train_single_experiment(
     metrics.update(prediction_probability_stats(graph.labels[test_idx], test_scores))
     metrics.update(class_stats)
     metrics["pos_weight"] = float(pos_weight)
+    metrics.update(_model_metadata(model_name))
     metrics.update({key: bool(value) for key, value in variant_flags.items()})
     metrics.update(branch_masks)
     metrics.update(
@@ -391,6 +423,14 @@ def _prepare_features(graph: ProcessedGraphData, model_name: str, top_k: int) ->
             top_k=top_k,
         )
         return _graphsage_features(graph.features, filtered)
+    if model_name == "sec_gfd_lite":
+        low_pass = _neighbor_mean_features(graph.features, graph.edge_index)
+        high_pass = _neighbor_mean_abs_diff_features(graph.features, graph.edge_index)
+        return np.concatenate([graph.features, low_pass, high_pass], axis=1).astype(np.float32)
+    if model_name == "dga_gnn_lite":
+        return _dga_lite_features(graph)
+    if model_name == "flag_lite":
+        return _flag_lite_features(graph, top_k=top_k)
     raise ValueError(f"Unknown model_name={model_name}")
 
 
@@ -406,6 +446,7 @@ def _prepare_hero_features(
     topk_chains: int,
     max_chain_length: int,
     min_chain_quality: float,
+    llm_label_file: str | Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     print(f"[START] {model_name}")
     timings = {
@@ -469,7 +510,12 @@ def _prepare_hero_features(
     timings["time_retrieval_sec"] = time.perf_counter() - retrieval_start
 
     print("[BUILD] mock LLM labels" if use_mock_llm_mechanism else "[BUILD] rule hetero labels")
-    labels_by_target, label_time = _label_candidates(data_dir, candidates_by_target, use_mechanism=use_mock_llm_mechanism)
+    labels_by_target, label_time, label_stats = _label_candidates(
+        data_dir,
+        candidates_by_target,
+        use_mechanism=use_mock_llm_mechanism,
+        llm_label_file=llm_label_file,
+    )
     timings["time_mock_labeling_sec"] = label_time
     hetero_features, mechanism_features = _hetero_feature_matrix(
         graph=graph,
@@ -480,6 +526,7 @@ def _prepare_hero_features(
         **base_debug,
         "num_heterophilic_neighbors_used": int(sum(len(labels) for labels in labels_by_target.values())),
         "num_mechanism_labels_used": int(sum(len(labels) for labels in labels_by_target.values())) if use_mechanism else 0,
+        **label_stats,
     }
 
     if not use_chain:
@@ -856,25 +903,41 @@ def _label_candidates(
     data_dir: Path,
     candidates_by_target: dict[int, list[Any]],
     use_mechanism: bool,
-) -> tuple[dict[int, list[dict[str, Any]]], float]:
+    llm_label_file: str | Path | None = None,
+) -> tuple[dict[int, list[dict[str, Any]]], float, dict[str, Any]]:
     label_start = time.perf_counter()
-    cache = LabelCache(data_dir / "llm_labels.jsonl") if use_mechanism else None
+    custom_label_path = Path(llm_label_file) if llm_label_file is not None else None
+    if custom_label_path is not None and not custom_label_path.exists():
+        raise FileNotFoundError(f"Missing LLM label file: {custom_label_path}")
+    cache_path = custom_label_path or (data_dir / "llm_labels.jsonl")
+    cache = LabelCache(cache_path) if use_mechanism else None
+    custom_readonly = custom_label_path is not None
     labels_by_target: dict[int, list[dict[str, Any]]] = {}
     if cache is not None and cache.path.exists():
-        print("[CACHE] loading llm_labels.jsonl")
+        print(f"[CACHE] loading {cache.path}")
     pairs = [
         (target_idx, candidate)
         for target_idx, candidates in candidates_by_target.items()
         for candidate in candidates
     ]
     base_by_pair: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    stats = {
+        "external_llm_label_file": str(custom_label_path) if custom_label_path is not None else "",
+        "external_llm_labels_used": 0,
+        "mock_llm_labels_used": 0,
+    }
     if use_mechanism:
-        for target_idx, candidate in tqdm(pairs, desc="mock_labeler", unit="pair"):
+        labeler_desc = "external_llm_labels" if custom_readonly else "mock_labeler"
+        for target_idx, candidate in tqdm(pairs, desc=labeler_desc, unit="pair"):
             key = cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath)
             cached_label = cache.get(key) if cache is not None else None
-            if cached_label is None or cached_label.get("labeler_version") != MOCK_LABELER_VERSION:
+            if custom_readonly and cached_label is not None:
+                base_label = dict(cached_label)
+                stats["external_llm_labels_used"] += 1
+            elif cached_label is None or cached_label.get("labeler_version") != MOCK_LABELER_VERSION:
                 base_label = label_candidate_mechanism(candidate)
-                if cache is not None:
+                stats["mock_llm_labels_used"] += 1
+                if cache is not None and not custom_readonly:
                     cache.set(key, base_label)
             else:
                 base_label = dict(cached_label)
@@ -904,16 +967,16 @@ def _label_candidates(
         label = dict(label)
         label["risk_score"] = score
         label["mechanism_logits"] = mechanism_logits.tolist()
-        if use_mechanism and cache is not None:
+        if use_mechanism and cache is not None and not custom_readonly:
             cache.set(cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath), label)
         labels_by_target.setdefault(target_idx, []).append(label)
 
     for target_idx in candidates_by_target:
         target_labels = labels_by_target.get(target_idx, [])
         labels_by_target[target_idx] = sorted(target_labels, key=lambda item: item["risk_score"], reverse=True)
-    if cache is not None:
+    if cache is not None and not custom_readonly:
         cache.save()
-    return labels_by_target, time.perf_counter() - label_start
+    return labels_by_target, time.perf_counter() - label_start, stats
 
 
 def _chain_feature_matrix(
@@ -988,12 +1051,14 @@ def _hetero_feature_matrix(
 
 
 def _edge_index_for_model(graph: ProcessedGraphData, model_name: str, top_k: int) -> np.ndarray:
-    if model_name in {"mlp", "graphsage"}:
+    if model_name in {"mlp", "graphsage", "sec_gfd_lite", "dga_gnn_lite"}:
         return graph.edge_index
     if model_name == "semsim_gnn":
         return filter_topk_semantic_edges(graph.edge_index, graph.text_features, top_k=top_k)
     if model_name == "rulehetero_gnn":
         return filter_rule_hetero_edges(graph.edge_index, graph.text_features, graph.numeric_features, top_k=top_k)
+    if model_name == "flag_lite":
+        return _flag_neighbor_edges(graph, top_k=top_k)
     raise ValueError(f"Unknown model_name={model_name}")
 
 
@@ -1006,6 +1071,136 @@ def _neighbor_mean_features(features: np.ndarray, edge_index: np.ndarray) -> np.
         np.add.at(agg, src, features[dst])
         np.add.at(degree, src, 1.0)
     return agg / np.maximum(degree, 1.0)
+
+
+def _neighbor_mean_abs_diff_features(features: np.ndarray, edge_index: np.ndarray) -> np.ndarray:
+    agg = np.zeros_like(features, dtype=np.float32)
+    degree = np.zeros((features.shape[0], 1), dtype=np.float32)
+    if edge_index.size > 0:
+        src = edge_index[0]
+        dst = edge_index[1]
+        np.add.at(agg, src, np.abs(features[src] - features[dst]))
+        np.add.at(degree, src, 1.0)
+    return agg / np.maximum(degree, 1.0)
+
+
+def _flag_lite_features(graph: ProcessedGraphData, top_k: int) -> np.ndarray:
+    edge_index = _flag_neighbor_edges(graph, top_k=top_k)
+    semantic_neighbor_mean = _neighbor_mean_features(graph.features, edge_index)
+    return np.concatenate([graph.features, graph.text_features, semantic_neighbor_mean], axis=1).astype(np.float32)
+
+
+def _flag_neighbor_edges(graph: ProcessedGraphData, top_k: int) -> np.ndarray:
+    if _has_text_signal_matrix(graph.text_features):
+        return filter_topk_semantic_edges(graph.edge_index, graph.text_features, top_k=top_k)
+    return _filter_topk_similarity_edges(graph.edge_index, graph.features, top_k=top_k)
+
+
+def _has_text_signal_matrix(features: np.ndarray, eps: float = 1e-8) -> bool:
+    return bool(features.size and features.shape[1] > 0 and np.any(np.linalg.norm(features, axis=1) > eps))
+
+
+def _filter_topk_similarity_edges(edge_index: np.ndarray, features: np.ndarray, top_k: int) -> np.ndarray:
+    if top_k <= 0 or edge_index.size == 0:
+        return np.zeros((2, 0), dtype=np.int64)
+    scores = _cosine_edge_scores(edge_index, features)
+    selected: list[int] = []
+    for src in np.unique(edge_index[0]):
+        positions = np.flatnonzero(edge_index[0] == src)
+        ranked = positions[np.argsort(scores[positions])[::-1]]
+        selected.extend(ranked[:top_k].tolist())
+    return edge_index[:, np.array(selected, dtype=np.int64)] if selected else np.zeros((2, 0), dtype=np.int64)
+
+
+def _cosine_edge_scores(edge_index: np.ndarray, features: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    if edge_index.size == 0:
+        return np.array([], dtype=np.float32)
+    src = features[edge_index[0]]
+    dst = features[edge_index[1]]
+    denom = np.linalg.norm(src, axis=1) * np.linalg.norm(dst, axis=1)
+    scores = np.zeros(edge_index.shape[1], dtype=np.float32)
+    valid = denom > eps
+    scores[valid] = np.sum(src[valid] * dst[valid], axis=1) / denom[valid]
+    return scores
+
+
+def _dga_lite_features(graph: ProcessedGraphData, num_attribute_groups: int = 4, num_neighbor_groups: int = 4) -> np.ndarray:
+    attribute_groups = _attribute_groups(graph.features, num_attribute_groups)
+    relation_groups = _relation_groups_for_graph(graph, num_neighbor_groups)
+    distance_groups = _edge_distance_groups(graph.features, graph.edge_index, num_neighbor_groups)
+    neighbor_groups = (relation_groups[: graph.edge_index.shape[1]] + distance_groups) % num_neighbor_groups
+    attr_contexts = _group_mean_by_edge_group(
+        features=graph.features,
+        edge_index=graph.edge_index,
+        group_ids=attribute_groups,
+        num_groups=num_attribute_groups,
+        use_neighbor_group=True,
+    )
+    neighbor_contexts = _group_mean_by_edge_group(
+        features=graph.features,
+        edge_index=graph.edge_index,
+        group_ids=neighbor_groups,
+        num_groups=num_neighbor_groups,
+        use_neighbor_group=False,
+    )
+    return np.concatenate([graph.features, attr_contexts.reshape(graph.features.shape[0], -1), neighbor_contexts.reshape(graph.features.shape[0], -1)], axis=1).astype(np.float32)
+
+
+def _attribute_groups(features: np.ndarray, num_groups: int = 4) -> np.ndarray:
+    if features.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    scores = np.mean(features, axis=1)
+    order = np.argsort(scores)
+    groups = np.zeros(features.shape[0], dtype=np.int64)
+    ranks = np.arange(features.shape[0], dtype=np.int64)
+    groups[order] = np.minimum(ranks * int(num_groups) // max(features.shape[0], 1), int(num_groups) - 1)
+    return groups
+
+
+def _relation_groups_for_graph(graph: ProcessedGraphData, num_groups: int = 4) -> np.ndarray:
+    if graph.edge_index.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    relation_names = []
+    for src, dst, edge_type in graph.edges[[schema.SRC, schema.DST, schema.EDGE_TYPE]].itertuples(index=False, name=None):
+        if src in graph.node_id_to_idx and dst in graph.node_id_to_idx:
+            relation_names.append(str(edge_type))
+    mapping = {name: index % int(num_groups) for index, name in enumerate(sorted(set(relation_names)))}
+    values = [mapping.get(name, 0) for name in relation_names]
+    if len(values) < graph.edge_index.shape[1]:
+        values.extend([0] * (graph.edge_index.shape[1] - len(values)))
+    return np.asarray(values[: graph.edge_index.shape[1]], dtype=np.int64)
+
+
+def _edge_distance_groups(features: np.ndarray, edge_index: np.ndarray, num_groups: int = 4) -> np.ndarray:
+    if edge_index.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    distances = np.linalg.norm(features[edge_index[0]] - features[edge_index[1]], axis=1)
+    span = max(float(np.max(distances) - np.min(distances)), 1e-8)
+    normalized = (distances - float(np.min(distances))) / span
+    return np.minimum((normalized * int(num_groups)).astype(np.int64), int(num_groups) - 1)
+
+
+def _group_mean_by_edge_group(
+    features: np.ndarray,
+    edge_index: np.ndarray,
+    group_ids: np.ndarray,
+    num_groups: int,
+    use_neighbor_group: bool,
+) -> np.ndarray:
+    out = np.zeros((features.shape[0], int(num_groups), features.shape[1]), dtype=np.float32)
+    degree = np.zeros((features.shape[0], int(num_groups), 1), dtype=np.float32)
+    if edge_index.size == 0:
+        return out
+    src = edge_index[0]
+    dst = edge_index[1]
+    edge_groups = group_ids[dst] if use_neighbor_group else group_ids[: edge_index.shape[1]]
+    for group in range(int(num_groups)):
+        mask = edge_groups == group
+        if not np.any(mask):
+            continue
+        np.add.at(out[:, group, :], src[mask], features[dst[mask]])
+        np.add.at(degree[:, group, :], src[mask], 1.0)
+    return out / np.maximum(degree, 1.0)
 
 
 def _baseline_avg_selected_neighbors(
@@ -1135,6 +1330,9 @@ def _write_hero_explanations(
         "num_heterophilic_neighbors_used": int(variant_debug.get("num_heterophilic_neighbors_used", 0)),
         "num_chains_used": int(variant_debug.get("num_chains_used", 0)),
         "num_mechanism_labels_used": int(variant_debug.get("num_mechanism_labels_used", 0)),
+        "external_llm_label_file": str(variant_debug.get("external_llm_label_file", "")),
+        "external_llm_labels_used": int(variant_debug.get("external_llm_labels_used", 0)),
+        "mock_llm_labels_used": int(variant_debug.get("mock_llm_labels_used", 0)),
         "num_raw_chains": int(variant_debug.get("num_raw_chains", 0)),
         "num_filtered_chains": int(variant_debug.get("num_filtered_chains", 0)),
         "chain_filter_keep_rate": float(variant_debug.get("chain_filter_keep_rate", 0.0)),
@@ -1243,6 +1441,9 @@ def _write_variant_debug(
         "num_heterophilic_neighbors_used": int(metrics.get("num_heterophilic_neighbors_used", 0)),
         "num_chains_used": int(metrics.get("num_chains_used", 0)),
         "num_mechanism_labels_used": int(metrics.get("num_mechanism_labels_used", 0)),
+        "external_llm_label_file": str(metrics.get("external_llm_label_file", "")),
+        "external_llm_labels_used": int(metrics.get("external_llm_labels_used", 0)),
+        "mock_llm_labels_used": int(metrics.get("mock_llm_labels_used", 0)),
         "num_raw_chains": int(metrics.get("num_raw_chains", 0)),
         "num_filtered_chains": int(metrics.get("num_filtered_chains", 0)),
         "chain_filter_keep_rate": float(metrics.get("chain_filter_keep_rate", 0.0)),
@@ -1293,9 +1494,12 @@ def _fit_torch_model(
     top_k: int,
     pos_weight: float,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    from src.models.dga_gnn_lite import DGAGNNLite
+    from src.models.flag_lite import FLAGLite
     from src.models.graphsage import GraphSAGE
     from src.models.mlp import MLP
     from src.models.rulehetero_gnn import RuleHeteroGNN
+    from src.models.sec_gfd_lite import SECGFDLite
     from src.models.semsim_gnn import SemSimGNN
 
     torch.manual_seed(seed)
@@ -1304,11 +1508,20 @@ def _fit_torch_model(
         "graphsage": GraphSAGE,
         "semsim_gnn": SemSimGNN,
         "rulehetero_gnn": RuleHeteroGNN,
+        "sec_gfd_lite": SECGFDLite,
+        "dga_gnn_lite": DGAGNNLite,
+        "flag_lite": FLAGLite,
     }[model_name]
-    model = model_cls(input_dim=graph.features.shape[1], hidden_dim=hidden_dim, output_dim=1)
+    model_kwargs = {"input_dim": graph.features.shape[1], "hidden_dim": hidden_dim, "output_dim": 1}
+    if model_name == "flag_lite":
+        model_kwargs["text_dim"] = graph.text_features.shape[1]
+    model = model_cls(**model_kwargs)
     x = torch.tensor(graph.features, dtype=torch.float32)
+    text_x = torch.tensor(graph.text_features, dtype=torch.float32)
     labels = torch.tensor(graph.labels, dtype=torch.float32)
     edge_index = torch.tensor(_edge_index_for_model(graph, model_name, top_k), dtype=torch.long)
+    attribute_groups = torch.tensor(_attribute_groups(graph.features, 4), dtype=torch.long)
+    relation_groups = torch.tensor(_relation_groups_for_graph(graph, 4), dtype=torch.long)
     train_tensor = torch.tensor(train_idx, dtype=torch.long)
     val_tensor = torch.tensor(val_idx if val_idx.size else train_idx, dtype=torch.long)
     test_tensor = torch.tensor(test_idx, dtype=torch.long)
@@ -1320,14 +1533,14 @@ def _fit_torch_model(
     for _epoch in range(max(1, epochs)):
         model.train()
         optimizer.zero_grad()
-        logits = _model_logits(model, model_name, x, edge_index)
+        logits = _model_logits(model, model_name, x, edge_index, text_x, attribute_groups, relation_groups)
         loss = criterion(logits[train_tensor], labels[train_tensor])
         loss.backward()
         optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            logits = _model_logits(model, model_name, x, edge_index)
+            logits = _model_logits(model, model_name, x, edge_index, text_x, attribute_groups, relation_groups)
             val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         val_metrics = binary_classification_metrics(graph.labels[val_tensor.numpy()], val_scores, k=100)
         if val_metrics["auprc"] >= best_score:
@@ -1338,14 +1551,21 @@ def _fit_torch_model(
         model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        logits = _model_logits(model, model_name, x, edge_index)
+        logits = _model_logits(model, model_name, x, edge_index, text_x, attribute_groups, relation_groups)
         val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         test_scores = torch.sigmoid(logits[test_tensor]).cpu().numpy()
     return val_scores, test_scores, {"model_state_dict": best_state, "model_name": model_name, "pos_weight": float(pos_weight)}
 
 
-def _model_logits(model, model_name: str, x, edge_index):
-    logits = model(x) if model_name == "mlp" else model(x, edge_index)
+def _model_logits(model, model_name: str, x, edge_index, text_x=None, attribute_groups=None, relation_groups=None):
+    if model_name == "mlp":
+        logits = model(x)
+    elif model_name == "flag_lite":
+        logits = model(x, edge_index, text_x)
+    elif model_name == "dga_gnn_lite":
+        logits = model(x, edge_index, attribute_groups=attribute_groups, relation_groups=relation_groups)
+    else:
+        logits = model(x, edge_index)
     return logits.squeeze(-1)
 
 

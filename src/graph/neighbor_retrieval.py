@@ -63,6 +63,7 @@ class HeteroCandidate:
     time_gap_is_short: bool
     burst_score: float
     neighbor_risk_prior: float
+    has_text_signal: bool = True
 
 
 def retrieve_hetero_candidates(
@@ -111,6 +112,7 @@ def retrieve_hetero_candidates(
         metapath = edge_type_by_pair.get((src, dst), "review-item-review")
         semantic_similarity = _pair_cosine(text_features[src], text_features[dst])
         semantic_distance = 1.0 - semantic_similarity
+        has_text_signal = _has_text_signal(text_features, src, dst)
         structural_score = _metapath_proximity(metapath)
         numeric_deviation = _normalized_l1(numeric_features[src], numeric_features[dst], max_numeric)
         time_deviation = _time_gap_score(timestamps[src], timestamps[dst], max_time_gap)
@@ -123,12 +125,8 @@ def retrieve_hetero_candidates(
             + w_time * time_deviation
             + w_semantic * semantic_distance
         )
-        same_item_or_business = metapath in {
-            "review-item-review",
-            "review-business-review",
-            "review-product-review",
-            "review-rating-review",
-        }
+        same_user = _is_user_relation(metapath)
+        same_item_or_business = _is_item_relation(metapath)
         candidate = HeteroCandidate(
             target_idx=src,
             neighbor_idx=dst,
@@ -142,13 +140,14 @@ def retrieve_hetero_candidates(
             time_deviation=float(time_deviation),
             candidate_score=float(candidate_score),
             rating_diff=float(abs(numeric_features[src, 0] - numeric_features[dst, 0])) if numeric_features.shape[1] else 0.0,
-            same_user=metapath == "review-user-review",
+            same_user=same_user,
             same_device=metapath == "review-device-review",
-            same_item=metapath == "review-item-review",
+            same_item=metapath == "review-item-review" or metapath == "net_upu",
             same_item_or_business=same_item_or_business,
             time_gap_is_short=time_deviation > 0.7,
             burst_score=float(max(burst_by_idx[src], burst_by_idx[dst])),
             neighbor_risk_prior=0.0,
+            has_text_signal=has_text_signal,
         )
         by_target[src].append(candidate)
 
@@ -182,15 +181,30 @@ def _filter_edges_by_score(edge_index: np.ndarray, scores: np.ndarray, top_k: in
 def _cosine_similarity_scores(edge_index: np.ndarray, features: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     if edge_index.size == 0:
         return np.array([], dtype=np.float32)
+    if features.size == 0 or features.shape[1] == 0:
+        return np.full(edge_index.shape[1], 0.5, dtype=np.float32)
     src = features[edge_index[0]]
     dst = features[edge_index[1]]
-    denom = np.linalg.norm(src, axis=1) * np.linalg.norm(dst, axis=1) + eps
-    return np.sum(src * dst, axis=1) / denom
+    src_norm = np.linalg.norm(src, axis=1)
+    dst_norm = np.linalg.norm(dst, axis=1)
+    denom = src_norm * dst_norm
+    scores = np.full(edge_index.shape[1], 0.5, dtype=np.float32)
+    valid = denom > eps
+    scores[valid] = np.sum(src[valid] * dst[valid], axis=1) / denom[valid]
+    return scores
 
 
 def _pair_cosine(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> float:
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b) + eps)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= eps:
+        return 0.5
     return float(np.dot(a, b) / denom)
+
+
+def _has_text_signal(features: np.ndarray, src: int, dst: int, eps: float = 1e-8) -> bool:
+    if features.size == 0 or features.shape[1] == 0:
+        return False
+    return bool(np.linalg.norm(features[src]) > eps and np.linalg.norm(features[dst]) > eps)
 
 
 def _metapath_proximity(metapath: str) -> float:
@@ -204,7 +218,29 @@ def _metapath_proximity(metapath: str) -> float:
         "review-rating-review": 0.60,
         "review-month-review": 0.55,
         "review-week-review": 0.55,
+        "net_rur": 0.95,
+        "net_rsr": 0.65,
+        "net_rtr": 0.75,
+        "net_upu": 0.65,
+        "net_usu": 0.60,
+        "net_uvu": 0.60,
     }.get(metapath, 0.50)
+
+
+def _is_user_relation(metapath: str) -> bool:
+    return metapath in {"review-user-review", "net_rur"}
+
+
+def _is_item_relation(metapath: str) -> bool:
+    return metapath in {
+        "review-item-review",
+        "review-business-review",
+        "review-product-review",
+        "review-rating-review",
+        "net_rsr",
+        "net_rtr",
+        "net_upu",
+    }
 
 
 def _normalized_l1(a: np.ndarray, b: np.ndarray, scale: float) -> float:

@@ -31,6 +31,7 @@ def main() -> None:
         _empty_ablation().to_csv(out_dir / "ablation_table.csv", index=False)
         _empty_neighbor().to_csv(out_dir / "neighbor_strategy_table.csv", index=False)
         _empty_diagnostic().to_csv(out_dir / "diagnostic_table.csv", index=False)
+        _empty_runtime().to_csv(out_dir / "runtime_table.csv", index=False)
         print(f"Wrote empty summary to {table_path}")
         return
 
@@ -40,6 +41,7 @@ def main() -> None:
     _ablation_table(frame).to_csv(out_dir / "ablation_table.csv", index=False)
     _neighbor_strategy_table(frame).to_csv(out_dir / "neighbor_strategy_table.csv", index=False)
     _diagnostic_table(frame).to_csv(out_dir / "diagnostic_table.csv", index=False)
+    _runtime_table(frame).to_csv(out_dir / "runtime_table.csv", index=False)
     print(f"Wrote summary to {table_path}")
 
 
@@ -127,8 +129,30 @@ def _diagnostic_table(frame: pd.DataFrame) -> pd.DataFrame:
     columns = _diagnostic_columns()
     for col in columns:
         if col not in table:
+            table[col] = "" if col == "model_family" else 0.0
+    table = table[columns]
+    if "model_family" in table:
+        table["model_family"] = table["model_family"].fillna("")
+    return table.fillna(0.0)
+
+
+def _runtime_table(frame: pd.DataFrame) -> pd.DataFrame:
+    table = frame.copy()
+    if table.empty:
+        return _empty_runtime()
+    for col in ["time_total_sec", "time_retrieval_sec", "time_training_sec"]:
+        if col not in table:
             table[col] = 0.0
-    return table[columns].fillna(0.0)
+    return (
+        table.groupby(["dataset", "method"], as_index=False)
+        .agg(
+            time_total_mean=("time_total_sec", "mean"),
+            time_total_std=("time_total_sec", "std"),
+            time_retrieval_mean=("time_retrieval_sec", "mean"),
+            time_training_mean=("time_training_sec", "mean"),
+        )
+        .fillna(0.0)
+    )
 
 
 def _selected_neighbor_value(row: pd.Series) -> float:
@@ -178,11 +202,29 @@ def _empty_diagnostic() -> pd.DataFrame:
     return pd.DataFrame(columns=_diagnostic_columns())
 
 
+def _empty_runtime() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "dataset",
+            "method",
+            "time_total_mean",
+            "time_total_std",
+            "time_retrieval_mean",
+            "time_training_mean",
+        ]
+    )
+
+
 def _diagnostic_columns() -> list[str]:
     return [
         "dataset",
         "model",
         "seed",
+        "model_family",
+        "uses_heterophily_filter",
+        "uses_semantic_enhancement",
+        "num_attribute_groups",
+        "num_neighbor_groups",
         "positive_rate_train",
         "positive_rate_val",
         "positive_rate_test",

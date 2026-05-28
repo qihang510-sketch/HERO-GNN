@@ -21,11 +21,12 @@ def label_candidate_mechanism(candidate: HeteroCandidate) -> dict[str, Any]:
 
 
 def label_risk_card_mechanism(card: dict[str, Any]) -> dict[str, Any]:
+    official_mode = not bool(card.get("has_text_signal", True))
     mechanism = "irrelevant_heterophily"
     confidence = 0.35
     rationale = "pair lacks the combined semantic, structural, and behavioral evidence required for risk relevance"
 
-    semantic_dissimilar = float(card["semantic_similarity"]) <= 0.55
+    semantic_dissimilar = True if official_mode else float(card["semantic_similarity"]) <= 0.55
     structurally_close = float(card["structural_score"]) >= 0.60
     numeric_signal = float(card["numeric_deviation"]) >= 0.45 or float(card["rating_diff"]) >= 0.45
     time_signal = bool(card["same_time_window"]) and float(card["time_deviation"]) >= 0.65
@@ -70,5 +71,6 @@ def label_risk_card_mechanism(card: dict[str, Any]) -> dict[str, Any]:
         "confidence": confidence,
         "rationale": rationale,
         "risk_card": card,
+        "labeler_mode": "HERO-official" if official_mode else "risk-card",
         "labeler_version": MOCK_LABELER_VERSION,
     }

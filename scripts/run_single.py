@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_chain_quality", type=float, default=None, help="Minimum evidence chain quality used by HERO.")
     parser.add_argument("--lambda_chain_pos", type=float, default=None, help="Positive-sample chain contribution loss weight.")
     parser.add_argument("--lambda_chain_neg", type=float, default=None, help="Negative-sample chain contribution loss weight.")
+    parser.add_argument("--llm_label_file", default=None, help="Optional prebuilt LLM label JSONL file for HERO-style models.")
     return parser.parse_args()
 
 
@@ -70,6 +71,7 @@ def main() -> None:
         min_chain_quality=float(_first_not_none(args.min_chain_quality, chain_cfg.get("min_chain_quality", 0.45))),
         lambda_chain_pos=float(_first_not_none(args.lambda_chain_pos, training_cfg.get("lambda_chain_pos", 0.03))),
         lambda_chain_neg=float(_first_not_none(args.lambda_chain_neg, training_cfg.get("lambda_chain_neg", 0.01))),
+        llm_label_file=args.llm_label_file,
     )
     print(metrics)
 

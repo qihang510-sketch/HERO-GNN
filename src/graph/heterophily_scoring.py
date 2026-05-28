@@ -76,5 +76,11 @@ def _metapath_embedding(metapath: str) -> np.ndarray:
         "review-item-review": [0.0, 1.0, 0.0, 0.0],
         "review-device-review": [0.0, 0.0, 1.0, 0.0],
         "review-time-review": [0.0, 0.0, 0.0, 1.0],
+        "net_rur": [1.0, 0.0, 0.0, 0.0],
+        "net_rsr": [0.0, 1.0, 0.0, 0.0],
+        "net_rtr": [0.0, 0.0, 0.0, 1.0],
+        "net_upu": [0.0, 1.0, 0.0, 0.0],
+        "net_usu": [0.0, 0.0, 0.0, 1.0],
+        "net_uvu": [0.0, 0.0, 1.0, 0.0],
     }
     return np.array(mapping.get(metapath, [0.0, 0.0, 0.0, 0.0]), dtype=np.float32)

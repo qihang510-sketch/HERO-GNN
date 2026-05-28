@@ -19,6 +19,7 @@ def format_candidate_risk_card(candidate: HeteroCandidate) -> dict[str, Any]:
         "neighbor_id": candidate.neighbor_id,
         "metapath": candidate.metapath,
         "semantic_similarity": float(candidate.semantic_similarity),
+        "has_text_signal": bool(getattr(candidate, "has_text_signal", True)),
         "structural_score": float(candidate.structural_score),
         "numeric_deviation": float(candidate.numeric_deviation),
         "time_deviation": float(candidate.time_deviation),
