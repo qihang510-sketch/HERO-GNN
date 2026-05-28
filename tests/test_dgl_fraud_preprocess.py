@@ -149,7 +149,7 @@ def test_official_no_text_data_trains_mlp_graphsage_and_hero(tmp_path):
     )
     preprocess_dgl_fraud_graph(graph, "fraud_yelp_official", processed_dir, seed=0)
 
-    for model_name in ["mlp", "graphsage", "sec_gfd_lite", "dga_gnn_lite", "flag_lite", "hero_gnn"]:
+    for model_name in ["mlp", "graphsage", "sec_gfd_lite", "dga_gnn_lite", "flag_lite", "hero_official"]:
         metrics = train_single_experiment(
             dataset="fraud_yelp_official",
             model_name=model_name,
@@ -168,3 +168,6 @@ def test_official_no_text_data_trains_mlp_graphsage_and_hero(tmp_path):
         )
         assert metrics["dataset"] == "fraud_yelp_official"
         assert metrics["model"] == model_name
+        if model_name == "hero_official":
+            assert metrics["official_mode"] is True
+            assert metrics["use_official_chain"] is False

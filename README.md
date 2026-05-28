@@ -51,6 +51,14 @@ data/raw/amazon_video/
 
 `meta_Amazon_Instant_Video.json.gz` is optional and ignored by the first preprocessor.
 
+### Official DGL Fraud Benchmarks
+
+For text-rich review datasets such as Yelp Academic and AmazonVideo, HERO-GNN uses text-aware mechanism annotation and evidence chains.
+
+For official non-text fraud benchmarks such as DGL FraudYelp and FraudAmazon, we use HERO-official, which disables text evidence chains by default and relies on relation-aware heterophily and feature-deviation signals.
+
+DGL 1.1.3 is recommended for loading FraudYelp / FraudAmazon. DGL 2.x and GraphBolt are not required.
+
 ## Proxy Label Statement
 
 Yelp Academic and Amazon Instant Video do not provide official fraud labels. This project uses **proxy anomaly labels** for the first real-data version. These proxy labels are heuristic labels for method validation and real text-graph runnable checks only.
@@ -179,6 +187,10 @@ The default suites run:
 - `hero_wo_chain`: HERO without evidence chains.
 - `hero_wo_hetero`: HERO without risk heterophilous neighbors.
 - `hero_wo_mechanism`: HERO without mechanism labels.
+- `hero_official`: relation-aware HERO mode for official non-text fraud datasets.
+- `hero_official_wo_hetero`: HERO-official without the official heterophily branch.
+- `hero_official_wo_relation`: HERO-official without the relation-type branch.
+- `hero_official_wo_feature_deviation`: HERO-official without the feature-deviation branch.
 
 These are controlled lite implementations inspired by recent methods, implemented under the same data format, split, features, and training protocol for fair comparison.
 

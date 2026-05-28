@@ -23,6 +23,7 @@ class ProcessedGraphData:
     node_id_to_idx: dict[str, int]
     edge_index: np.ndarray
     evidence_gt: dict
+    preprocess_report: dict
 
 
 def load_processed_data(data_dir: str | Path = "data/processed/synthetic") -> ProcessedGraphData:
@@ -32,6 +33,7 @@ def load_processed_data(data_dir: str | Path = "data/processed/synthetic") -> Pr
     features_path = data_dir / "features.npz"
     split_path = data_dir / "split.json"
     evidence_path = data_dir / "evidence_gt.json"
+    report_path = data_dir / "preprocess_report.json"
 
     _require_files([nodes_path, edges_path, features_path, split_path])
 
@@ -60,6 +62,7 @@ def load_processed_data(data_dir: str | Path = "data/processed/synthetic") -> Pr
     ]
     edge_index = np.array(edge_pairs, dtype=np.int64).T if edge_pairs else np.zeros((2, 0), dtype=np.int64)
     evidence_gt = json.loads(evidence_path.read_text(encoding="utf-8")) if evidence_path.exists() else {}
+    preprocess_report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
     return ProcessedGraphData(
         features=features,
         text_features=text_features,
@@ -71,6 +74,7 @@ def load_processed_data(data_dir: str | Path = "data/processed/synthetic") -> Pr
         node_id_to_idx=node_id_to_idx,
         edge_index=edge_index,
         evidence_gt=evidence_gt,
+        preprocess_report=preprocess_report,
     )
 
 

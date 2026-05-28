@@ -49,7 +49,13 @@ BASELINE_MODEL_NAMES = (
     "flag_lite",
 )
 HERO_MODEL_NAMES = ("hero_gnn", "hero_wo_chain", "hero_wo_hetero", "hero_wo_mechanism")
-MODEL_NAMES = (*BASELINE_MODEL_NAMES, *HERO_MODEL_NAMES)
+HERO_OFFICIAL_MODEL_NAMES = (
+    "hero_official",
+    "hero_official_wo_hetero",
+    "hero_official_wo_relation",
+    "hero_official_wo_feature_deviation",
+)
+MODEL_NAMES = (*BASELINE_MODEL_NAMES, *HERO_MODEL_NAMES, *HERO_OFFICIAL_MODEL_NAMES)
 LITE_MODEL_NAMES = ("sec_gfd_lite", "dga_gnn_lite", "flag_lite")
 
 
@@ -134,6 +140,10 @@ def _default_chain_diagnostics() -> dict[str, float | int]:
 
 
 def _model_metadata(model_name: str) -> dict[str, Any]:
+    if model_name in HERO_OFFICIAL_MODEL_NAMES:
+        return {
+            "model_family": "hero_official",
+        }
     if model_name == "sec_gfd_lite":
         return {
             "model_family": "sec_gfd_lite",
@@ -151,6 +161,45 @@ def _model_metadata(model_name: str) -> dict[str, Any]:
             "uses_semantic_enhancement": True,
         }
     return {}
+
+
+def _official_variant_flags(model_name: str) -> dict[str, bool]:
+    return {
+        "use_official_hetero": model_name != "hero_official_wo_hetero",
+        "use_official_relation": model_name != "hero_official_wo_relation",
+        "use_official_feature_deviation": model_name != "hero_official_wo_feature_deviation",
+    }
+
+
+def _default_official_diagnostics() -> dict[str, float | int | bool]:
+    return {
+        "official_mode": False,
+        "use_official_chain": False,
+        "avg_relation_gate": 0.0,
+        "avg_feature_deviation_gate": 0.0,
+        "avg_official_hetero_gate": 0.0,
+        "official_avg_feature_distance_selected": 0.0,
+        "official_avg_homo_similarity_selected": 0.0,
+        "official_avg_relation_rarity": 0.0,
+        "official_num_relation_types": 0,
+        "official_topk_homo": 0,
+        "official_topk_hetero": 0,
+    }
+
+
+def _is_official_graph(graph: ProcessedGraphData, dataset: str) -> bool:
+    return graph.preprocess_report.get("label_source") == "official" or dataset in {"fraud_yelp_official", "fraud_amazon_official"}
+
+
+def _resolve_device_name(device: str | None) -> tuple[str, bool]:
+    requested = device or "auto"
+    cuda_available = bool(torch is not None and torch.cuda.is_available())
+    if requested == "auto":
+        return ("cuda" if cuda_available else "cpu"), cuda_available
+    if requested == "cuda" and not cuda_available:
+        print("[WARNING] CUDA requested but not available; fallback to CPU")
+        return "cpu", cuda_available
+    return requested, cuda_available
 
 
 def train_single_experiment(
@@ -173,6 +222,8 @@ def train_single_experiment(
     lambda_chain_pos: float = 0.03,
     lambda_chain_neg: float = 0.01,
     llm_label_file: str | Path | None = None,
+    enable_official_chain: bool = False,
+    device: str | None = "auto",
 ) -> dict[str, Any]:
     if model_name not in MODEL_NAMES:
         raise ValueError(f"Unknown model_name={model_name}. Expected one of {MODEL_NAMES}.")
@@ -180,6 +231,8 @@ def train_single_experiment(
     set_seed(seed)
     data_dir = Path(data_dir or f"data/processed/{dataset}")
     graph = load_processed_data(data_dir)
+    official_mode = _is_official_graph(graph, dataset)
+    device_name, cuda_available = _resolve_device_name(device)
     paths = _experiment_paths(output_root, dataset, model_name, seed)
     logger = _make_logger(paths["log"], dataset, model_name, seed)
     time_total_start = time.perf_counter()
@@ -194,10 +247,13 @@ def train_single_experiment(
     logger.info(start_message)
     logger.info("Starting experiment dataset=%s model=%s seed=%s", dataset, model_name, seed)
     logger.info("Training knobs epochs=%s lr=%s hidden_dim=%s top_k=%s", epochs, lr, hidden_dim, top_k)
+    print(f"[DEVICE] dataset={dataset} model={model_name} seed={seed} device={device_name}")
 
     train_idx = _valid_label_indices(graph.split.get("train", np.array([], dtype=np.int64)), graph.labels)
     val_idx = _valid_label_indices(graph.split.get("val", np.array([], dtype=np.int64)), graph.labels)
     test_idx = _valid_label_indices(graph.split.get("test", np.array([], dtype=np.int64)), graph.labels)
+    if official_mode and max_target_nodes is not None:
+        train_idx, val_idx, test_idx = _limit_official_split_indices(train_idx, val_idx, test_idx, max_target_nodes)
     if train_idx.size == 0 or test_idx.size == 0:
         raise ValueError("Processed data must contain labeled train and test review nodes.")
 
@@ -211,6 +267,11 @@ def train_single_experiment(
     print(f"[TRAIN-INFO] train_pos={class_stats['train_num_pos']} train_neg={class_stats['train_num_neg']} pos_weight={pos_weight:.6f}")
     variant_flags = _hero_variant_flags(model_name)
     branch_masks = _hero_branch_masks(model_name)
+    if official_mode and model_name in HERO_MODEL_NAMES:
+        raise ValueError(f"{model_name} is a text-rich HERO model. Use hero_official variants for official fraud datasets.")
+    if not official_mode and model_name in HERO_OFFICIAL_MODEL_NAMES:
+        raise ValueError(f"{model_name} is for official non-text fraud datasets. Use text-rich HERO variants for {dataset}.")
+
     if model_name in HERO_MODEL_NAMES:
         variant_message = (
             f"[VARIANT] model={model_name} "
@@ -265,10 +326,32 @@ def train_single_experiment(
             lambda_chain_pos=float(lambda_chain_pos),
             lambda_chain_neg=float(lambda_chain_neg),
             min_chain_quality=float(min_chain_quality),
+            device=device_name,
         )
         stage_times["time_training_sec"] += time.perf_counter() - train_start
         checkpoint["hero_artifacts"] = hero_artifacts
         hero_artifacts["model_diagnostics"] = checkpoint.get("diagnostics", {})
+    elif model_name in HERO_OFFICIAL_MODEL_NAMES:
+        train_start = time.perf_counter()
+        val_scores, test_scores, checkpoint, official_artifacts = _fit_hero_official_model(
+            graph=graph,
+            model_name=model_name,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            seed=seed,
+            epochs=epochs,
+            lr=lr,
+            hidden_dim=hidden_dim,
+            pos_weight=pos_weight,
+            homophilic_topk=homophilic_topk,
+            heterophilic_topk=heterophilic_topk,
+            max_candidates_per_node=max_candidates_per_node,
+            enable_official_chain=enable_official_chain,
+            device=device_name,
+        )
+        stage_times["time_retrieval_sec"] = float(official_artifacts.get("time_retrieval_sec", 0.0))
+        stage_times["time_training_sec"] = time.perf_counter() - train_start - stage_times["time_retrieval_sec"]
     elif torch is not None:
         train_start = time.perf_counter()
         val_scores, test_scores, checkpoint = _fit_torch_model(
@@ -283,6 +366,7 @@ def train_single_experiment(
             hidden_dim=hidden_dim,
             top_k=top_k,
             pos_weight=pos_weight,
+            device=device_name,
         )
         stage_times["time_training_sec"] = time.perf_counter() - train_start
     else:
@@ -311,6 +395,9 @@ def train_single_experiment(
     metrics.update(prediction_probability_stats(graph.labels[test_idx], test_scores))
     metrics.update(class_stats)
     metrics["pos_weight"] = float(pos_weight)
+    metrics["official_mode"] = bool(official_mode)
+    metrics["device"] = device_name
+    metrics["cuda_available"] = bool(cuda_available)
     metrics.update(_model_metadata(model_name))
     metrics.update({key: bool(value) for key, value in variant_flags.items()})
     metrics.update(branch_masks)
@@ -343,9 +430,15 @@ def train_single_experiment(
         )
         metrics.update(explanation_metrics)
         metrics["avg_selected_neighbors"] = _hero_avg_selected_neighbors(hero_artifacts)
+    elif model_name in HERO_OFFICIAL_MODEL_NAMES:
+        official_metrics = dict(official_artifacts.get("diagnostics", {}))
+        metrics.update(official_metrics)
+        metrics["avg_selected_neighbors"] = float(official_metrics.get("avg_selected_neighbors", 0.0))
     else:
         metrics["avg_selected_neighbors"] = _baseline_avg_selected_neighbors(graph, model_name, test_idx, top_k)
     for key, value in _default_chain_diagnostics().items():
+        metrics.setdefault(key, value)
+    for key, value in _default_official_diagnostics().items():
         metrics.setdefault(key, value)
     payload = {
         "dataset": dataset,
@@ -582,6 +675,24 @@ def _limit_target_indices(target_indices: np.ndarray, max_target_nodes: int | No
     if max_target_nodes is None or max_target_nodes <= 0 or target_indices.size <= max_target_nodes:
         return target_indices
     return target_indices[: int(max_target_nodes)]
+
+
+def _limit_official_split_indices(
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    max_target_nodes: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    limit = int(max_target_nodes)
+    if limit <= 0:
+        return train_idx, val_idx, test_idx
+    total = train_idx.size + val_idx.size + test_idx.size
+    if total <= limit:
+        return train_idx, val_idx, test_idx
+    train_quota = max(1, int(limit * 0.6))
+    val_quota = max(1, int(limit * 0.2)) if val_idx.size else 0
+    test_quota = max(1, limit - train_quota - val_quota)
+    return train_idx[:train_quota], val_idx[:val_quota], test_idx[:test_quota]
 
 
 def _load_or_build_hetero_candidates(
@@ -1203,6 +1314,155 @@ def _group_mean_by_edge_group(
     return out / np.maximum(degree, 1.0)
 
 
+def _prepare_official_features(
+    graph: ProcessedGraphData,
+    homophilic_topk: int,
+    heterophilic_topk: int,
+    max_candidates_per_node: int,
+    target_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, int], dict[str, float | int]]:
+    x = graph.features.astype(np.float32, copy=False)
+    num_nodes, feature_dim = x.shape
+    edge_index = graph.edge_index
+    relation_names = _edge_relation_names_for_graph(graph)
+    relation_values = sorted(set(relation_names)) or ["rel_0"]
+    relation_to_idx = {name: idx for idx, name in enumerate(relation_values)}
+    relation_dim = max(len(relation_values), 1)
+    relation_counts = {name: relation_names.count(name) for name in relation_values}
+    max_relation_count = max(relation_counts.values()) if relation_counts else 1
+    relation_rarity = np.asarray(
+        [1.0 - relation_counts.get(name, 0) / max(max_relation_count, 1) for name in relation_names],
+        dtype=np.float32,
+    )
+    degree = _undirected_degree(edge_index, num_nodes)
+    degree_dev = _edge_degree_deviation(edge_index, degree)
+    similarity = _cosine_edge_scores(edge_index, x)
+    feature_distance = np.clip(1.0 - similarity, 0.0, 1.0).astype(np.float32)
+    local_z = _local_feature_zscores(edge_index, feature_distance)
+    hetero_score = (
+        0.45 * feature_distance
+        + 0.25 * relation_rarity
+        + 0.20 * local_z
+        + 0.10 * degree_dev
+    ).astype(np.float32)
+
+    homo = np.zeros_like(x, dtype=np.float32)
+    hetero = np.zeros_like(x, dtype=np.float32)
+    feature_deviation = np.zeros_like(x, dtype=np.float32)
+    relation_type = np.zeros((num_nodes, relation_dim), dtype=np.float32)
+    selected_feature_distances: list[float] = []
+    selected_homo_similarities: list[float] = []
+    selected_relation_rarity: list[float] = []
+    selected_counts: list[int] = []
+    max_pool = max(int(max_candidates_per_node), int(heterophilic_topk), 1)
+    positions_by_src: dict[int, list[int]] = {}
+    if edge_index.size:
+        for position, src in enumerate(edge_index[0]):
+            positions_by_src.setdefault(int(src), []).append(int(position))
+    if target_indices is None:
+        source_nodes = sorted(positions_by_src)
+    else:
+        source_nodes = [
+            int(index)
+            for index in np.asarray(target_indices, dtype=np.int64)
+            if 0 <= int(index) < num_nodes
+        ]
+    for src in source_nodes:
+        src = int(src)
+        positions = np.asarray(positions_by_src.get(src, []), dtype=np.int64)
+        if positions.size == 0:
+            selected_counts.append(0)
+            continue
+        homo_positions = positions[np.argsort(similarity[positions])[::-1]][: max(int(homophilic_topk), 0)]
+        hetero_pool = positions[np.argsort(hetero_score[positions])[::-1]][:max_pool]
+        hetero_positions = hetero_pool[: max(int(heterophilic_topk), 0)]
+        if homo_positions.size:
+            dst = edge_index[1, homo_positions]
+            weights = _normalize_positive(similarity[homo_positions])
+            homo[src] = np.sum(x[dst] * weights[:, None], axis=0)
+            selected_homo_similarities.extend(similarity[homo_positions].astype(float).tolist())
+        if hetero_positions.size:
+            dst = edge_index[1, hetero_positions]
+            weights = _normalize_positive(hetero_score[hetero_positions])
+            hetero[src] = np.sum(x[dst] * weights[:, None], axis=0)
+            feature_deviation[src] = np.sum(np.abs(x[src] - x[dst]) * weights[:, None], axis=0)
+            selected_feature_distances.extend(feature_distance[hetero_positions].astype(float).tolist())
+            selected_relation_rarity.extend(relation_rarity[hetero_positions].astype(float).tolist())
+        relation_positions = np.concatenate([homo_positions, hetero_positions]) if homo_positions.size or hetero_positions.size else np.array([], dtype=np.int64)
+        if relation_positions.size:
+            for position in relation_positions:
+                relation_type[src, relation_to_idx.get(relation_names[int(position)], 0)] += 1.0
+            relation_type[src] /= max(float(np.sum(relation_type[src])), 1.0)
+        selected_counts.append(int(homo_positions.size + hetero_positions.size))
+
+    features = np.concatenate([x, homo, hetero, feature_deviation, relation_type], axis=1).astype(np.float32)
+    feature_dims = {
+        "target_dim": int(feature_dim),
+        "homo_dim": int(feature_dim),
+        "hetero_dim": int(feature_dim),
+        "feature_deviation_dim": int(feature_dim),
+        "relation_dim": int(relation_dim),
+    }
+    diagnostics = {
+        "official_avg_feature_distance_selected": float(np.mean(selected_feature_distances)) if selected_feature_distances else 0.0,
+        "official_avg_homo_similarity_selected": float(np.mean(selected_homo_similarities)) if selected_homo_similarities else 0.0,
+        "official_avg_relation_rarity": float(np.mean(selected_relation_rarity)) if selected_relation_rarity else 0.0,
+        "official_num_relation_types": int(relation_dim),
+        "official_topk_homo": int(homophilic_topk),
+        "official_topk_hetero": int(heterophilic_topk),
+        "avg_selected_neighbors": float(np.mean(selected_counts)) if selected_counts else 0.0,
+    }
+    return features, feature_dims, diagnostics
+
+
+def _edge_relation_names_for_graph(graph: ProcessedGraphData) -> list[str]:
+    names: list[str] = []
+    for src, dst, edge_type in graph.edges[[schema.SRC, schema.DST, schema.EDGE_TYPE]].itertuples(index=False, name=None):
+        if src in graph.node_id_to_idx and dst in graph.node_id_to_idx:
+            names.append(str(edge_type))
+    if len(names) < graph.edge_index.shape[1]:
+        names.extend(["rel_0"] * (graph.edge_index.shape[1] - len(names)))
+    return names[: graph.edge_index.shape[1]]
+
+
+def _undirected_degree(edge_index: np.ndarray, num_nodes: int) -> np.ndarray:
+    degree = np.zeros(num_nodes, dtype=np.float32)
+    if edge_index.size:
+        np.add.at(degree, edge_index[0], 1.0)
+        np.add.at(degree, edge_index[1], 1.0)
+    return degree
+
+
+def _edge_degree_deviation(edge_index: np.ndarray, degree: np.ndarray) -> np.ndarray:
+    if edge_index.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    values = np.abs(np.log1p(degree[edge_index[0]]) - np.log1p(degree[edge_index[1]])).astype(np.float32)
+    max_value = float(np.max(values)) if values.size else 0.0
+    return values / max(max_value, 1e-8)
+
+
+def _local_feature_zscores(edge_index: np.ndarray, distances: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(distances, dtype=np.float32)
+    if edge_index.size == 0:
+        return out
+    for src in np.unique(edge_index[0]):
+        positions = np.flatnonzero(edge_index[0] == src)
+        values = distances[positions]
+        if values.size <= 1:
+            out[positions] = values
+            continue
+        std = float(np.std(values))
+        z = (values - float(np.mean(values))) / max(std, 1e-8)
+        out[positions] = np.clip((z + 2.0) / 4.0, 0.0, 1.0)
+    return out
+
+
+def _normalize_positive(values: np.ndarray) -> np.ndarray:
+    weights = np.asarray(values, dtype=np.float32)
+    weights = np.maximum(weights, 0.0) + 1e-6
+    return weights / max(float(np.sum(weights)), 1e-6)
+
+
 def _baseline_avg_selected_neighbors(
     graph: ProcessedGraphData,
     model_name: str,
@@ -1481,6 +1741,153 @@ def _evidence_recall_for_node(target_id: str, chains: list[dict[str, Any]], evid
     return float(len(gt_neighbors & predicted) / len(gt_neighbors))
 
 
+def _fit_hero_official_model(
+    graph: ProcessedGraphData,
+    model_name: str,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    seed: int,
+    epochs: int,
+    lr: float,
+    hidden_dim: int,
+    pos_weight: float,
+    homophilic_topk: int,
+    heterophilic_topk: int,
+    max_candidates_per_node: int,
+    enable_official_chain: bool,
+    device: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], dict[str, Any]]:
+    retrieval_start = time.perf_counter()
+    features, feature_dims, diagnostics = _prepare_official_features(
+        graph=graph,
+        homophilic_topk=homophilic_topk,
+        heterophilic_topk=heterophilic_topk,
+        max_candidates_per_node=max_candidates_per_node,
+        target_indices=np.concatenate([train_idx, val_idx, test_idx]),
+    )
+    retrieval_time = time.perf_counter() - retrieval_start
+    diagnostics.update(
+        {
+            "official_mode": True,
+            "use_official_chain": bool(enable_official_chain),
+            "lambda_chain_pos": 0.0,
+            "lambda_chain_neg": 0.0,
+            "num_chains_used": 0,
+            "num_raw_chains": 0,
+            "num_filtered_chains": 0,
+        }
+    )
+    variant_flags = _official_variant_flags(model_name)
+    if torch is None:
+        val_scores, test_scores, _without, checkpoint = _fit_numpy_feature_model(
+            features=features,
+            features_without_chains=features,
+            labels=graph.labels,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            seed=seed,
+            epochs=epochs,
+            lr=lr,
+            pos_weight=pos_weight,
+        )
+        checkpoint["official_feature_dims"] = feature_dims
+        return val_scores, test_scores, checkpoint, {"diagnostics": diagnostics, "time_retrieval_sec": retrieval_time}
+
+    from src.models.hero_official import HEROOfficial
+
+    torch.manual_seed(seed)
+    x = torch.tensor(features, dtype=torch.float32, device=device)
+    y = torch.tensor(graph.labels, dtype=torch.float32, device=device)
+    train_tensor = torch.tensor(train_idx, dtype=torch.long, device=device)
+    val_eval_idx = val_idx if val_idx.size else train_idx
+    val_tensor = torch.tensor(val_eval_idx, dtype=torch.long, device=device)
+    test_tensor = torch.tensor(test_idx, dtype=torch.long, device=device)
+    target_x, homo_x, hetero_x, deviation_x, relation_x = _split_official_features_torch(x, feature_dims)
+    model = HEROOfficial(
+        input_dim=int(feature_dims["target_dim"]),
+        relation_dim=int(feature_dims["relation_dim"]),
+        hidden_dim=hidden_dim,
+        output_dim=1,
+        use_hetero=variant_flags["use_official_hetero"],
+        use_relation=variant_flags["use_official_relation"],
+        use_feature_deviation=variant_flags["use_official_feature_deviation"],
+        dropout=0.2,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device))
+    best_state = None
+    best_score = -1.0
+    for _epoch in range(max(1, epochs)):
+        model.train()
+        optimizer.zero_grad()
+        logits = model(target_x, homo_x, hetero_x, deviation_x, relation_x)
+        loss = criterion(logits[train_tensor], y[train_tensor])
+        loss.backward()
+        optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            logits = model(target_x, homo_x, hetero_x, deviation_x, relation_x)
+            val_scores = torch.sigmoid(logits[val_tensor]).detach().cpu().numpy()
+        val_metrics = binary_classification_metrics(graph.labels[val_eval_idx], val_scores, k=100)
+        if val_metrics["auprc"] >= best_score:
+            best_score = val_metrics["auprc"]
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        logits, details = model(target_x, homo_x, hetero_x, deviation_x, relation_x, return_details=True)
+        val_scores = torch.sigmoid(logits[val_tensor]).detach().cpu().numpy()
+        test_scores = torch.sigmoid(logits[test_tensor]).detach().cpu().numpy()
+        diagnostics.update(_official_gate_diagnostics(details, test_tensor))
+    return val_scores, test_scores, {"model_state_dict": best_state, "model_name": model_name, "pos_weight": float(pos_weight)}, {
+        "diagnostics": diagnostics,
+        "time_retrieval_sec": retrieval_time,
+    }
+
+
+def _split_official_features_torch(x, feature_dims: dict[str, int]):
+    target_dim = int(feature_dims["target_dim"])
+    homo_dim = int(feature_dims["homo_dim"])
+    hetero_dim = int(feature_dims["hetero_dim"])
+    deviation_dim = int(feature_dims["feature_deviation_dim"])
+    relation_dim = int(feature_dims["relation_dim"])
+    target_start = 0
+    homo_start = target_start + target_dim
+    hetero_start = homo_start + homo_dim
+    deviation_start = hetero_start + hetero_dim
+    relation_start = deviation_start + deviation_dim
+    return (
+        x[:, target_start:homo_start],
+        x[:, homo_start:hetero_start],
+        x[:, hetero_start:deviation_start],
+        x[:, deviation_start:relation_start],
+        x[:, relation_start : relation_start + relation_dim],
+    )
+
+
+def _official_gate_diagnostics(details: dict[str, Any], indices) -> dict[str, float]:
+    diagnostics = {
+        "avg_relation_gate": 0.0,
+        "avg_feature_deviation_gate": 0.0,
+        "avg_official_hetero_gate": 0.0,
+    }
+    mapping = {
+        "avg_relation_gate": "relation_gate",
+        "avg_feature_deviation_gate": "feature_deviation_gate",
+        "avg_official_hetero_gate": "official_hetero_gate",
+    }
+    for metric, key in mapping.items():
+        value = details.get(key)
+        if value is not None and value.numel():
+            diagnostics[metric] = float(value[indices].detach().cpu().mean().item())
+    return diagnostics
+
+
 def _fit_torch_model(
     graph: ProcessedGraphData,
     model_name: str,
@@ -1493,6 +1900,7 @@ def _fit_torch_model(
     hidden_dim: int,
     top_k: int,
     pos_weight: float,
+    device: str,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     from src.models.dga_gnn_lite import DGAGNNLite
     from src.models.flag_lite import FLAGLite
@@ -1515,19 +1923,20 @@ def _fit_torch_model(
     model_kwargs = {"input_dim": graph.features.shape[1], "hidden_dim": hidden_dim, "output_dim": 1}
     if model_name == "flag_lite":
         model_kwargs["text_dim"] = graph.text_features.shape[1]
-    model = model_cls(**model_kwargs)
-    x = torch.tensor(graph.features, dtype=torch.float32)
-    text_x = torch.tensor(graph.text_features, dtype=torch.float32)
-    labels = torch.tensor(graph.labels, dtype=torch.float32)
-    edge_index = torch.tensor(_edge_index_for_model(graph, model_name, top_k), dtype=torch.long)
-    attribute_groups = torch.tensor(_attribute_groups(graph.features, 4), dtype=torch.long)
-    relation_groups = torch.tensor(_relation_groups_for_graph(graph, 4), dtype=torch.long)
-    train_tensor = torch.tensor(train_idx, dtype=torch.long)
-    val_tensor = torch.tensor(val_idx if val_idx.size else train_idx, dtype=torch.long)
-    test_tensor = torch.tensor(test_idx, dtype=torch.long)
+    model = model_cls(**model_kwargs).to(device)
+    x = torch.tensor(graph.features, dtype=torch.float32, device=device)
+    text_x = torch.tensor(graph.text_features, dtype=torch.float32, device=device)
+    labels = torch.tensor(graph.labels, dtype=torch.float32, device=device)
+    edge_index = torch.tensor(_edge_index_for_model(graph, model_name, top_k), dtype=torch.long, device=device)
+    attribute_groups = torch.tensor(_attribute_groups(graph.features, 4), dtype=torch.long, device=device)
+    relation_groups = torch.tensor(_relation_groups_for_graph(graph, 4), dtype=torch.long, device=device)
+    train_tensor = torch.tensor(train_idx, dtype=torch.long, device=device)
+    val_eval_idx = val_idx if val_idx.size else train_idx
+    val_tensor = torch.tensor(val_eval_idx, dtype=torch.long, device=device)
+    test_tensor = torch.tensor(test_idx, dtype=torch.long, device=device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32))
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device))
     best_state = None
     best_score = -1.0
     for _epoch in range(max(1, epochs)):
@@ -1542,7 +1951,7 @@ def _fit_torch_model(
         with torch.no_grad():
             logits = _model_logits(model, model_name, x, edge_index, text_x, attribute_groups, relation_groups)
             val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
-        val_metrics = binary_classification_metrics(graph.labels[val_tensor.numpy()], val_scores, k=100)
+        val_metrics = binary_classification_metrics(graph.labels[val_eval_idx], val_scores, k=100)
         if val_metrics["auprc"] >= best_score:
             best_score = val_metrics["auprc"]
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -1695,6 +2104,7 @@ def _fit_torch_feature_model(
     lambda_chain_pos: float,
     lambda_chain_neg: float,
     min_chain_quality: float,
+    device: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     if torch is None:
         return _fit_numpy_feature_model(
@@ -1720,11 +2130,12 @@ def _fit_torch_feature_model(
     from src.models.hero_gnn import HEROGNN
 
     torch.manual_seed(seed)
-    x = torch.tensor(features, dtype=torch.float32)
-    y = torch.tensor(labels, dtype=torch.float32)
-    train_tensor = torch.tensor(train_idx, dtype=torch.long)
-    val_tensor = torch.tensor(val_idx if val_idx.size else train_idx, dtype=torch.long)
-    test_tensor = torch.tensor(test_idx, dtype=torch.long)
+    x = torch.tensor(features, dtype=torch.float32, device=device)
+    y = torch.tensor(labels, dtype=torch.float32, device=device)
+    train_tensor = torch.tensor(train_idx, dtype=torch.long, device=device)
+    val_eval_idx = val_idx if val_idx.size else train_idx
+    val_tensor = torch.tensor(val_eval_idx, dtype=torch.long, device=device)
+    test_tensor = torch.tensor(test_idx, dtype=torch.long, device=device)
     target_x, homo_x, hetero_x, mechanism_x, chain_x = _split_hero_features_torch(x, feature_dims)
     model = HEROGNN(
         input_dim=int(feature_dims["target_dim"]),
@@ -1737,9 +2148,9 @@ def _fit_torch_feature_model(
         hetero_input_dim=int(feature_dims["hetero_dim"]),
         mechanism_input_dim=int(feature_dims["mechanism_dim"]),
         chain_input_dim=int(feature_dims["chain_dim"]),
-    )
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32))
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device))
     best_state = None
     best_score = -1.0
     last_chain_pos_loss = 0.0
@@ -1778,7 +2189,7 @@ def _fit_torch_feature_model(
         with torch.no_grad():
             logits = model(target_x, homo_x, hetero_x, mechanism_x, chain_x)
             val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
-        val_metrics = binary_classification_metrics(labels[val_tensor.numpy()], val_scores, k=100)
+        val_metrics = binary_classification_metrics(labels[val_eval_idx], val_scores, k=100)
         if val_metrics["auprc"] >= best_score:
             best_score = val_metrics["auprc"]
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
