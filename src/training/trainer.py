@@ -225,6 +225,8 @@ def train_single_experiment(
     llm_label_file: str | Path | None = None,
     experiment_tag: str | None = None,
     llm_labeler: str | None = None,
+    eval_target_file: str | Path | None = None,
+    disable_llm_fallback: bool = False,
     enable_official_chain: bool = False,
     device: str | None = "auto",
 ) -> dict[str, Any]:
@@ -259,6 +261,7 @@ def train_single_experiment(
         train_idx, val_idx, test_idx = _limit_official_split_indices(train_idx, val_idx, test_idx, max_target_nodes)
     if train_idx.size == 0 or test_idx.size == 0:
         raise ValueError("Processed data must contain labeled train and test review nodes.")
+    eval_target_indices = _load_eval_target_indices(eval_target_file, graph, test_idx) if eval_target_file is not None else None
 
     class_stats = _split_class_stats(
         train_labels=graph.labels[train_idx],
@@ -307,6 +310,8 @@ def train_single_experiment(
             llm_label_file=llm_label_file,
             experiment_tag=experiment_tag,
             llm_labeler=llm_labeler,
+            coverage_target_indices=eval_target_indices,
+            disable_llm_fallback=disable_llm_fallback,
         )
         stage_times.update(hero_artifacts.get("time", {}))
         print(f"[TRAIN] {model_name}")
@@ -391,14 +396,30 @@ def train_single_experiment(
         )
         stage_times["time_training_sec"] = time.perf_counter() - train_start
 
+    eval_test_idx = test_idx
+    eval_test_scores = test_scores
+    if eval_target_indices is not None:
+        eval_positions = _subset_positions(test_idx, eval_target_indices)
+        if eval_positions.size == 0:
+            raise ValueError(f"No eval target ids from {eval_target_file} overlap the test split.")
+        eval_test_idx = test_idx[eval_positions]
+        eval_test_scores = test_scores[eval_positions]
+        if model_name in HERO_MODEL_NAMES:
+            scores_without_chains = scores_without_chains[eval_positions]
+
     threshold_labels = graph.labels[val_idx] if val_idx.size else graph.labels[train_idx]
     threshold_info = tune_threshold(threshold_labels, val_scores, return_info=True)
     best_threshold = float(threshold_info["best_threshold"])
-    metrics = binary_classification_metrics(graph.labels[test_idx], test_scores, k=100, threshold=best_threshold)
+    metrics = binary_classification_metrics(graph.labels[eval_test_idx], eval_test_scores, k=100, threshold=best_threshold)
     metrics.update(threshold_info)
-    metrics.update(fixed_threshold_diagnostics(graph.labels[test_idx], test_scores, threshold=0.5))
-    metrics.update(prediction_probability_stats(graph.labels[test_idx], test_scores))
+    metrics.update(fixed_threshold_diagnostics(graph.labels[eval_test_idx], eval_test_scores, threshold=0.5))
+    metrics.update(prediction_probability_stats(graph.labels[eval_test_idx], eval_test_scores))
     metrics.update(class_stats)
+    if eval_target_file is not None:
+        metrics["eval_target_file"] = str(eval_target_file)
+        metrics["num_eval_target_nodes"] = int(eval_test_idx.size)
+    if disable_llm_fallback:
+        metrics["disable_llm_fallback"] = True
     metrics["pos_weight"] = float(pos_weight)
     metrics["official_mode"] = bool(official_mode)
     metrics["device"] = device_name
@@ -411,7 +432,7 @@ def train_single_experiment(
             {
                 "train": graph.labels[train_idx],
                 "val": graph.labels[val_idx],
-                "test": graph.labels[test_idx],
+                "test": graph.labels[eval_test_idx],
             }
         )
     )
@@ -428,8 +449,8 @@ def train_single_experiment(
             model_name=model_name,
             seed=seed,
             output_root=output_root,
-            test_idx=test_idx,
-            scores=test_scores,
+            test_idx=eval_test_idx,
+            scores=eval_test_scores,
             scores_without_chains=scores_without_chains,
             hero_artifacts=hero_artifacts,
         )
@@ -440,7 +461,7 @@ def train_single_experiment(
         metrics.update(official_metrics)
         metrics["avg_selected_neighbors"] = float(official_metrics.get("avg_selected_neighbors", 0.0))
     else:
-        metrics["avg_selected_neighbors"] = _baseline_avg_selected_neighbors(graph, model_name, test_idx, top_k)
+        metrics["avg_selected_neighbors"] = _baseline_avg_selected_neighbors(graph, model_name, eval_test_idx, top_k)
     for key, value in _default_chain_diagnostics().items():
         metrics.setdefault(key, value)
     for key, value in _default_official_diagnostics().items():
@@ -456,6 +477,11 @@ def train_single_experiment(
         payload["experiment_tag"] = str(experiment_tag or metrics.get("experiment_tag", ""))
         payload["llm_labeler"] = str(llm_labeler or metrics.get("llm_labeler", "mock"))
         payload["llm_label_coverage_rate"] = float(metrics.get("llm_label_coverage_rate", 0.0))
+    if eval_target_file is not None:
+        payload["eval_target_file"] = str(eval_target_file)
+        payload["num_eval_target_nodes"] = int(metrics.get("num_eval_target_nodes", 0))
+    if disable_llm_fallback:
+        payload["disable_llm_fallback"] = True
     payload.update(stage_times)
     payload["time_total_sec"] = time.perf_counter() - time_total_start
 
@@ -552,6 +578,8 @@ def _prepare_hero_features(
     llm_label_file: str | Path | None = None,
     experiment_tag: str | None = None,
     llm_labeler: str | None = None,
+    coverage_target_indices: np.ndarray | None = None,
+    disable_llm_fallback: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     print(f"[START] {model_name}")
     timings = {
@@ -597,6 +625,9 @@ def _prepare_hero_features(
                 "llm_labeler": str(llm_labeler or ("external" if llm_label_file is not None else "mock")),
                 "llm_label_coverage_rate": 0.0,
                 "llm_label_total_pairs": 0,
+                "num_external_llm_labels_used": 0,
+                "num_missing_llm_pairs": 0,
+                "disable_llm_fallback": bool(disable_llm_fallback),
             }
         )
 
@@ -625,7 +656,10 @@ def _prepare_hero_features(
     timings["time_retrieval_sec"] = time.perf_counter() - retrieval_start
 
     if use_mock_llm_mechanism and llm_label_file is not None:
-        print("[BUILD] external LLM labels with mock fallback")
+        if disable_llm_fallback:
+            print("[BUILD] external LLM labels without mock fallback")
+        else:
+            print("[BUILD] external LLM labels with mock fallback")
     else:
         print("[BUILD] mock LLM labels" if use_mock_llm_mechanism else "[BUILD] rule hetero labels")
     labels_by_target, label_time, label_stats = _label_candidates(
@@ -635,6 +669,8 @@ def _prepare_hero_features(
         llm_label_file=llm_label_file,
         experiment_tag=experiment_tag,
         llm_labeler=llm_labeler,
+        coverage_target_indices=coverage_target_indices,
+        disable_llm_fallback=disable_llm_fallback,
     )
     timings["time_mock_labeling_sec"] = label_time
     hetero_features, mechanism_features = _hetero_feature_matrix(
@@ -1037,6 +1073,25 @@ def _read_evidence_chains(path: Path) -> dict[int, list[dict[str, Any]]]:
     return chains_by_idx
 
 
+def _coverage_pair_count(pairs: list[tuple[int, Any]], coverage_target_set: set[int] | None) -> int:
+    if coverage_target_set is None:
+        return len(pairs)
+    return int(sum(1 for target_idx, _candidate in pairs if int(target_idx) in coverage_target_set))
+
+
+def _missing_llm_label(candidate: Any) -> dict[str, Any]:
+    return {
+        "target_id": candidate.target_id,
+        "neighbor_id": candidate.neighbor_id,
+        "metapath": candidate.metapath,
+        "mechanism": "irrelevant_heterophily",
+        "risk_relevance": 0,
+        "confidence": 0.0,
+        "rationale": "missing external LLM label; fallback disabled",
+        "labeler_version": "external_missing_no_fallback",
+    }
+
+
 def _label_candidates(
     data_dir: Path,
     candidates_by_target: dict[int, list[Any]],
@@ -1044,6 +1099,8 @@ def _label_candidates(
     llm_label_file: str | Path | None = None,
     experiment_tag: str | None = None,
     llm_labeler: str | None = None,
+    coverage_target_indices: np.ndarray | None = None,
+    disable_llm_fallback: bool = False,
 ) -> tuple[dict[int, list[dict[str, Any]]], float, dict[str, Any]]:
     label_start = time.perf_counter()
     custom_label_path = Path(llm_label_file) if llm_label_file is not None else None
@@ -1061,6 +1118,7 @@ def _label_candidates(
         for candidate in candidates
     ]
     base_by_pair: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    coverage_target_set = {int(value) for value in coverage_target_indices} if coverage_target_indices is not None else None
     stats = {
         "external_llm_label_file": str(custom_label_path) if custom_label_path is not None else "",
         "external_llm_labels_used": 0,
@@ -1072,13 +1130,17 @@ def _label_candidates(
                 "llm_label_file": str(custom_label_path) if custom_label_path is not None else "",
                 "experiment_tag": str(experiment_tag or ""),
                 "llm_labeler": str(llm_labeler or ("external" if custom_label_path is not None else "mock")),
-                "llm_label_total_pairs": len(pairs),
+                "llm_label_total_pairs": _coverage_pair_count(pairs, coverage_target_set),
                 "llm_label_coverage_rate": 0.0,
+                "num_external_llm_labels_used": 0,
+                "num_missing_llm_pairs": 0,
+                "disable_llm_fallback": bool(disable_llm_fallback),
             }
         )
     if use_mechanism:
         labeler_desc = "external_llm_labels" if custom_readonly else "mock_labeler"
         for target_idx, candidate in tqdm(pairs, desc=labeler_desc, unit="pair"):
+            is_coverage_pair = coverage_target_set is None or int(target_idx) in coverage_target_set
             key = cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath)
             cached_label = cache.get(key) if cache is not None else None
             if custom_readonly and cached_label is None and cache is not None:
@@ -1086,17 +1148,26 @@ def _label_candidates(
             if custom_readonly and cached_label is not None:
                 base_label = normalize_label(cached_label, risk_card=format_candidate_risk_card(candidate))
                 stats["external_llm_labels_used"] += 1
+                if is_coverage_pair and "num_external_llm_labels_used" in stats:
+                    stats["num_external_llm_labels_used"] += 1
+            elif custom_readonly and disable_llm_fallback:
+                base_label = _missing_llm_label(candidate)
+                if is_coverage_pair and "num_missing_llm_pairs" in stats:
+                    stats["num_missing_llm_pairs"] += 1
             elif cached_label is None or cached_label.get("labeler_version") != MOCK_LABELER_VERSION:
                 base_label = label_candidate_mechanism(candidate)
                 stats["mock_llm_labels_used"] += 1
+                if custom_readonly and is_coverage_pair and "num_missing_llm_pairs" in stats:
+                    stats["num_missing_llm_pairs"] += 1
                 if cache is not None and not custom_readonly:
                     cache.set(key, base_label)
             else:
                 base_label = dict(cached_label)
             base_by_pair[(target_idx, candidate.target_id, candidate.neighbor_id, candidate.metapath)] = base_label
         if custom_label_path is not None or experiment_tag:
+            coverage_total = int(stats.get("llm_label_total_pairs", 0))
             stats["llm_label_coverage_rate"] = (
-                float(stats["external_llm_labels_used"] / len(pairs)) if custom_readonly and pairs else 0.0
+                float(stats.get("num_external_llm_labels_used", 0) / coverage_total) if custom_readonly and coverage_total else 0.0
             )
 
     for target_idx, candidate in tqdm(pairs, desc="risk heterophily scoring", unit="pair"):
@@ -1642,6 +1713,9 @@ def _write_hero_explanations(
         "external_llm_label_file": str(variant_debug.get("external_llm_label_file", "")),
         "external_llm_labels_used": int(variant_debug.get("external_llm_labels_used", 0)),
         "mock_llm_labels_used": int(variant_debug.get("mock_llm_labels_used", 0)),
+        "num_external_llm_labels_used": int(variant_debug.get("num_external_llm_labels_used", variant_debug.get("external_llm_labels_used", 0))),
+        "num_missing_llm_pairs": int(variant_debug.get("num_missing_llm_pairs", 0)),
+        "disable_llm_fallback": bool(variant_debug.get("disable_llm_fallback", False)),
         "num_raw_chains": int(variant_debug.get("num_raw_chains", 0)),
         "num_filtered_chains": int(variant_debug.get("num_filtered_chains", 0)),
         "chain_filter_keep_rate": float(variant_debug.get("chain_filter_keep_rate", 0.0)),
@@ -1774,6 +1848,9 @@ def _write_variant_debug(
         "llm_labeler": str(metrics.get("llm_labeler", "mock")),
         "llm_label_coverage_rate": float(metrics.get("llm_label_coverage_rate", 0.0)),
         "llm_label_total_pairs": int(metrics.get("llm_label_total_pairs", 0)),
+        "num_external_llm_labels_used": int(metrics.get("num_external_llm_labels_used", metrics.get("external_llm_labels_used", 0))),
+        "num_missing_llm_pairs": int(metrics.get("num_missing_llm_pairs", 0)),
+        "disable_llm_fallback": bool(metrics.get("disable_llm_fallback", False)),
         "external_llm_labels_used": int(metrics.get("external_llm_labels_used", 0)),
         "mock_llm_labels_used": int(metrics.get("mock_llm_labels_used", 0)),
         "num_raw_chains": int(metrics.get("num_raw_chains", 0)),
@@ -2818,6 +2895,35 @@ def _positive_scores(classifier, features: np.ndarray) -> np.ndarray:
 def _valid_label_indices(indices: np.ndarray, labels: np.ndarray) -> np.ndarray:
     indices = np.asarray(indices, dtype=np.int64)
     return indices[labels[indices] >= 0]
+
+
+def _load_eval_target_indices(path: str | Path, graph: ProcessedGraphData, test_idx: np.ndarray) -> np.ndarray:
+    target_path = Path(path)
+    if not target_path.exists():
+        raise FileNotFoundError(f"Missing eval target file: {target_path}")
+    payload = json.loads(target_path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        target_ids = payload
+    elif isinstance(payload, dict):
+        target_ids = payload.get("target_ids", payload.get("targets", []))
+    else:
+        raise ValueError("eval_target_file must be a JSON list or an object with target_ids.")
+    target_set = {str(value) for value in target_ids}
+    test_set = {int(value) for value in np.asarray(test_idx, dtype=np.int64).tolist()}
+    indices = [
+        int(graph.node_id_to_idx[target_id])
+        for target_id in target_set
+        if target_id in graph.node_id_to_idx and int(graph.node_id_to_idx[target_id]) in test_set
+    ]
+    if not indices:
+        return np.array([], dtype=np.int64)
+    ordered = [int(idx) for idx in test_idx.tolist() if int(idx) in set(indices)]
+    return np.asarray(ordered, dtype=np.int64)
+
+
+def _subset_positions(full_indices: np.ndarray, subset_indices: np.ndarray) -> np.ndarray:
+    subset = {int(value) for value in np.asarray(subset_indices, dtype=np.int64).tolist()}
+    return np.asarray([pos for pos, value in enumerate(full_indices.tolist()) if int(value) in subset], dtype=np.int64)
 
 
 def _experiment_paths(

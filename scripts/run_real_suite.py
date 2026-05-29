@@ -66,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_chain_neg", type=float, default=None, help="Negative-sample chain contribution loss weight.")
     parser.add_argument("--llm_label_file", default=None, help="Optional prebuilt LLM label JSONL file for HERO-style models.")
     parser.add_argument("--experiment_tag", default=None, help="Optional tag for LLM labeler comparison outputs.")
+    parser.add_argument("--eval_target_file", default=None, help="Optional target-id JSON file for subset test evaluation.")
+    parser.add_argument("--disable_llm_fallback", action="store_true", help="Use irrelevant_heterophily for missing external LLM labels.")
     parser.add_argument("--enable_official_chain", action="store_true", help="Enable evidence-chain knobs for HERO-official variants.")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto", help="Training device.")
     return parser.parse_args()
@@ -130,6 +132,8 @@ def main() -> None:
                 llm_label_file=args.llm_label_file,
                 experiment_tag=experiment_tag if args.llm_label_file else None,
                 llm_labeler=llm_labeler,
+                eval_target_file=args.eval_target_file,
+                disable_llm_fallback=bool(args.disable_llm_fallback),
                 enable_official_chain=bool(args.enable_official_chain),
                 device=args.device,
             )

@@ -341,6 +341,52 @@ python scripts/run_real_suite.py \
 
 If `--llm_label_file` is omitted, HERO uses the reproducible mock LLM labeler. A small label file is read only for matching risk cards; missing cards fall back to mock labels and do not trigger real LLM calls.
 
+## High-Coverage Real LLM Subset Study
+
+The 500-card real LLM study verifies feasibility but has low label coverage.
+The high-coverage subset study evaluates HERO-GNN on selected target nodes whose heterophilic candidates are densely annotated by Qwen2.5-7B-Instruct.
+
+Build target nodes and dense risk cards:
+
+```bash
+python scripts/build_high_coverage_llm_subset.py \
+  --dataset yelp_academic \
+  --num_target_nodes 500 \
+  --heterophilic_topk 10 \
+  --out_target_file data/processed/yelp_academic/llm_subset_targets_500.json \
+  --out_risk_card_file data/processed/yelp_academic/risk_cards_highcov_500x10.jsonl
+```
+
+Reuse the standard label builder:
+
+```bash
+python scripts/build_llm_labels.py \
+  --dataset yelp_academic \
+  --labeler local_qwen \
+  --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+  --risk_card_file data/processed/yelp_academic/risk_cards_highcov_500x10.jsonl \
+  --out_file data/processed/yelp_academic/llm_labels_qwen2p5_7b_highcov_500x10.jsonl
+```
+
+Run the subset study:
+
+```bash
+python scripts/run_high_coverage_llm_subset.py \
+  --dataset yelp_academic \
+  --target_file data/processed/yelp_academic/llm_subset_targets_500.json \
+  --llm_label_file data/processed/yelp_academic/llm_labels_qwen2p5_7b_highcov_500x10.jsonl \
+  --experiment_tag qwen2p5_7b_highcov_500x10 \
+  --device cuda
+```
+
+Export the study table:
+
+```bash
+python scripts/export_real_llm_study_table.py \
+  --datasets yelp_academic amazon_video \
+  --out_dir outputs/summary_llm_highcov
+```
+
 ## Replacing Labels
 
 To use DGP-processed labels:
