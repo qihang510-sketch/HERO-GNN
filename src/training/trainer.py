@@ -22,6 +22,7 @@ from src.graph.neighbor_retrieval import (
     retrieve_hetero_candidates,
 )
 from src.llm.label_cache import LabelCache, cache_key
+from src.llm.base_labeler import normalize_label
 from src.llm.mock_labeler import MOCK_LABELER_VERSION, label_candidate_mechanism
 from src.llm.risk_card import format_candidate_risk_card
 from src.training.evaluator import (
@@ -222,6 +223,8 @@ def train_single_experiment(
     lambda_chain_pos: float = 0.03,
     lambda_chain_neg: float = 0.01,
     llm_label_file: str | Path | None = None,
+    experiment_tag: str | None = None,
+    llm_labeler: str | None = None,
     enable_official_chain: bool = False,
     device: str | None = "auto",
 ) -> dict[str, Any]:
@@ -233,7 +236,7 @@ def train_single_experiment(
     graph = load_processed_data(data_dir)
     official_mode = _is_official_graph(graph, dataset)
     device_name, cuda_available = _resolve_device_name(device)
-    paths = _experiment_paths(output_root, dataset, model_name, seed)
+    paths = _experiment_paths(output_root, dataset, model_name, seed, experiment_tag=experiment_tag)
     logger = _make_logger(paths["log"], dataset, model_name, seed)
     time_total_start = time.perf_counter()
     stage_times = {
@@ -302,6 +305,8 @@ def train_single_experiment(
             max_chain_length=max_chain_length,
             min_chain_quality=min_chain_quality,
             llm_label_file=llm_label_file,
+            experiment_tag=experiment_tag,
+            llm_labeler=llm_labeler,
         )
         stage_times.update(hero_artifacts.get("time", {}))
         print(f"[TRAIN] {model_name}")
@@ -446,6 +451,11 @@ def train_single_experiment(
         "seed": seed,
         **metrics,
     }
+    if llm_label_file is not None or metrics.get("llm_label_file") or experiment_tag:
+        payload["llm_label_file"] = str(llm_label_file) if llm_label_file is not None else str(metrics.get("llm_label_file", ""))
+        payload["experiment_tag"] = str(experiment_tag or metrics.get("experiment_tag", ""))
+        payload["llm_labeler"] = str(llm_labeler or metrics.get("llm_labeler", "mock"))
+        payload["llm_label_coverage_rate"] = float(metrics.get("llm_label_coverage_rate", 0.0))
     payload.update(stage_times)
     payload["time_total_sec"] = time.perf_counter() - time_total_start
 
@@ -540,6 +550,8 @@ def _prepare_hero_features(
     max_chain_length: int,
     min_chain_quality: float,
     llm_label_file: str | Path | None = None,
+    experiment_tag: str | None = None,
+    llm_labeler: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     print(f"[START] {model_name}")
     timings = {
@@ -577,6 +589,16 @@ def _prepare_hero_features(
         "num_filtered_chains": 0,
         "chain_filter_keep_rate": 0.0,
     }
+    if llm_label_file is not None or experiment_tag:
+        base_debug.update(
+            {
+                "llm_label_file": str(llm_label_file) if llm_label_file is not None else "",
+                "experiment_tag": str(experiment_tag or ""),
+                "llm_labeler": str(llm_labeler or ("external" if llm_label_file is not None else "mock")),
+                "llm_label_coverage_rate": 0.0,
+                "llm_label_total_pairs": 0,
+            }
+        )
 
     if not use_hetero:
         features = np.concatenate([graph.features, homo_agg, zero_hetero, zero_mechanism, zero_chain], axis=1).astype(np.float32)
@@ -602,12 +624,17 @@ def _prepare_hero_features(
     candidates_by_target = _trim_candidates(candidates_by_target, heterophilic_topk)
     timings["time_retrieval_sec"] = time.perf_counter() - retrieval_start
 
-    print("[BUILD] mock LLM labels" if use_mock_llm_mechanism else "[BUILD] rule hetero labels")
+    if use_mock_llm_mechanism and llm_label_file is not None:
+        print("[BUILD] external LLM labels with mock fallback")
+    else:
+        print("[BUILD] mock LLM labels" if use_mock_llm_mechanism else "[BUILD] rule hetero labels")
     labels_by_target, label_time, label_stats = _label_candidates(
         data_dir,
         candidates_by_target,
         use_mechanism=use_mock_llm_mechanism,
         llm_label_file=llm_label_file,
+        experiment_tag=experiment_tag,
+        llm_labeler=llm_labeler,
     )
     timings["time_mock_labeling_sec"] = label_time
     hetero_features, mechanism_features = _hetero_feature_matrix(
@@ -1015,6 +1042,8 @@ def _label_candidates(
     candidates_by_target: dict[int, list[Any]],
     use_mechanism: bool,
     llm_label_file: str | Path | None = None,
+    experiment_tag: str | None = None,
+    llm_labeler: str | None = None,
 ) -> tuple[dict[int, list[dict[str, Any]]], float, dict[str, Any]]:
     label_start = time.perf_counter()
     custom_label_path = Path(llm_label_file) if llm_label_file is not None else None
@@ -1037,13 +1066,25 @@ def _label_candidates(
         "external_llm_labels_used": 0,
         "mock_llm_labels_used": 0,
     }
+    if custom_label_path is not None or experiment_tag:
+        stats.update(
+            {
+                "llm_label_file": str(custom_label_path) if custom_label_path is not None else "",
+                "experiment_tag": str(experiment_tag or ""),
+                "llm_labeler": str(llm_labeler or ("external" if custom_label_path is not None else "mock")),
+                "llm_label_total_pairs": len(pairs),
+                "llm_label_coverage_rate": 0.0,
+            }
+        )
     if use_mechanism:
         labeler_desc = "external_llm_labels" if custom_readonly else "mock_labeler"
         for target_idx, candidate in tqdm(pairs, desc=labeler_desc, unit="pair"):
             key = cache_key(candidate.target_id, candidate.neighbor_id, candidate.metapath)
             cached_label = cache.get(key) if cache is not None else None
+            if custom_readonly and cached_label is None and cache is not None:
+                cached_label = cache.get_pair(candidate.target_id, candidate.neighbor_id)
             if custom_readonly and cached_label is not None:
-                base_label = dict(cached_label)
+                base_label = normalize_label(cached_label, risk_card=format_candidate_risk_card(candidate))
                 stats["external_llm_labels_used"] += 1
             elif cached_label is None or cached_label.get("labeler_version") != MOCK_LABELER_VERSION:
                 base_label = label_candidate_mechanism(candidate)
@@ -1053,6 +1094,10 @@ def _label_candidates(
             else:
                 base_label = dict(cached_label)
             base_by_pair[(target_idx, candidate.target_id, candidate.neighbor_id, candidate.metapath)] = base_label
+        if custom_label_path is not None or experiment_tag:
+            stats["llm_label_coverage_rate"] = (
+                float(stats["external_llm_labels_used"] / len(pairs)) if custom_readonly and pairs else 0.0
+            )
 
     for target_idx, candidate in tqdm(pairs, desc="risk heterophily scoring", unit="pair"):
         if use_mechanism:
@@ -1509,7 +1554,12 @@ def _write_hero_explanations(
     scores_without_chains: np.ndarray,
     hero_artifacts: dict[str, Any],
 ) -> dict[str, float]:
-    path = Path(output_root) / "explanations" / dataset / model_name / f"seed_{seed}" / "examples.jsonl"
+    variant_debug = hero_artifacts.get("variant_debug", {})
+    experiment_tag = str(variant_debug.get("experiment_tag", ""))
+    if experiment_tag:
+        path = Path(output_root) / "explanations_llm_comparison" / dataset / experiment_tag / model_name / f"seed_{seed}" / "examples.jsonl"
+    else:
+        path = Path(output_root) / "explanations" / dataset / model_name / f"seed_{seed}" / "examples.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     idx_to_id = _idx_to_node_id(graph)
     chains_by_idx = hero_artifacts.get("chains_by_idx", {})
@@ -1574,7 +1624,6 @@ def _write_hero_explanations(
     necessity_gap = necessity_pos - necessity_neg
     avg_num_chains = float(np.mean(chain_counts)) if chain_counts else 0.0
     model_diagnostics = hero_artifacts.get("model_diagnostics", {})
-    variant_debug = hero_artifacts.get("variant_debug", {})
     metrics = {
         "use_hetero": bool(hero_artifacts.get("use_hetero", False)),
         "use_chain": bool(hero_artifacts.get("use_chain", False)),
@@ -1630,6 +1679,16 @@ def _write_hero_explanations(
         "chain_pos_loss": float(model_diagnostics.get("chain_pos_loss", 0.0)),
         "chain_neg_loss": float(model_diagnostics.get("chain_neg_loss", 0.0)),
     }
+    if variant_debug.get("llm_label_file") or variant_debug.get("experiment_tag"):
+        metrics.update(
+            {
+                "llm_label_file": str(variant_debug.get("llm_label_file", variant_debug.get("external_llm_label_file", ""))),
+                "experiment_tag": str(variant_debug.get("experiment_tag", "")),
+                "llm_labeler": str(variant_debug.get("llm_labeler", "mock")),
+                "llm_label_coverage_rate": float(variant_debug.get("llm_label_coverage_rate", 0.0)),
+                "llm_label_total_pairs": int(variant_debug.get("llm_label_total_pairs", 0)),
+            }
+        )
     _write_hero_diagnostics(
         output_root=output_root,
         dataset=dataset,
@@ -1654,7 +1713,11 @@ def _write_hero_diagnostics(
     seed: int,
     metrics: dict[str, float],
 ) -> None:
-    path = Path(output_root) / "diagnostics" / dataset / model_name / f"seed_{seed}" / "hero_diagnostics.json"
+    experiment_tag = str(metrics.get("experiment_tag", ""))
+    if experiment_tag:
+        path = Path(output_root) / "diagnostics_llm_comparison" / dataset / experiment_tag / model_name / f"seed_{seed}" / "hero_diagnostics.json"
+    else:
+        path = Path(output_root) / "diagnostics" / dataset / model_name / f"seed_{seed}" / "hero_diagnostics.json"
     payload = {
         "avg_chain_gate": float(metrics.get("avg_chain_gate", 0.0)),
         "avg_chain_gate_pos": float(metrics.get("avg_chain_gate_pos", 0.0)),
@@ -1684,7 +1747,11 @@ def _write_variant_debug(
     seed: int,
     metrics: dict[str, Any],
 ) -> None:
-    path = Path(output_root) / "diagnostics" / dataset / model_name / f"seed_{seed}" / "variant_debug.json"
+    experiment_tag = str(metrics.get("experiment_tag", ""))
+    if experiment_tag:
+        path = Path(output_root) / "diagnostics_llm_comparison" / dataset / experiment_tag / model_name / f"seed_{seed}" / "variant_debug.json"
+    else:
+        path = Path(output_root) / "diagnostics" / dataset / model_name / f"seed_{seed}" / "variant_debug.json"
     payload = {
         "dataset": dataset,
         "model": model_name,
@@ -1702,6 +1769,11 @@ def _write_variant_debug(
         "num_chains_used": int(metrics.get("num_chains_used", 0)),
         "num_mechanism_labels_used": int(metrics.get("num_mechanism_labels_used", 0)),
         "external_llm_label_file": str(metrics.get("external_llm_label_file", "")),
+        "llm_label_file": str(metrics.get("llm_label_file", metrics.get("external_llm_label_file", ""))),
+        "experiment_tag": str(metrics.get("experiment_tag", "")),
+        "llm_labeler": str(metrics.get("llm_labeler", "mock")),
+        "llm_label_coverage_rate": float(metrics.get("llm_label_coverage_rate", 0.0)),
+        "llm_label_total_pairs": int(metrics.get("llm_label_total_pairs", 0)),
         "external_llm_labels_used": int(metrics.get("external_llm_labels_used", 0)),
         "mock_llm_labels_used": int(metrics.get("mock_llm_labels_used", 0)),
         "num_raw_chains": int(metrics.get("num_raw_chains", 0)),
@@ -2748,11 +2820,23 @@ def _valid_label_indices(indices: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return indices[labels[indices] >= 0]
 
 
-def _experiment_paths(output_root: str | Path, dataset: str, model_name: str, seed: int) -> dict[str, Path]:
+def _experiment_paths(
+    output_root: str | Path,
+    dataset: str,
+    model_name: str,
+    seed: int,
+    experiment_tag: str | None = None,
+) -> dict[str, Path]:
     output_root = Path(output_root)
-    result_dir = output_root / "results" / dataset / model_name / f"seed_{seed}"
-    checkpoint_dir = output_root / "checkpoints" / dataset / model_name / f"seed_{seed}"
-    log_dir = output_root / "logs" / dataset / model_name
+    if experiment_tag:
+        tag = str(experiment_tag)
+        result_dir = output_root / "results_llm_comparison" / dataset / tag / model_name / f"seed_{seed}"
+        checkpoint_dir = output_root / "checkpoints_llm_comparison" / dataset / tag / model_name / f"seed_{seed}"
+        log_dir = output_root / "logs_llm_comparison" / dataset / tag / model_name
+    else:
+        result_dir = output_root / "results" / dataset / model_name / f"seed_{seed}"
+        checkpoint_dir = output_root / "checkpoints" / dataset / model_name / f"seed_{seed}"
+        log_dir = output_root / "logs" / dataset / model_name
     result_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)

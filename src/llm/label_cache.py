@@ -9,14 +9,20 @@ class LabelCache:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.values: dict[str, dict[str, Any]] = {}
+        self.pair_values: dict[str, dict[str, Any]] = {}
         if self.path.exists():
             self._load()
 
     def get(self, key: str) -> dict[str, Any] | None:
         return self.values.get(key)
 
+    def get_pair(self, target_id: str, neighbor_id: str) -> dict[str, Any] | None:
+        return self.pair_values.get(pair_key(target_id, neighbor_id))
+
     def set(self, key: str, value: dict[str, Any]) -> None:
         self.values[key] = value
+        if "target_id" in value and "neighbor_id" in value:
+            self.pair_values[pair_key(value["target_id"], value["neighbor_id"])] = value
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,6 +53,9 @@ class LabelCache:
                 raw = json.loads(text)
                 if isinstance(raw, dict):
                     self.values = raw
+                    for value in raw.values():
+                        if isinstance(value, dict) and "target_id" in value and "neighbor_id" in value:
+                            self.pair_values[pair_key(value["target_id"], value["neighbor_id"])] = value
                     return
             except json.JSONDecodeError:
                 pass
@@ -54,7 +63,12 @@ class LabelCache:
             payload = json.loads(line)
             key = cache_key(payload["target_id"], payload["neighbor_id"], payload.get("metapath", ""))
             self.values[key] = payload
+            self.pair_values[pair_key(payload["target_id"], payload["neighbor_id"])] = payload
 
 
 def cache_key(target_id: str, neighbor_id: str, metapath: str) -> str:
     return f"{target_id}|{neighbor_id}|{metapath}"
+
+
+def pair_key(target_id: str, neighbor_id: str) -> str:
+    return f"{target_id}|{neighbor_id}"

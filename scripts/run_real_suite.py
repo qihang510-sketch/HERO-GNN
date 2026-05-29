@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_chain_pos", type=float, default=None, help="Positive-sample chain contribution loss weight.")
     parser.add_argument("--lambda_chain_neg", type=float, default=None, help="Negative-sample chain contribution loss weight.")
     parser.add_argument("--llm_label_file", default=None, help="Optional prebuilt LLM label JSONL file for HERO-style models.")
+    parser.add_argument("--experiment_tag", default=None, help="Optional tag for LLM labeler comparison outputs.")
     parser.add_argument("--enable_official_chain", action="store_true", help="Enable evidence-chain knobs for HERO-official variants.")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto", help="Training device.")
     return parser.parse_args()
@@ -85,6 +86,10 @@ def main() -> None:
     selected_models = args.methods if args.methods is not None else args.models
     if not selected_models:
         selected_models = OFFICIAL_DEFAULT_METHODS if official_mode else TEXT_RICH_DEFAULT_METHODS
+    experiment_tag = args.experiment_tag
+    if args.llm_label_file and not experiment_tag:
+        experiment_tag = _infer_experiment_tag(args.llm_label_file)
+    llm_labeler = _infer_llm_labeler(args.llm_label_file) if args.llm_label_file else "mock"
     max_candidates = _first_not_none(
         args.max_candidates_per_node,
         100 if official_mode else neighbor_cfg.get("max_candidates_per_node"),
@@ -123,6 +128,8 @@ def main() -> None:
                 lambda_chain_pos=float(lambda_chain_pos),
                 lambda_chain_neg=float(lambda_chain_neg),
                 llm_label_file=args.llm_label_file,
+                experiment_tag=experiment_tag if args.llm_label_file else None,
+                llm_labeler=llm_labeler,
                 enable_official_chain=bool(args.enable_official_chain),
                 device=args.device,
             )
@@ -146,6 +153,26 @@ def _is_official_dataset(dataset: str, data_dir: Path) -> bool:
         except json.JSONDecodeError:
             return False
     return dataset in {"fraud_yelp_official", "fraud_amazon_official"}
+
+
+def _infer_experiment_tag(label_file: str | Path) -> str:
+    stem = Path(label_file).stem
+    if stem.startswith("llm_labels_"):
+        stem = stem[len("llm_labels_") :]
+    return stem or "external_llm"
+
+
+def _infer_llm_labeler(label_file: str | Path | None) -> str:
+    if label_file is None:
+        return "mock"
+    stem = Path(label_file).stem.lower()
+    if "qwen" in stem:
+        return "local_qwen"
+    if "openai" in stem:
+        return "openai"
+    if "mock" in stem:
+        return "mock"
+    return "external"
 
 
 def _warn_if_variants_identical(metrics_by_model: dict) -> None:

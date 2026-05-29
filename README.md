@@ -133,17 +133,23 @@ python scripts/run_official_fraud_suite.py \
 3. Real LLM labeler comparison
 
 ```bash
+python scripts/build_risk_cards.py \
+  --dataset yelp_academic \
+  --max_cards 2000 \
+  --out_file data/processed/yelp_academic/risk_cards.jsonl
+
 python scripts/build_llm_labels.py \
   --dataset yelp_academic \
   --labeler mock \
-  --max_cards 2000 \
+  --risk_card_file data/processed/yelp_academic/risk_cards.jsonl \
   --out_file data/processed/yelp_academic/llm_labels_mock.jsonl
 
 python scripts/run_labeler_comparison.py \
   --dataset yelp_academic \
   --label_files \
     data/processed/yelp_academic/llm_labels_mock.jsonl \
-    data/processed/yelp_academic/llm_labels_openai.jsonl
+    data/processed/yelp_academic/llm_labels_qwen2p5_7b.jsonl \
+  --out_dir outputs/summary_llm
 ```
 
 4. Scalability experiments
@@ -254,60 +260,62 @@ Synthetic additionally includes `evidence_gt.json`.
 
 `edges.csv` contains `src,dst,edge_type,timestamp`.
 
-## Real LLM Labelers
+## Real LLM labeler study
 
-Full experiments use mock LLM labeler for reproducibility.
-A small-scale real LLM labeler comparison is provided to validate whether real LLM annotations align with the designed mechanism labels.
+Main experiments use mock LLM labeler for reproducibility and cost control.
+We provide a small-scale real LLM labeler study using Qwen2.5-7B-Instruct.
+The LLM is not used as a fraud classifier; it only annotates risk-relevant heterophilic mechanisms.
+HERO-GNN remains the final classification model.
 
-The default implementation uses `src/llm/mock_labeler.py`. Optional real labeler interfaces are provided:
+The default implementation uses `src/llm/mock_labeler.py`. Optional real labeler interfaces are provided in:
 
 ```text
-src/llm/openai_labeler.py
 src/llm/local_qwen_labeler.py
+src/llm/openai_labeler.py
 ```
 
-A real LLM labeler only needs to output the shared schema:
+All labelers write the same strict JSON schema:
 
 ```json
 {
+  "dataset": "yelp_academic",
   "target_id": "...",
   "neighbor_id": "...",
-  "mechanism": "...",
+  "mechanism": "coordinated_burst",
   "risk_relevance": 1,
   "confidence": 0.8,
   "rationale": "..."
 }
 ```
 
-The pipeline caches mechanism labels in:
+Build risk cards first:
 
-```text
-data/processed/{dataset}/llm_labels.jsonl
+```bash
+python scripts/build_risk_cards.py \
+  --dataset yelp_academic \
+  --max_cards 2000 \
+  --out_file data/processed/yelp_academic/risk_cards.jsonl
 ```
 
-Build small-sample label files from HERO risk cards:
+Build mock and Qwen labels:
 
 ```bash
 python scripts/build_llm_labels.py \
   --dataset yelp_academic \
   --labeler mock \
-  --max_cards 2000 \
+  --risk_card_file data/processed/yelp_academic/risk_cards.jsonl \
   --out_file data/processed/yelp_academic/llm_labels_mock.jsonl
 
 python scripts/build_llm_labels.py \
   --dataset yelp_academic \
-  --labeler openai \
-  --max_cards 500 \
-  --out_file data/processed/yelp_academic/llm_labels_openai.jsonl
-
-python scripts/build_llm_labels.py \
-  --dataset yelp_academic \
   --labeler local_qwen \
-  --max_cards 500 \
-  --out_file data/processed/yelp_academic/llm_labels_qwen.jsonl
+  --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+  --risk_card_file data/processed/yelp_academic/risk_cards.jsonl \
+  --out_file data/processed/yelp_academic/llm_labels_qwen2p5_7b.jsonl
 ```
 
-Real LLM labelers are optional. Set `OPENAI_API_KEY` for the OpenAI labeler, or pass a local model path with `--local_model_path` / `LOCAL_QWEN_MODEL_PATH` for the local Qwen labeler.
+You can also pass a local path, for example `--model_name_or_path /root/autodl-tmp/models/Qwen2.5-7B-Instruct`.
+The optional OpenAI labeler uses `OPENAI_API_KEY` and `--openai_model gpt-5.4-mini`.
 
 Compare label files:
 
@@ -316,7 +324,8 @@ python scripts/run_labeler_comparison.py \
   --dataset yelp_academic \
   --label_files \
     data/processed/yelp_academic/llm_labels_mock.jsonl \
-    data/processed/yelp_academic/llm_labels_openai.jsonl
+    data/processed/yelp_academic/llm_labels_qwen2p5_7b.jsonl \
+  --out_dir outputs/summary_llm
 ```
 
 Run HERO with a prebuilt small-sample label file:
@@ -325,7 +334,9 @@ Run HERO with a prebuilt small-sample label file:
 python scripts/run_real_suite.py \
   --dataset yelp_academic \
   --seeds 0 \
-  --llm_label_file data/processed/yelp_academic/llm_labels_openai.jsonl
+  --models hero_gnn \
+  --llm_label_file data/processed/yelp_academic/llm_labels_qwen2p5_7b.jsonl \
+  --experiment_tag qwen2p5_7b
 ```
 
 If `--llm_label_file` is omitted, HERO uses the reproducible mock LLM labeler. A small label file is read only for matching risk cards; missing cards fall back to mock labels and do not trigger real LLM calls.

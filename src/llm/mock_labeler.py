@@ -26,30 +26,50 @@ def label_risk_card_mechanism(card: dict[str, Any]) -> dict[str, Any]:
     confidence = 0.35
     rationale = "pair lacks the combined semantic, structural, and behavioral evidence required for risk relevance"
 
-    semantic_dissimilar = True if official_mode else float(card["semantic_similarity"]) <= 0.55
-    structurally_close = float(card["structural_score"]) >= 0.60
-    numeric_signal = float(card["numeric_deviation"]) >= 0.45 or float(card["rating_diff"]) >= 0.45
-    time_signal = bool(card["same_time_window"]) and float(card["time_deviation"]) >= 0.65
-    burst_signal = float(card["burst_score"]) >= 0.55
-    identity_signal = bool(card["same_user"]) and float(card["rating_diff"]) >= 0.45
-    counterparty_signal = bool(card["same_item_or_business"]) and (numeric_signal or burst_signal or time_signal)
+    semantic_dissimilar = True if official_mode else _as_float(card.get("semantic_similarity", 0.0)) <= 0.55
+    structurally_close = _as_float(card.get("structural_score", 0.0)) >= 0.60
+    numeric_deviation = _as_float(card.get("numeric_deviation", card.get("feature_distance", 0.0)))
+    rating_diff = _as_float(card.get("rating_diff", card.get("rating_deviation", 0.0)))
+    edge_type = str(card.get("edge_type", card.get("metapath", "")))
+    same_user = bool(card.get("same_user", edge_type in {"review-user-review", "net_rur"}))
+    same_item_or_business = bool(
+        card.get(
+            "same_item_or_business",
+            edge_type
+            in {
+                "review-item-review",
+                "review-business-review",
+                "review-product-review",
+                "review-rating-review",
+                "net_rsr",
+                "net_rtr",
+                "net_upu",
+            },
+        )
+    )
+    same_time_window = bool(card.get("same_time_window", _as_float(card.get("time_deviation", 0.0)) >= 0.65))
+    numeric_signal = numeric_deviation >= 0.45 or rating_diff >= 0.45
+    time_signal = same_time_window and _as_float(card.get("time_deviation", 0.0)) >= 0.65
+    burst_signal = _as_float(card.get("burst_score", 0.0)) >= 0.55
+    identity_signal = same_user and rating_diff >= 0.45
+    counterparty_signal = same_item_or_business and (numeric_signal or burst_signal or time_signal)
     has_behavior_signal = numeric_signal or time_signal or burst_signal or identity_signal or counterparty_signal
 
     risk_relevance = int(semantic_dissimilar and structurally_close and has_behavior_signal)
     if risk_relevance:
-        if bool(card["same_user"]) and numeric_signal:
+        if same_user and numeric_signal:
             mechanism = "behavioral_contradiction"
             confidence = 0.83
             rationale = "same user pair is semantically dissimilar, structurally close, and has rating or numeric contradiction"
-        elif bool(card["same_item_or_business"]) and burst_signal and time_signal:
+        elif same_item_or_business and burst_signal and time_signal:
             mechanism = "coordinated_burst"
             confidence = 0.81
             rationale = "same item/business pair combines semantic mismatch, short-time proximity, and burst behavior"
-        elif bool(card["same_user"]) and burst_signal:
+        elif same_user and burst_signal:
             mechanism = "identity_sharing"
             confidence = 0.77
             rationale = "shared identity context has semantic mismatch plus burst-like behavior"
-        elif bool(card["same_item_or_business"]) and numeric_signal:
+        elif same_item_or_business and numeric_signal:
             mechanism = "counterparty_risk"
             confidence = 0.75
             rationale = "same item/business neighborhood shows semantic mismatch with numeric or rating deviation"
@@ -63,9 +83,10 @@ def label_risk_card_mechanism(card: dict[str, Any]) -> dict[str, Any]:
             rationale = "heterophilous pair has structural support and at least one behavioral anomaly"
 
     return {
-        "target_id": card["target_id"],
-        "neighbor_id": card["neighbor_id"],
-        "metapath": card["metapath"],
+        "dataset": card.get("dataset", ""),
+        "target_id": card.get("target_id", ""),
+        "neighbor_id": card.get("neighbor_id", ""),
+        "metapath": card.get("metapath", card.get("edge_type", "")),
         "mechanism": mechanism,
         "risk_relevance": risk_relevance,
         "confidence": confidence,
@@ -74,3 +95,10 @@ def label_risk_card_mechanism(card: dict[str, Any]) -> dict[str, Any]:
         "labeler_mode": "HERO-official" if official_mode else "risk-card",
         "labeler_version": MOCK_LABELER_VERSION,
     }
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

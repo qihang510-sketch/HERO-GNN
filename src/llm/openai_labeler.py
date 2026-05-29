@@ -15,6 +15,8 @@ from src.llm.base_labeler import (
     parse_json_object,
 )
 
+OPENAI_KEY_MESSAGE = "OPENAI_API_KEY is not set. Real API labeler is optional."
+
 
 class OpenAIRiskLabeler(BaseRiskLabeler):
     name = "openai"
@@ -29,8 +31,8 @@ class OpenAIRiskLabeler(BaseRiskLabeler):
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
-            raise OptionalLabelerUnavailable(OPTIONAL_REAL_LLM_MESSAGE)
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            raise OptionalLabelerUnavailable(f"{OPENAI_KEY_MESSAGE} {OPTIONAL_REAL_LLM_MESSAGE}")
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
         self.base_url = (base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
         self.temperature = float(temperature)
         self.timeout = int(timeout)

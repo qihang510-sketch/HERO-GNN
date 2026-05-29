@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from src.llm.base_labeler import (
@@ -12,22 +11,33 @@ from src.llm.base_labeler import (
     parse_json_object,
 )
 
+DEFAULT_QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+QWEN_LOAD_ERROR = (
+    "Failed to load Qwen2.5-7B-Instruct. "
+    "Please check HuggingFace access or provide --model_name_or_path. "
+    f"{OPTIONAL_REAL_LLM_MESSAGE}"
+)
+
 
 class LocalQwenRiskLabeler(BaseRiskLabeler):
     name = "local_qwen"
 
-    def __init__(self, model_path: str | None = None, max_new_tokens: int = 256) -> None:
-        self.model_path = model_path or os.getenv("LOCAL_QWEN_MODEL_PATH")
-        if not self.model_path:
-            raise OptionalLabelerUnavailable(OPTIONAL_REAL_LLM_MESSAGE)
+    def __init__(self, model_name_or_path: str | None = None, model_path: str | None = None, max_new_tokens: int = 256) -> None:
+        self.model_name_or_path = model_name_or_path or model_path or DEFAULT_QWEN_MODEL
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as exc:
-            raise OptionalLabelerUnavailable(
-                "Real LLM labeler is optional. Please set OPENAI_API_KEY or provide local model path."
-            ) from exc
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_path, device_map="auto", trust_remote_code=True)
+            raise OptionalLabelerUnavailable(QWEN_LOAD_ERROR) from exc
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path, trust_remote_code=True)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name_or_path,
+                torch_dtype="auto",
+                device_map="auto",
+                trust_remote_code=True,
+            )
+        except Exception as exc:
+            raise OptionalLabelerUnavailable(QWEN_LOAD_ERROR) from exc
         self.max_new_tokens = int(max_new_tokens)
 
     def label_risk_card(self, risk_card: dict[str, Any]) -> dict[str, Any]:
@@ -37,7 +47,12 @@ class LocalQwenRiskLabeler(BaseRiskLabeler):
         device = getattr(self.model, "device", None)
         if device is not None:
             inputs = {key: value.to(device) for key, value in inputs.items()}
-        output = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        output = self.model.generate(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            temperature=0.0,
+            do_sample=False,
+        )
         generated = output[0][inputs["input_ids"].shape[1] :]
         text = self.tokenizer.decode(generated, skip_special_tokens=True)
         return normalize_label(parse_json_object(text), risk_card=risk_card)
