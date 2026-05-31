@@ -1,0 +1,23 @@
+﻿\begin{table}[t]
+\centering
+\small
+\caption{Ablation study of HERO-official on official benchmarks.}
+\label{tab:official_ablation}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Variant & Macro-F1 & AUROC & AUPRC & Hetero Gate \\
+\midrule
+FraudYelp & HERO-official & \textbf{0.6617$\pm$0.0005} & \textbf{0.7867$\pm$0.0010} & \textbf{0.4157$\pm$0.0014} & 0.8012$\pm$0.2664 \\
+FraudYelp & w/o Feature Deviation & 0.6440$\pm$0.0009 & 0.7682$\pm$0.0007 & 0.3764$\pm$0.0044 & 0.8286$\pm$0.2016 \\
+FraudYelp & w/o Hetero & 0.6578$\pm$0.0067 & 0.7844$\pm$0.0033 & 0.4119$\pm$0.0065 & 0.0000$\pm$0.0000 \\
+FraudYelp & w/o Relation & 0.6448$\pm$0.0009 & 0.7713$\pm$0.0025 & 0.3899$\pm$0.0043 & 0.8209$\pm$0.2444 \\
+\midrule
+FraudAmazon & HERO-official & 0.9248$\pm$0.0043 & 0.9231$\pm$0.0181 & 0.8712$\pm$0.0119 & 0.2132$\pm$0.0712 \\
+FraudAmazon & w/o Feature Deviation & \textbf{0.9259$\pm$0.0063} & 0.9211$\pm$0.0245 & 0.8666$\pm$0.0220 & 0.1903$\pm$0.0759 \\
+FraudAmazon & w/o Hetero & 0.9157$\pm$0.0041 & \textbf{0.9235$\pm$0.0262} & 0.8677$\pm$0.0155 & 0.0000$\pm$0.0000 \\
+FraudAmazon & w/o Relation & 0.9218$\pm$0.0026 & 0.9232$\pm$0.0181 & \textbf{0.8713$\pm$0.0121} & 0.2140$\pm$0.0705 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

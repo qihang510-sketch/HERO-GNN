@@ -1,0 +1,30 @@
+% Auto-converted from outputs/paper_tables/table_main_proxy.csv.
+\begin{table*}[t]
+\centering
+\small
+\caption{Text-rich proxy-label benchmark.}
+\label{tab:main_proxy}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Method & Macro-F1 & AUROC & AUPRC & Evidence Recall \\
+\midrule
+\multirow{5}{*}{amazon\_video}
+& \texttt{graphsage} & $0.4874{\pm}0.0000$ & $0.5059{\pm}0.0000$ & $0.1182{\pm}0.0000$ & $0.0000{\pm}0.0000$ \\
+& \texttt{hero\_gnn} & $0.4819{\pm}0.0000$ & $0.4550{\pm}0.0000$ & $0.1091{\pm}0.0000$ & $\mathbf{0.9881{\pm}0.0000}$ \\
+& \texttt{mlp} & $\mathbf{0.5139{\pm}0.0000}$ & $0.4691{\pm}0.0000$ & $0.1244{\pm}0.0000$ & $0.0000{\pm}0.0000$ \\
+& \texttt{rulehetero\_gnn} & $0.5106{\pm}0.0000$ & $\mathbf{0.5350{\pm}0.0000}$ & $\mathbf{0.1439{\pm}0.0000}$ & $0.0000{\pm}0.0000$ \\
+& \texttt{semsim\_gnn} & $0.4938{\pm}0.0000$ & $0.4605{\pm}0.0000$ & $0.1124{\pm}0.0000$ & $0.0000{\pm}0.0000$ \\
+\midrule
+\multirow{5}{*}{yelp\_academic}
+& \texttt{graphsage} & $0.5020{\pm}0.0000$ & $0.5055{\pm}0.0000$ & $0.1237{\pm}0.0000$ & $0.0000{\pm}0.0000$ \\
+& \texttt{hero\_gnn} & $0.5023{\pm}0.0000$ & $0.4950{\pm}0.0000$ & $\mathbf{0.1292{\pm}0.0000}$ & $\mathbf{0.7830{\pm}0.0000}$ \\
+& \texttt{mlp} & $0.5023{\pm}0.0000$ & $\mathbf{0.5164{\pm}0.0000}$ & $0.1225{\pm}0.0000$ & $0.0000{\pm}0.0000$ \\
+& \texttt{rulehetero\_gnn} & $0.5043{\pm}0.0000$ & $0.4934{\pm}0.0000$ & $0.1218{\pm}0.0000$ & $0.0000{\pm}0.0000$ \\
+& \texttt{semsim\_gnn} & $\mathbf{0.5125{\pm}0.0000}$ & $0.5092{\pm}0.0000$ & $0.1272{\pm}0.0000$ & $0.0000{\pm}0.0000$ \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{2pt}
+\footnotesize Source: \texttt{outputs/paper\_tables/table\_main\_proxy.csv}. Bold values are selected from the corresponding mean columns before mean$\pm$std formatting.
+\end{table*}

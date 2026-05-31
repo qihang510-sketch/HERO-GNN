@@ -1,0 +1,15 @@
+﻿\begin{table*}[t]
+\centering
+\small
+\caption{Representative cases from the high-coverage real LLM subset study.}
+\label{tab:case_study}
+\begin{tabular}{p{0.05\textwidth}p{0.18\textwidth}p{0.12\textwidth}p{0.07\textwidth}p{0.26\textwidth}p{0.25\textwidth}}
+\toprule
+Case & Mechanism & Decision & Conf. & Evidence Pattern & Interpretation \\
+\midrule
+C1 & behavioral\_contradiction & risk-relevant & 0.85 & Positive brunch experience vs negative brunch experience in a similar context & Risk-relevant heterophily may arise from contradictory behavioral evidence rather than direct semantic similarity. \\
+C2 & counterparty\_risk & risk-relevant & 0.85 & Target and neighbor are connected through the same business context & Shared counterparty or business-level context can provide risk evidence beyond text-level similarity. \\
+C3 & irrelevant\_heterophily & irrelevant & 0.85 & Ramen restaurant review vs flea market review despite strong review-user-review structural connection & LLM-guided annotation filters noisy heterophilic neighbors that are structurally connected but not risk-relevant. \\
+\bottomrule
+\end{tabular}
+\end{table*}

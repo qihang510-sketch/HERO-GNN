@@ -1,0 +1,70 @@
+\documentclass[letterpaper]{article}
+
+% AAAI style loader. The official Overleaf template supplies one of these
+% style files; the fallback keeps the skeleton compilable during local edits.
+\IfFileExists{aaai2027.sty}{\usepackage{aaai2027}}{%
+\IfFileExists{aaai27.sty}{\usepackage{aaai27}}{%
+\IfFileExists{aaai2026.sty}{\usepackage{aaai2026}}{%
+\IfFileExists{aaai26.sty}{\usepackage{aaai26}}{%
+\IfFileExists{aaai2025.sty}{\usepackage{aaai2025}}{%
+\IfFileExists{aaai25.sty}{\usepackage{aaai25}}{%
+\IfFileExists{aaai2024.sty}{\usepackage{aaai2024}}{%
+\IfFileExists{aaai24.sty}{\usepackage{aaai24}}{%
+\IfFileExists{aaai.sty}{\usepackage{aaai}}{}}}}}}}}}
+
+\usepackage[utf8]{inputenc}
+\usepackage{times}
+\usepackage{helvet}
+\usepackage{courier}
+\usepackage[hyphens]{url}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xspace}
+
+\urlstyle{rm}
+\def\UrlFont{\rm}
+\frenchspacing
+\setlength{\pdfpagewidth}{8.5in}
+\setlength{\pdfpageheight}{11in}
+
+\providecommand{\affiliations}[1]{\date{#1}}
+\newcommand{\method}{HERO-GNN\xspace}
+\newcommand{\figureplaceholder}[2]{%
+  \IfFileExists{#1}{%
+    \includegraphics[width=\linewidth]{#1}%
+  }{%
+    \fbox{%
+      \begin{minipage}[c][1.35in][c]{0.92\linewidth}
+        \centering
+        #2\\[2pt]
+        \texttt{#1}
+      \end{minipage}%
+    }%
+  }%
+}
+
+\title{HERO-GNN: Heterophily-aware Evidence Reasoning over Fraud Graphs}
+\author{Anonymous Authors}
+\affiliations{Paper under double-blind review}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\input{sections/abstract}
+\end{abstract}
+
+\input{sections/introduction}
+\input{sections/related_work}
+\input{sections/method}
+\input{sections/experiments}
+\input{sections/discussion}
+\input{sections/conclusion}
+
+\bibliography{references}
+
+\end{document}
