@@ -2,3 +2,11 @@ name: hero_gnn
 display_name: HERO-GNN
 implementation_source: project
 forbidden_lite_name: false
+use_risk_relevant_heterophily: true
+use_mechanism_annotation: true
+use_evidence_chain: true
+use_llm_annotation: true
+use_heterophily_filter: true
+use_dual_branch_encoder: true
+use_gated_fusion: true
+fusion_type: gated

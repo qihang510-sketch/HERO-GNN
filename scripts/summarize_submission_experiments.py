@@ -125,6 +125,7 @@ def _ablation_table(ablation_dir: Path, min_seeds: int, warnings: list[str]) -> 
             skip_subset = skip_frame[(skip_frame.get("dataset", pd.Series(dtype=str)) == dataset) & (skip_frame.get("model", pd.Series(dtype=str)) == variant)] if not skip_frame.empty else pd.DataFrame()
             row = {
                 "dataset": dataset,
+                "variant": variant,
                 "model": variant,
                 "ablation": _ablation_display_name(variant),
                 "seed_count": int(subset["seed"].nunique()) if "seed" in subset else 0,

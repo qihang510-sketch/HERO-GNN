@@ -96,21 +96,35 @@ def _figure4(tables_dir: Path, output_dir: Path, skipped: list[str]) -> None:
     if table.empty or metric_col is None:
         skipped.append("fig_ablation_drop_bar: missing ablation table.")
         return
-    hero = table[table["model"].astype(str).isin(["hero_gnn", "HERO-GNN"])]
+    model_col = "variant" if "variant" in table else "model"
+    label_col = "ablation" if "ablation" in table else model_col
+    hero = table[table[model_col].astype(str).isin(["hero_gnn", "HERO-GNN"])]
     if hero.empty:
         skipped.append("fig_ablation_drop_bar: missing HERO-GNN reference.")
         return
-    ref = pd.to_numeric(hero.iloc[0].get(metric_col), errors="coerce")
-    if pd.isna(ref):
-        skipped.append("fig_ablation_drop_bar: HERO-GNN AUPRC is NA.")
-        return
-    values = float(ref) - pd.to_numeric(table[metric_col], errors="coerce")
-    if values.dropna().empty:
+    rows = []
+    for dataset, group in table.groupby("dataset"):
+        hero_row = group[group[model_col].astype(str).isin(["hero_gnn", "HERO-GNN"])]
+        if hero_row.empty:
+            continue
+        ref = pd.to_numeric(hero_row.iloc[0].get(metric_col), errors="coerce")
+        if pd.isna(ref):
+            continue
+        for _, row in group.iterrows():
+            variant = str(row.get(model_col, ""))
+            if variant in {"hero_gnn", "HERO-GNN"}:
+                continue
+            value = pd.to_numeric(row.get(metric_col), errors="coerce")
+            if pd.isna(value):
+                continue
+            rows.append({"label": str(row.get(label_col, variant)), "drop": float(ref) - float(value)})
+    drop_table = pd.DataFrame(rows)
+    if drop_table.empty:
         skipped.append("fig_ablation_drop_bar: ablation metrics are all NA.")
         return
+    drop_table = drop_table.groupby("label", as_index=False)["drop"].mean()
     fig, ax = plt.subplots(figsize=(7, 3.4))
-    labels = table["ablation"].astype(str) if "ablation" in table else table["model"].astype(str)
-    ax.bar(labels, values)
+    ax.bar(drop_table["label"], drop_table["drop"])
     ax.set_ylabel("AUPRC drop")
     ax.tick_params(axis="x", rotation=25)
     _save(fig, output_dir, "fig_ablation_drop_bar")

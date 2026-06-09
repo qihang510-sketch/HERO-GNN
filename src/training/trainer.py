@@ -58,61 +58,80 @@ HERO_OFFICIAL_MODEL_NAMES = (
 )
 MODEL_NAMES = (*BASELINE_MODEL_NAMES, *HERO_MODEL_NAMES, *HERO_OFFICIAL_MODEL_NAMES)
 LITE_MODEL_NAMES = ("sec_gfd_lite", "dga_gnn_lite", "flag_lite")
+HERO_CONFIG_KEYS = (
+    "use_risk_relevant_heterophily",
+    "use_mechanism_annotation",
+    "use_evidence_chain",
+    "use_llm_annotation",
+    "use_heterophily_filter",
+    "use_dual_branch_encoder",
+    "use_gated_fusion",
+    "fusion_type",
+)
+DEFAULT_HERO_CONFIG: dict[str, Any] = {
+    "use_risk_relevant_heterophily": True,
+    "use_mechanism_annotation": True,
+    "use_evidence_chain": True,
+    "use_llm_annotation": True,
+    "use_heterophily_filter": True,
+    "use_dual_branch_encoder": True,
+    "use_gated_fusion": True,
+    "fusion_type": "gated",
+}
 
 
-def _hero_variant_flags(model_name: str) -> dict[str, bool]:
-    if model_name == "hero_gnn":
-        return {
-            "use_hetero": True,
-            "use_chain": True,
-            "use_mechanism": True,
-            "use_chain_encoder": True,
-            "use_mock_llm_mechanism": True,
-        }
+def _resolve_hero_config(model_name: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = dict(DEFAULT_HERO_CONFIG)
     if model_name == "hero_wo_chain":
-        return {
-            "use_hetero": True,
-            "use_chain": False,
-            "use_mechanism": True,
-            "use_chain_encoder": False,
-            "use_mock_llm_mechanism": True,
-        }
-    if model_name == "hero_wo_hetero":
-        return {
-            "use_hetero": False,
-            "use_chain": False,
-            "use_mechanism": False,
-            "use_chain_encoder": False,
-            "use_mock_llm_mechanism": False,
-        }
-    if model_name == "hero_wo_mechanism":
-        return {
-            "use_hetero": True,
-            "use_chain": True,
-            "use_mechanism": False,
-            "use_chain_encoder": True,
-            "use_mock_llm_mechanism": False,
-        }
+        config.update({"use_evidence_chain": False})
+    elif model_name == "hero_wo_hetero":
+        config.update(
+            {
+                "use_risk_relevant_heterophily": False,
+                "use_mechanism_annotation": False,
+                "use_evidence_chain": False,
+                "use_llm_annotation": False,
+            }
+        )
+    elif model_name == "hero_wo_mechanism":
+        config.update({"use_mechanism_annotation": False, "use_llm_annotation": False})
+    if overrides:
+        for key, value in overrides.items():
+            if key in HERO_CONFIG_KEYS:
+                config[key] = value
+    if not bool(config["use_risk_relevant_heterophily"]):
+        config["use_mechanism_annotation"] = False
+        config["use_evidence_chain"] = False
+        config["use_llm_annotation"] = False
+    if not bool(config["use_mechanism_annotation"]):
+        config["use_llm_annotation"] = False
+    if not bool(config["use_gated_fusion"]) and str(config.get("fusion_type", "gated")) == "gated":
+        config["fusion_type"] = "concat_linear"
+    config["fusion_type"] = str(config.get("fusion_type", "gated"))
+    config["llm_annotation_enabled"] = bool(config["use_llm_annotation"])
+    return config
+
+
+def _hero_variant_flags(model_name: str, hero_config: dict[str, Any] | None = None) -> dict[str, bool]:
+    config = _resolve_hero_config(model_name, hero_config)
     return {
-        "use_hetero": False,
-        "use_chain": False,
-        "use_mechanism": False,
-        "use_chain_encoder": False,
-        "use_mock_llm_mechanism": False,
+        "use_hetero": bool(config["use_risk_relevant_heterophily"]),
+        "use_chain": bool(config["use_evidence_chain"]),
+        "use_mechanism": bool(config["use_mechanism_annotation"]),
+        "use_chain_encoder": bool(config["use_evidence_chain"]),
+        "use_mock_llm_mechanism": bool(config["use_llm_annotation"] and config["use_mechanism_annotation"]),
     }
 
 
-def _hero_branch_masks(model_name: str) -> dict[str, int]:
-    if model_name == "hero_gnn":
-        values = (1, 1, 1, 1, 1)
-    elif model_name == "hero_wo_chain":
-        values = (1, 1, 1, 1, 0)
-    elif model_name == "hero_wo_hetero":
-        values = (1, 1, 0, 0, 0)
-    elif model_name == "hero_wo_mechanism":
-        values = (1, 1, 1, 0, 1)
-    else:
-        values = (0, 0, 0, 0, 0)
+def _hero_branch_masks(model_name: str, hero_config: dict[str, Any] | None = None) -> dict[str, int]:
+    config = _resolve_hero_config(model_name, hero_config)
+    values = (
+        1,
+        1 if bool(config["use_dual_branch_encoder"]) else 0,
+        1 if bool(config["use_risk_relevant_heterophily"]) else 0,
+        1 if bool(config["use_mechanism_annotation"]) else 0,
+        1 if bool(config["use_evidence_chain"]) else 0,
+    )
     return {
         "branch_mask_target": values[0],
         "branch_mask_homo": values[1],
@@ -229,6 +248,7 @@ def train_single_experiment(
     disable_llm_fallback: bool = False,
     enable_official_chain: bool = False,
     device: str | None = "auto",
+    hero_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if model_name not in MODEL_NAMES:
         raise ValueError(f"Unknown model_name={model_name}. Expected one of {MODEL_NAMES}.")
@@ -271,8 +291,25 @@ def train_single_experiment(
     pos_weight = _pos_weight_from_counts(class_stats["train_num_pos"], class_stats["train_num_neg"])
     print(f"[TRAIN-INFO] dataset={dataset} model={model_name} seed={seed}")
     print(f"[TRAIN-INFO] train_pos={class_stats['train_num_pos']} train_neg={class_stats['train_num_neg']} pos_weight={pos_weight:.6f}")
-    variant_flags = _hero_variant_flags(model_name)
-    branch_masks = _hero_branch_masks(model_name)
+    resolved_hero_config = _resolve_hero_config(model_name, hero_config) if model_name in HERO_MODEL_NAMES else {}
+    if model_name in HERO_MODEL_NAMES:
+        variant_flags = _hero_variant_flags(model_name, resolved_hero_config)
+        branch_masks = _hero_branch_masks(model_name, resolved_hero_config)
+    else:
+        variant_flags = {
+            "use_hetero": False,
+            "use_chain": False,
+            "use_mechanism": False,
+            "use_chain_encoder": False,
+            "use_mock_llm_mechanism": False,
+        }
+        branch_masks = {
+            "branch_mask_target": 0,
+            "branch_mask_homo": 0,
+            "branch_mask_hetero": 0,
+            "branch_mask_mechanism": 0,
+            "branch_mask_chain": 0,
+        }
     if official_mode and model_name in HERO_MODEL_NAMES:
         raise ValueError(f"{model_name} is a text-rich HERO model. Use hero_official variants for official fraud datasets.")
     if not official_mode and model_name in HERO_OFFICIAL_MODEL_NAMES:
@@ -283,7 +320,8 @@ def train_single_experiment(
             f"[VARIANT] model={model_name} "
             f"use_hetero={variant_flags['use_hetero']} "
             f"use_chain={variant_flags['use_chain']} "
-            f"use_mechanism={variant_flags['use_mechanism']}"
+            f"use_mechanism={variant_flags['use_mechanism']} "
+            f"fusion_type={resolved_hero_config.get('fusion_type', 'gated')}"
         )
         print(variant_message)
         logger.info(variant_message)
@@ -312,6 +350,7 @@ def train_single_experiment(
             llm_labeler=llm_labeler,
             coverage_target_indices=eval_target_indices,
             disable_llm_fallback=disable_llm_fallback,
+            hero_config=resolved_hero_config,
         )
         stage_times.update(hero_artifacts.get("time", {}))
         print(f"[TRAIN] {model_name}")
@@ -333,6 +372,9 @@ def train_single_experiment(
             use_hetero=bool(hero_artifacts.get("use_hetero", False)),
             use_mechanism=bool(hero_artifacts.get("use_mechanism", False)),
             use_chain=bool(hero_artifacts.get("use_chain", False)),
+            use_dual_branch_encoder=bool(resolved_hero_config.get("use_dual_branch_encoder", True)),
+            use_gated_fusion=bool(resolved_hero_config.get("use_gated_fusion", True)),
+            fusion_type=str(resolved_hero_config.get("fusion_type", "gated")),
             lambda_chain_pos=float(lambda_chain_pos),
             lambda_chain_neg=float(lambda_chain_neg),
             min_chain_quality=float(min_chain_quality),
@@ -426,6 +468,8 @@ def train_single_experiment(
     metrics["cuda_available"] = bool(cuda_available)
     metrics.update(_model_metadata(model_name))
     metrics.update({key: bool(value) for key, value in variant_flags.items()})
+    if resolved_hero_config:
+        metrics.update({key: value for key, value in resolved_hero_config.items() if key in HERO_CONFIG_KEYS or key == "llm_annotation_enabled"})
     metrics.update(branch_masks)
     metrics.update(
         split_label_stats(
@@ -582,6 +626,7 @@ def _prepare_hero_features(
     llm_labeler: str | None = None,
     coverage_target_indices: np.ndarray | None = None,
     disable_llm_fallback: bool = False,
+    hero_config: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     print(f"[START] {model_name}")
     timings = {
@@ -591,11 +636,13 @@ def _prepare_hero_features(
         "time_training_sec": 0.0,
     }
     target_indices = _limit_target_indices(target_indices, max_target_nodes)
-    variant_flags = _hero_variant_flags(model_name)
+    resolved_config = _resolve_hero_config(model_name, hero_config)
+    variant_flags = _hero_variant_flags(model_name, resolved_config)
     use_hetero = bool(variant_flags["use_hetero"])
     use_chain = bool(variant_flags["use_chain"])
     use_mechanism = bool(variant_flags["use_mechanism"])
     use_mock_llm_mechanism = bool(variant_flags["use_mock_llm_mechanism"])
+    use_heterophily_filter = bool(resolved_config["use_heterophily_filter"])
     homo_edges = filter_topk_semantic_edges(graph.edge_index, graph.text_features, top_k=homophilic_topk)
     homo_agg = _neighbor_mean_features(graph.features, homo_edges)
     feature_dims = {
@@ -610,7 +657,8 @@ def _prepare_hero_features(
     zero_chain = np.zeros((graph.features.shape[0], graph.features.shape[1] + len(schema.EVIDENCE_MECHANISMS) + 2), dtype=np.float32)
     base_debug = {
         **variant_flags,
-        **_hero_branch_masks(model_name),
+        **_hero_branch_masks(model_name, resolved_config),
+        **{key: value for key, value in resolved_config.items() if key in HERO_CONFIG_KEYS or key == "llm_annotation_enabled"},
         "num_homophilic_neighbors_used": int(homo_edges.shape[1]) if homo_edges.size else 0,
         "num_heterophilic_neighbors_used": 0,
         "num_chains_used": 0,
@@ -654,7 +702,8 @@ def _prepare_hero_features(
         max_target_nodes=max_target_nodes,
         max_candidates_per_node=max_candidates_per_node,
     )
-    candidates_by_target = _trim_candidates(candidates_by_target, heterophilic_topk)
+    if use_heterophily_filter:
+        candidates_by_target = _trim_candidates(candidates_by_target, heterophilic_topk)
     timings["time_retrieval_sec"] = time.perf_counter() - retrieval_start
 
     if use_mock_llm_mechanism and llm_label_file is not None:
@@ -679,6 +728,7 @@ def _prepare_hero_features(
         graph=graph,
         labels_by_target=labels_by_target,
         use_mechanism=use_mechanism,
+        use_heterophily_filter=use_heterophily_filter,
     )
     usage_debug = {
         **base_debug,
@@ -711,9 +761,18 @@ def _prepare_hero_features(
         max_chain_length=max_chain_length,
         use_cache=use_mock_llm_mechanism,
     )
-    chains_by_idx = _filter_chains_by_quality(raw_chains_by_idx, min_chain_quality=min_chain_quality, topk_chains=topk_chains)
+    chains_by_idx = (
+        _filter_chains_by_quality(raw_chains_by_idx, min_chain_quality=min_chain_quality, topk_chains=topk_chains)
+        if use_heterophily_filter
+        else _take_unfiltered_chains(raw_chains_by_idx, topk_chains=topk_chains)
+    )
     timings["time_evidence_chain_sec"] = time.perf_counter() - chain_start
-    chain_features = _chain_feature_matrix(graph, chains_by_idx, use_mechanism=use_mechanism)
+    chain_features = _chain_feature_matrix(
+        graph,
+        chains_by_idx,
+        use_mechanism=use_mechanism,
+        use_heterophily_filter=use_heterophily_filter,
+    )
     features = np.concatenate([graph.features, homo_agg, hetero_features, mechanism_features, chain_features], axis=1).astype(np.float32)
     features_without_chains = np.concatenate([graph.features, homo_agg, hetero_features, mechanism_features, zero_chain], axis=1).astype(np.float32)
     raw_count = int(sum(len(chains) for chains in raw_chains_by_idx.values()))
@@ -1003,6 +1062,14 @@ def _filter_chains_by_quality(
     return filtered
 
 
+def _take_unfiltered_chains(chains_by_idx: dict[int, list[dict[str, Any]]], topk_chains: int) -> dict[int, list[dict[str, Any]]]:
+    limit = max(int(topk_chains), 0)
+    return {
+        int(target_idx): [_with_chain_quality(dict(chain)) for chain in chains[:limit]] if limit > 0 else []
+        for target_idx, chains in chains_by_idx.items()
+    }
+
+
 def _with_chain_quality(chain: dict[str, Any]) -> dict[str, Any]:
     chain["confidence"] = _bounded_float(chain.get("confidence", 0.0))
     chain["risk_relevance"] = int(chain.get("risk_relevance", 0))
@@ -1212,6 +1279,7 @@ def _chain_feature_matrix(
     graph: ProcessedGraphData,
     chains_by_idx: dict[int, list[dict[str, Any]]],
     use_mechanism: bool,
+    use_heterophily_filter: bool = True,
 ) -> np.ndarray:
     dim = graph.features.shape[1]
     out_dim = dim + len(schema.EVIDENCE_MECHANISMS) + 2
@@ -1235,7 +1303,7 @@ def _chain_feature_matrix(
             score = np.array([float(chain.get("chain_score", 0.0))], dtype=np.float32)
             quality = np.array([float(chain.get("chain_quality", 0.0))], dtype=np.float32)
             reps.append(np.concatenate([node_repr, mechanism, score, quality]))
-            weights.append(max(float(chain.get("chain_quality", 0.0)), 1e-3))
+            weights.append(max(float(chain.get("chain_quality", 0.0)), 1e-3) if use_heterophily_filter else 1.0)
         weight_array = np.asarray(weights, dtype=np.float32)
         weight_array = weight_array / np.maximum(float(np.sum(weight_array)), 1e-6)
         features[target_idx] = np.sum(np.asarray(reps, dtype=np.float32) * weight_array[:, None], axis=0)
@@ -1246,6 +1314,7 @@ def _hetero_feature_matrix(
     graph: ProcessedGraphData,
     labels_by_target: dict[int, list[dict[str, Any]]],
     use_mechanism: bool,
+    use_heterophily_filter: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     hetero = np.zeros_like(graph.features, dtype=np.float32)
     mechanisms = np.zeros((graph.features.shape[0], len(schema.EVIDENCE_MECHANISMS)), dtype=np.float32)
@@ -1262,7 +1331,7 @@ def _hetero_feature_matrix(
             if neighbor_idx is None or not (0 <= int(neighbor_idx) < graph.features.shape[0]):
                 continue
             score = float(label.get("risk_score", label.get("confidence", 0.0)))
-            weight = max(score, 1e-3)
+            weight = max(score, 1e-3) if use_heterophily_filter else 1.0
             node_reps.append(graph.features[int(neighbor_idx)])
             weights.append(weight)
             if use_mechanism:
@@ -2252,10 +2321,13 @@ def _fit_torch_feature_model(
     use_hetero: bool,
     use_mechanism: bool,
     use_chain: bool,
-    lambda_chain_pos: float,
-    lambda_chain_neg: float,
-    min_chain_quality: float,
-    device: str,
+    use_dual_branch_encoder: bool = True,
+    use_gated_fusion: bool = True,
+    fusion_type: str = "gated",
+    lambda_chain_pos: float = 0.0,
+    lambda_chain_neg: float = 0.0,
+    min_chain_quality: float = 0.45,
+    device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     if torch is None:
         return _fit_numpy_feature_model(
@@ -2273,6 +2345,9 @@ def _fit_torch_feature_model(
             use_hetero=use_hetero,
             use_mechanism=use_mechanism,
             use_chain=use_chain,
+            use_dual_branch_encoder=use_dual_branch_encoder,
+            use_gated_fusion=use_gated_fusion,
+            fusion_type=fusion_type,
             lambda_chain_pos=lambda_chain_pos if model_name == "hero_gnn" else 0.0,
             lambda_chain_neg=lambda_chain_neg if model_name == "hero_gnn" else 0.0,
             min_chain_quality=min_chain_quality,
@@ -2296,6 +2371,9 @@ def _fit_torch_feature_model(
         use_heterophily=use_hetero,
         use_mechanism=use_mechanism,
         use_chain=use_chain,
+        use_dual_branch_encoder=use_dual_branch_encoder,
+        use_gated_fusion=use_gated_fusion,
+        fusion_type=fusion_type,
         hetero_input_dim=int(feature_dims["hetero_dim"]),
         mechanism_input_dim=int(feature_dims["mechanism_dim"]),
         chain_input_dim=int(feature_dims["chain_dim"]),
@@ -2375,6 +2453,9 @@ def _fit_torch_feature_model(
             "lambda_chain_neg": float(active_lambda_neg),
             "chain_pos_loss": float(last_chain_pos_loss),
             "chain_neg_loss": float(last_chain_neg_loss),
+            "use_dual_branch_encoder": bool(use_dual_branch_encoder),
+            "use_gated_fusion": bool(use_gated_fusion),
+            "fusion_type": str(fusion_type),
         }
     )
     return val_scores, test_scores, scores_without_chains, {
@@ -2400,6 +2481,9 @@ def _fit_numpy_feature_model(
     use_hetero: bool = False,
     use_mechanism: bool = False,
     use_chain: bool = False,
+    use_dual_branch_encoder: bool = True,
+    use_gated_fusion: bool = True,
+    fusion_type: str = "gated",
     lambda_chain_pos: float = 0.0,
     lambda_chain_neg: float = 0.0,
     min_chain_quality: float = 0.45,
@@ -2415,6 +2499,9 @@ def _fit_numpy_feature_model(
             use_hetero=use_hetero,
             use_mechanism=use_mechanism,
             use_chain=use_chain,
+            use_dual_branch_encoder=use_dual_branch_encoder,
+            use_gated_fusion=use_gated_fusion,
+            fusion_type=fusion_type,
         )
     else:
         x = np.asarray(features, dtype=np.float32)
@@ -2513,6 +2600,9 @@ def _fit_numpy_feature_model(
             "lambda_chain_neg": float(active_lambda_neg),
             "chain_pos_loss": float(chain_pos_loss),
             "chain_neg_loss": float(chain_neg_loss),
+            "use_dual_branch_encoder": bool(use_dual_branch_encoder),
+            "use_gated_fusion": bool(use_gated_fusion),
+            "fusion_type": str(fusion_type),
         }
     )
     return (
@@ -2536,17 +2626,25 @@ def _numpy_hero_fused_features(
     use_hetero: bool,
     use_mechanism: bool,
     use_chain: bool,
+    use_dual_branch_encoder: bool = True,
+    use_gated_fusion: bool = True,
+    fusion_type: str = "gated",
 ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     target, homo, hetero, mechanism, chain = _split_hero_features_np(features, feature_dims)
     target_without, homo_without, hetero_without, mechanism_without, _chain_without = _split_hero_features_np(features_without_chains, feature_dims)
     target_gate = np.ones((features.shape[0], 1), dtype=np.float32)
-    homo_gate = np.ones((features.shape[0], 1), dtype=np.float32)
+    homo_gate = np.ones((features.shape[0], 1), dtype=np.float32) if use_dual_branch_encoder else np.zeros((features.shape[0], 1), dtype=np.float32)
     hetero_gate = np.ones((features.shape[0], 1), dtype=np.float32) if use_hetero else np.zeros((features.shape[0], 1), dtype=np.float32)
     mechanism_gate = np.ones((features.shape[0], 1), dtype=np.float32) if use_mechanism else np.zeros((features.shape[0], 1), dtype=np.float32)
-    chain_gate = _chain_gate_np(chain) if use_chain else np.zeros((features.shape[0], 1), dtype=np.float32)
+    chain_gate = _chain_gate_np(chain) if use_chain and use_gated_fusion and fusion_type == "gated" else (np.ones((features.shape[0], 1), dtype=np.float32) if use_chain else np.zeros((features.shape[0], 1), dtype=np.float32))
     gated_hetero = hetero * hetero_gate
     gated_mechanism = mechanism * mechanism_gate
     gated_chain = chain * chain_gate
+    if not use_dual_branch_encoder:
+        target = 0.5 * (target + homo)
+        target_without = 0.5 * (target_without + homo_without)
+        homo = np.zeros_like(homo)
+        homo_without = np.zeros_like(homo_without)
     zero_hetero = np.zeros_like(gated_hetero, dtype=np.float32)
     zero_mechanism = np.zeros_like(gated_mechanism, dtype=np.float32)
     zero_chain = np.zeros_like(gated_chain, dtype=np.float32)

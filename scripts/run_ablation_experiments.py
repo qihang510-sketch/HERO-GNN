@@ -5,6 +5,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.training.submission import (  # noqa: E402
     TEXT_RICH_DATASETS,
@@ -13,19 +15,51 @@ from src.training.submission import (  # noqa: E402
     resolve_processed_dir,
     write_skip,
 )
-from src.training.trainer import train_single_experiment  # noqa: E402
+from src.training.trainer import _resolve_hero_config, train_single_experiment  # noqa: E402
 from src.utils.io import write_json  # noqa: E402
 
 
 ABLATION_VARIANTS = {
-    "hero_gnn": {"trainer_model": "hero_gnn", "name": "HERO-GNN"},
-    "wo_risk_relevant_heterophily": {"trainer_model": "hero_wo_hetero", "name": "w/o Risk-relevant Heterophily"},
-    "wo_mechanism_annotation": {"trainer_model": "hero_wo_mechanism", "name": "w/o Mechanism Annotation"},
-    "wo_evidence_chain": {"trainer_model": "hero_wo_chain", "name": "w/o Evidence Chain"},
-    "wo_llm_annotation": {"skip_reason": "separate no-LLM ablation switch is not implemented yet"},
-    "wo_heterophily_filter": {"skip_reason": "separate heterophily-filter ablation switch is not implemented yet"},
-    "wo_dual_branch_encoder": {"skip_reason": "separate dual-branch encoder ablation switch is not implemented yet"},
-    "wo_gated_fusion": {"skip_reason": "separate gated-fusion ablation switch is not implemented yet"},
+    "hero_gnn": {
+        "trainer_model": "hero_gnn",
+        "name": "HERO-GNN",
+        "hero_config": {},
+    },
+    "wo_risk_relevant_heterophily": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Risk-relevant Heterophily",
+        "hero_config": {"use_risk_relevant_heterophily": False},
+    },
+    "wo_mechanism_annotation": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Mechanism Annotation",
+        "hero_config": {"use_mechanism_annotation": False, "use_llm_annotation": False},
+    },
+    "wo_evidence_chain": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Evidence Chain",
+        "hero_config": {"use_evidence_chain": False},
+    },
+    "wo_llm_annotation": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o LLM Annotation",
+        "hero_config": {"use_llm_annotation": False, "use_mechanism_annotation": False},
+    },
+    "wo_heterophily_filter": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Heterophily Filter",
+        "hero_config": {"use_heterophily_filter": False},
+    },
+    "wo_dual_branch_encoder": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Dual-Branch Encoder",
+        "hero_config": {"use_dual_branch_encoder": False},
+    },
+    "wo_gated_fusion": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Gated Fusion",
+        "hero_config": {"use_gated_fusion": False, "fusion_type": "concat_linear"},
+    },
 }
 
 
@@ -58,10 +92,7 @@ def main() -> None:
                     write_skip(result_dir, dataset, variant, seed, "Missing dataset files. This is expected on local VSCode. Please run on AutoDL or provide data path.")
                     print(f"[skipped] {dataset}/{variant}/seed_{seed}: missing data")
                     continue
-                if "skip_reason" in spec:
-                    write_skip(result_dir, dataset, variant, seed, str(spec["skip_reason"]))
-                    print(f"[skipped] {dataset}/{variant}/seed_{seed}: {spec['skip_reason']}")
-                    continue
+                resolved_config = _resolve_hero_config(str(spec["trainer_model"]), dict(spec.get("hero_config", {})))
                 metrics = train_single_experiment(
                     dataset=dataset,
                     model_name=str(spec["trainer_model"]),
@@ -72,17 +103,37 @@ def main() -> None:
                     lr=args.lr,
                     hidden_dim=args.hidden_dim,
                     device=args.device,
+                    hero_config=resolved_config,
                 )
                 result_dir.mkdir(parents=True, exist_ok=True)
                 payload = _submission_metric_payload(metrics, dataset, variant, seed, "project")
+                payload["variant"] = variant
                 payload["ablation_name"] = str(spec["name"])
                 payload["trainer_model"] = str(spec["trainer_model"])
+                payload["hero_config"] = resolved_config
                 write_json(result_dir / "metrics.json", payload)
+                _write_ablation_config(result_dir, dataset, variant, seed, spec, args, resolved_config)
                 prediction_file = metrics.get("predictions_file")
                 if prediction_file and Path(str(prediction_file)).exists():
                     shutil.copyfile(str(prediction_file), result_dir / "predictions.npy")
                 (result_dir / "run.log").write_text(f"Completed ablation {dataset}/{variant}/seed_{seed}\n", encoding="utf-8")
                 print(f"[ok] {result_dir / 'metrics.json'}")
+
+
+def _write_ablation_config(result_dir: Path, dataset: str, variant: str, seed: int, spec: dict, args: argparse.Namespace, resolved_config: dict) -> None:
+    payload = {
+        "dataset": dataset,
+        "variant": variant,
+        "ablation_name": str(spec["name"]),
+        "model_name": str(spec["trainer_model"]),
+        "seed": int(seed),
+        "epochs": int(args.epochs),
+        "lr": float(args.lr),
+        "hidden_dim": int(args.hidden_dim),
+        "hero_config": resolved_config,
+        **resolved_config,
+    }
+    (result_dir / "config_resolved.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
 if __name__ == "__main__":

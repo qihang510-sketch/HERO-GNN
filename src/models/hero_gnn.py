@@ -20,6 +20,9 @@ if nn is not None:
             use_heterophily: bool = True,
             use_mechanism: bool = True,
             use_chain: bool = True,
+            use_dual_branch_encoder: bool = True,
+            use_gated_fusion: bool = True,
+            fusion_type: str = "gated",
             hetero_input_dim: int | None = None,
             mechanism_input_dim: int | None = None,
             chain_input_dim: int | None = None,
@@ -29,9 +32,13 @@ if nn is not None:
             self.use_heterophily = use_heterophily
             self.use_mechanism = use_mechanism
             self.use_chain = use_chain
+            self.use_dual_branch_encoder = bool(use_dual_branch_encoder)
+            self.use_gated_fusion = bool(use_gated_fusion)
+            self.fusion_type = str(fusion_type or "gated")
             self.min_chain_gate = float(min_chain_gate)
             self.target_encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
             self.homo_encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
+            self.single_branch_encoder = nn.Sequential(nn.Linear(input_dim * 2, hidden_dim), nn.ReLU())
             hetero_input_dim = input_dim if hetero_input_dim is None else int(hetero_input_dim)
             mechanism_input_dim = num_mechanisms if mechanism_input_dim is None else int(mechanism_input_dim)
             self.hetero_encoder = nn.Sequential(nn.Linear(hetero_input_dim, hidden_dim), nn.ReLU())
@@ -49,6 +56,8 @@ if nn is not None:
                 nn.ReLU(),
                 nn.Linear(hidden_dim, 1),
             )
+            self.concat_fusion = nn.Sequential(nn.Linear(hidden_dim * 5, hidden_dim * 5), nn.ReLU())
+            self.fixed_fusion_weights = nn.Parameter(torch.ones(5), requires_grad=False)
             self.classifier = nn.Linear(hidden_dim * 5, output_dim)
 
         def encode_chain(
@@ -76,8 +85,13 @@ if nn is not None:
             return_gates: bool = False,
             return_details: bool = False,
         ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-            target_repr = self.target_encoder(target_features)
-            homo_repr = self.homo_encoder(homo_neighbor_features)
+            if self.use_dual_branch_encoder:
+                target_repr = self.target_encoder(target_features)
+                homo_repr = self.homo_encoder(homo_neighbor_features)
+            else:
+                single_repr = self.single_branch_encoder(torch.cat([target_features, homo_neighbor_features], dim=1))
+                target_repr = single_repr
+                homo_repr = torch.zeros_like(single_repr)
             if self.use_heterophily and not zero_hetero:
                 hetero_repr = self.hetero_encoder(hetero_neighbor_features)
             else:
@@ -98,7 +112,11 @@ if nn is not None:
             if self.use_chain and not force_no_chain and not zero_chain:
                 chain_gate_scalar = torch.sigmoid(self.chain_gate_mlp(torch.cat([base_repr, raw_chain_repr, chain_quality], dim=1)))
                 chain_gate_scalar = chain_gate_scalar * chain_presence
-                chain_repr = raw_chain_repr * chain_gate_scalar
+                if self.use_gated_fusion and self.fusion_type == "gated":
+                    chain_repr = raw_chain_repr * chain_gate_scalar
+                else:
+                    chain_gate_scalar = chain_presence
+                    chain_repr = raw_chain_repr * chain_presence
             else:
                 chain_gate_scalar = torch.zeros_like(chain_presence)
                 chain_repr = torch.zeros_like(target_repr)
@@ -109,6 +127,18 @@ if nn is not None:
                 ],
                 dim=1,
             )
+            if not self.use_gated_fusion:
+                if self.fusion_type == "mean":
+                    stacked = torch.stack([target_repr, homo_repr, hetero_repr, mechanism_repr, chain_repr], dim=1)
+                    pooled = stacked.mean(dim=1)
+                    final_repr = torch.cat([pooled, pooled, pooled, pooled, pooled], dim=1)
+                elif self.fusion_type == "fixed_sum":
+                    weights = torch.softmax(self.fixed_fusion_weights, dim=0).view(1, 5, 1)
+                    stacked = torch.stack([target_repr, homo_repr, hetero_repr, mechanism_repr, chain_repr], dim=1)
+                    pooled = (stacked * weights).sum(dim=1)
+                    final_repr = torch.cat([pooled, pooled, pooled, pooled, pooled], dim=1)
+                else:
+                    final_repr = self.concat_fusion(final_repr)
             logits = self.classifier(final_repr).squeeze(-1)
             gates = {
                 "target_gate": torch.ones_like(target_repr),
