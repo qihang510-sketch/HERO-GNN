@@ -347,8 +347,8 @@ def _run_reproduced_baseline(
     train_idx = _valid_split(graph, "train")
     val_idx = _valid_split(graph, "val")
     test_idx = _valid_split(graph, "test")
-    if train_idx.size == 0 or test_idx.size == 0:
-        return write_skip(result_dir, dataset, model, seed, "processed split has no labeled train or test nodes")
+    if train_idx.size == 0 or val_idx.size == 0 or test_idx.size == 0:
+        return write_skip(result_dir, dataset, model, seed, "processed split has no labeled train/val/test nodes")
 
     train_x, train_y = features[train_idx], labels[train_idx]
     if model == "pc_gnn":

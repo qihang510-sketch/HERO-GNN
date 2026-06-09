@@ -5,6 +5,15 @@ processed_dir: data/processed/elliptic
 primary_method: hero_official
 label_source: official
 unknown_label_policy: kept_as_graph_context_excluded_from_loss
+processed_files:
+  - nodes.csv
+  - edges.csv
+  - features.npz
+  - features.npy
+  - edge_index.npy
+  - labels.npy
+  - split.json
+  - metadata.json
 models:
   - mlp
   - gcn

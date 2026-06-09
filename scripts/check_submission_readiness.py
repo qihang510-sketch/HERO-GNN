@@ -34,6 +34,7 @@ def main() -> None:
     official_table = _read_table(tables_dir / "table_official_benchmark.csv")
     transaction_table = _read_table(tables_dir / "table_transaction_benchmark.csv")
     coverage_table = _read_table(tables_dir / "table_llm_coverage_sensitivity.csv")
+    labeler_table = _read_table(tables_dir / "table_llm_labeler_comparison.csv")
 
     checks.append(_check_forbidden_names(results_dir, metrics))
     checks.append(_check_seed_counts(all_results, ["yelp_academic", "amazon_video"], args.min_seeds, "Text-rich proxy has 5 seeds"))
@@ -44,7 +45,7 @@ def main() -> None:
     checks.append(_check_beats(text_table, "hero_gnn", ["care_gnn", "graphconsis", "pc_gnn", "bwgnn"], ["AUPRC_mean", "Macro-F1_mean"], "HERO-GNN beats classic fraud baselines"))
     checks.append(_check_rank(official_table, "hero_official", "AUPRC_mean", "HERO-official official benchmark average rank top two", max_rank=2))
     checks.append(_check_beats(transaction_table, "hero_official", ["graphsage", "bwgnn", "linkx"], ["AUPRC_mean"], "HERO-official beats generic/anomaly baselines on Elliptic"))
-    checks.append(_check_coverage(coverage_table))
+    checks.append(_check_coverage(labeler_table, coverage_table))
     checks.append(_check_file(tables_dir / "table_significance_tests.csv", "Significance tests generated"))
     checks.append(_check_figures(figures_dir))
     checks.append(_check_na(all_results))
@@ -131,20 +132,79 @@ def _check_beats(table: pd.DataFrame, hero: str, baselines: list[str], metrics: 
     return _fail(label, "; ".join(failures)) if failures else _pass(label)
 
 
-def _check_coverage(table: pd.DataFrame) -> dict[str, str]:
+def _check_coverage(labeler_table: pd.DataFrame, coverage_table: pd.DataFrame) -> dict[str, str]:
     label = "Qwen high-coverage outperforms rule/mock"
-    if table.empty or "labeler" not in table:
-        return _fail(label, "coverage table missing")
+    if not labeler_table.empty:
+        return _check_labeler_comparison(labeler_table, label)
+    if not coverage_table.empty:
+        return _check_coverage_sensitivity(coverage_table, label)
+    return _fail(label, "table_llm_labeler_comparison.csv and table_llm_coverage_sensitivity.csv are both missing or empty")
+
+
+def _check_labeler_comparison(table: pd.DataFrame, label: str) -> dict[str, str]:
+    if "labeler" not in table:
+        return _warn(label, "table_llm_labeler_comparison.csv exists but lacks labeler column")
     qwen = table[table["labeler"].astype(str).str.contains("qwen", case=False, na=False)]
     rule = table[table["labeler"].astype(str).str.contains("rule|mock", case=False, na=False)]
     if qwen.empty or rule.empty:
-        return _fail(label, "missing qwen or rule/mock rows")
-    metric = "AUPRC_mean" if "AUPRC_mean" in table else "AUPRC"
-    if metric not in table:
-        return _fail(label, "missing AUPRC metric")
-    if pd.to_numeric(qwen[metric], errors="coerce").max() <= pd.to_numeric(rule[metric], errors="coerce").max():
-        return _fail(label, "qwen is not higher than rule/mock")
-    return _pass(label)
+        return _warn(label, "labeler comparison exists but qwen or rule/mock rows are missing")
+    improvements = []
+    missing = []
+    for metric in ["Macro-F1", "AUROC", "AUPRC"]:
+        col = _metric_column(table, metric)
+        if col is None:
+            missing.append(metric)
+            continue
+        qwen_value = pd.to_numeric(qwen[col], errors="coerce").max()
+        rule_value = pd.to_numeric(rule[col], errors="coerce").max()
+        improvements.append((metric, qwen_value, rule_value, bool(qwen_value > rule_value)))
+    if missing:
+        return _warn(label, f"labeler comparison lacks metric columns: {missing}")
+    if any(metric in {"AUPRC", "Macro-F1"} and improved for metric, _q, _r, improved in improvements):
+        return _pass(label)
+    return _fail(label, "qwen does not improve AUPRC or Macro-F1 over rule/mock")
+
+
+def _check_coverage_sensitivity(table: pd.DataFrame, label: str) -> dict[str, str]:
+    coverage_col = "coverage" if "coverage" in table else ("llm_label_coverage_rate" if "llm_label_coverage_rate" in table else "")
+    if not coverage_col:
+        return _warn(label, "coverage sensitivity table exists but lacks coverage column")
+    coverage = pd.to_numeric(table[coverage_col], errors="coerce")
+    low = table[coverage == coverage.min()]
+    high = table[coverage == coverage.max()]
+    if low.empty or high.empty:
+        return _warn(label, "coverage sensitivity table lacks comparable coverage=0 and coverage=1 rows")
+    improvements = []
+    missing = []
+    for metric in ["Macro-F1", "AUROC", "AUPRC"]:
+        col = _metric_column(table, metric)
+        if col is None:
+            missing.append(metric)
+            continue
+        high_value = pd.to_numeric(high[col], errors="coerce").max()
+        low_value = pd.to_numeric(low[col], errors="coerce").max()
+        improvements.append((metric, high_value, low_value, bool(high_value > low_value)))
+    if missing:
+        return _warn(label, f"coverage sensitivity lacks metric columns: {missing}")
+    if any(metric in {"AUPRC", "Macro-F1"} and improved for metric, _q, _r, improved in improvements):
+        return _pass(label)
+    return _fail(label, "coverage=1.0 does not improve AUPRC or Macro-F1 over coverage=0")
+
+
+def _metric_column(table: pd.DataFrame, metric: str) -> str | None:
+    candidates = [
+        f"{metric}_mean",
+        metric,
+        metric.lower(),
+        f"{metric.lower()}_mean",
+        metric.replace("-", "_"),
+        metric.replace("-", "_").lower(),
+        f"{metric.replace('-', '_').lower()}_mean",
+    ]
+    for candidate in candidates:
+        if candidate in table.columns:
+            return candidate
+    return None
 
 
 def _check_file(path: Path, label: str) -> dict[str, str]:

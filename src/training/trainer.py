@@ -189,7 +189,7 @@ def _default_official_diagnostics() -> dict[str, float | int | bool]:
 
 
 def _is_official_graph(graph: ProcessedGraphData, dataset: str) -> bool:
-    return graph.preprocess_report.get("label_source") == "official" or dataset in {"fraud_yelp_official", "fraud_amazon_official"}
+    return graph.preprocess_report.get("label_source") == "official" or dataset in {"fraud_yelp_official", "fraud_amazon_official", "elliptic"}
 
 
 def _resolve_device_name(device: str | None) -> tuple[str, bool]:
@@ -260,7 +260,7 @@ def train_single_experiment(
     if official_mode and max_target_nodes is not None:
         train_idx, val_idx, test_idx = _limit_official_split_indices(train_idx, val_idx, test_idx, max_target_nodes)
     if train_idx.size == 0 or test_idx.size == 0:
-        raise ValueError("Processed data must contain labeled train and test review nodes.")
+        raise ValueError("Processed data must contain labeled train and test nodes.")
     eval_target_indices = _load_eval_target_indices(eval_target_file, graph, test_idx) if eval_target_file is not None else None
 
     class_stats = _split_class_stats(

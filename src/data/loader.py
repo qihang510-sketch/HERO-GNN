@@ -34,6 +34,7 @@ def load_processed_data(data_dir: str | Path = "data/processed/synthetic") -> Pr
     split_path = data_dir / "split.json"
     evidence_path = data_dir / "evidence_gt.json"
     report_path = data_dir / "preprocess_report.json"
+    metadata_path = data_dir / "metadata.json"
 
     _require_files([nodes_path, edges_path, features_path, split_path])
 
@@ -62,7 +63,12 @@ def load_processed_data(data_dir: str | Path = "data/processed/synthetic") -> Pr
     ]
     edge_index = np.array(edge_pairs, dtype=np.int64).T if edge_pairs else np.zeros((2, 0), dtype=np.int64)
     evidence_gt = json.loads(evidence_path.read_text(encoding="utf-8")) if evidence_path.exists() else {}
-    preprocess_report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+    if report_path.exists():
+        preprocess_report = json.loads(report_path.read_text(encoding="utf-8"))
+    elif metadata_path.exists():
+        preprocess_report = json.loads(metadata_path.read_text(encoding="utf-8"))
+    else:
+        preprocess_report = {}
     return ProcessedGraphData(
         features=features,
         text_features=text_features,
