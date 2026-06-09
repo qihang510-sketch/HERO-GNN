@@ -10,8 +10,19 @@ processed_files:
   - edges.csv
   - features.npz
   - features.npy
+  - features.pt
   - edge_index.npy
+  - edge_index.pt
   - labels.npy
+  - labels.pt
+  - train_mask.npy
+  - val_mask.npy
+  - test_mask.npy
+  - train_mask.pt
+  - val_mask.pt
+  - test_mask.pt
+  - masks.npz
+  - masks.pt
   - split.json
   - metadata.json
 models:

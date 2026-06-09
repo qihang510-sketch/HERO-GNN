@@ -9,6 +9,11 @@ import pandas as pd
 
 from src.data import schema
 
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
+
 
 ELLIPTIC_FEATURES = "elliptic_txs_features.csv"
 ELLIPTIC_EDGES = "elliptic_txs_edgelist.csv"
@@ -80,6 +85,7 @@ def prepare_elliptic_dataset(
     nodes.to_csv(output_dir / "nodes.csv", index=False)
     edges[[schema.SRC, schema.DST, schema.EDGE_TYPE, schema.TIMESTAMP]].to_csv(output_dir / "edges.csv", index=False)
     node_id_to_idx = {node_id: index for index, node_id in enumerate(tx_ids.astype(str).tolist())}
+    train_mask, val_mask, test_mask = _split_to_masks(split, node_id_to_idx, num_nodes=feature_matrix.shape[0])
     edge_pairs = [
         (node_id_to_idx[src], node_id_to_idx[dst])
         for src, dst in edges[[schema.SRC, schema.DST]].itertuples(index=False, name=None)
@@ -96,6 +102,17 @@ def prepare_elliptic_dataset(
     np.save(output_dir / "features.npy", feature_matrix.astype(np.float32))
     np.save(output_dir / "edge_index.npy", edge_index)
     np.save(output_dir / "labels.npy", labels)
+    np.save(output_dir / "train_mask.npy", train_mask)
+    np.save(output_dir / "val_mask.npy", val_mask)
+    np.save(output_dir / "test_mask.npy", test_mask)
+    np.savez_compressed(output_dir / "masks.npz", train_mask=train_mask, val_mask=val_mask, test_mask=test_mask)
+    _save_pt(output_dir / "features.pt", feature_matrix.astype(np.float32))
+    _save_pt(output_dir / "edge_index.pt", edge_index.astype(np.int64))
+    _save_pt(output_dir / "labels.pt", labels.astype(np.int64))
+    _save_pt(output_dir / "train_mask.pt", train_mask)
+    _save_pt(output_dir / "val_mask.pt", val_mask)
+    _save_pt(output_dir / "test_mask.pt", test_mask)
+    _save_pt(output_dir / "masks.pt", {"train_mask": train_mask, "val_mask": val_mask, "test_mask": test_mask})
     (output_dir / "split.json").write_text(json.dumps(split, indent=2), encoding="utf-8")
     _write_report(output_dir, raw_dir, nodes, edges, feature_matrix, split_stats)
     return output_dir
@@ -151,21 +168,22 @@ def _labeled_split(node_ids: np.ndarray, labels: np.ndarray, seed: int) -> dict[
 
 
 def check_elliptic_processed(output_dir: str | Path = "data/processed/elliptic") -> dict[str, Any]:
-    output_dir = Path(output_dir)
-    nodes_path = output_dir / "nodes.csv"
-    split_path = output_dir / "split.json"
-    _require_files([nodes_path, split_path])
-    nodes = pd.read_csv(nodes_path).fillna("")
-    labels = pd.to_numeric(nodes[schema.LABEL], errors="coerce").fillna(-1).astype(int)
-    split = json.loads(split_path.read_text(encoding="utf-8"))
-    label_by_id = nodes.set_index(schema.NODE_ID)[schema.LABEL].astype(int).to_dict()
+    from src.data.loader import load_processed_data, processed_dataset_diagnostics
+
+    data = load_processed_data(output_dir)
+    diagnostics = processed_dataset_diagnostics(data, output_dir, dataset="elliptic")
     payload = {
-        "num_nodes": int(nodes.shape[0]),
-        "num_labeled": int((labels >= 0).sum()),
-        "num_licit": int((labels == 0).sum()),
-        "num_illicit": int((labels == 1).sum()),
-        "num_unknown": int((labels < 0).sum()),
-        "splits": _split_stats(split, {str(k): int(v) for k, v in label_by_id.items()}),
+        "num_nodes": diagnostics["num_nodes"],
+        "num_labeled": diagnostics["num_labeled"],
+        "num_licit": diagnostics["label_distribution"]["licit"],
+        "num_illicit": diagnostics["label_distribution"]["illicit"],
+        "num_unknown": diagnostics["label_distribution"]["unknown"],
+        "splits": {
+            "train": {"labeled_count": diagnostics["train_count"], **diagnostics["train_class_distribution"]},
+            "val": {"labeled_count": diagnostics["val_count"], **diagnostics["val_class_distribution"]},
+            "test": {"labeled_count": diagnostics["test_count"], **diagnostics["test_class_distribution"]},
+        },
+        "required_fields_status": diagnostics["required_fields_status"],
     }
     return payload
 
@@ -242,6 +260,27 @@ def _split_stats(split: dict[str, list[str]], labels_by_id: dict[str, int]) -> d
             "unknown": int(sum(label < 0 for label in labels)),
         }
     return out
+
+
+def _split_to_masks(split: dict[str, list[str]], node_id_to_idx: dict[str, int], num_nodes: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    masks = []
+    for split_name in ["train", "val", "test"]:
+        mask = np.zeros(num_nodes, dtype=bool)
+        for node_id in split.get(split_name, []):
+            idx = node_id_to_idx.get(str(node_id))
+            if idx is not None:
+                mask[int(idx)] = True
+        masks.append(mask)
+    return masks[0], masks[1], masks[2]
+
+
+def _save_pt(path: Path, value: Any) -> None:
+    if torch is None:
+        return
+    if isinstance(value, dict):
+        torch.save({key: torch.as_tensor(val) for key, val in value.items()}, path)
+    else:
+        torch.save(torch.as_tensor(value), path)
 
 
 def _write_report(output_dir: Path, raw_dir: Path, nodes: pd.DataFrame, edges: pd.DataFrame, features: np.ndarray, split_stats: dict[str, dict[str, int]]) -> None:

@@ -16,7 +16,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 from src.data import schema
-from src.data.loader import ProcessedGraphData, load_processed_data
+from src.data.loader import ProcessedGraphData, load_processed_data, validate_labeled_split
 from src.training.evaluator import (
     binary_classification_metrics,
     fixed_threshold_diagnostics,
@@ -204,6 +204,17 @@ def run_submission_experiment(
             {"data_dir": str(data_dir)},
         )
     try:
+        graph = load_processed_data(data_dir)
+        split_status = validate_labeled_split(graph)
+        if not split_status["valid"]:
+            return write_skip(
+                result_dir,
+                dataset,
+                model,
+                seed,
+                "processed split has no labeled train/val/test nodes",
+                {"data_dir": str(data_dir), **_split_validation_extra(split_status)},
+            )
         if model in HERO_MODELS:
             return _run_project_hero(
                 dataset=dataset,
@@ -219,7 +230,6 @@ def run_submission_experiment(
                 device=device,
                 llm_label_file=llm_label_file,
             )
-        graph = load_processed_data(data_dir)
         return _run_reproduced_baseline(
             graph=graph,
             dataset=dataset,
@@ -255,6 +265,15 @@ def resolve_processed_dir(dataset: str, data_root: str | Path = "data") -> Path:
 
 def processed_ready(path: str | Path) -> bool:
     path = Path(path)
+    if path.name.lower() == "elliptic" or _metadata_dataset(path) == "elliptic":
+        has_features = any((path / name).exists() for name in ["features.npz", "features.npy", "features.pt"])
+        has_edges = any((path / name).exists() for name in ["edge_index.npy", "edge_index.pt", "edges.csv"])
+        has_labels = any((path / name).exists() for name in ["labels.npy", "labels.pt", "nodes.csv"])
+        has_masks = (
+            all((path / f"{split_name}_mask.npy").exists() or (path / f"{split_name}_mask.pt").exists() for split_name in ["train", "val", "test"])
+            or any((path / name).exists() for name in ["masks.pt", "masks.npy", "masks.npz", "split.json"])
+        )
+        return has_features and has_edges and has_labels and has_masks
     return all((path / name).exists() for name in ["nodes.csv", "edges.csv", "features.npz", "split.json"])
 
 
@@ -344,6 +363,16 @@ def _run_reproduced_baseline(
         return write_skip(result_dir, dataset, model, seed, feature_result.skip_reason, {"data_dir": str(data_dir)})
     features = np.asarray(feature_result.features, dtype=np.float32)
     labels = np.asarray(graph.labels, dtype=np.int64)
+    split_status = validate_labeled_split(graph)
+    if not split_status["valid"]:
+        return write_skip(
+            result_dir,
+            dataset,
+            model,
+            seed,
+            "processed split has no labeled train/val/test nodes",
+            {"data_dir": str(data_dir), **_split_validation_extra(split_status)},
+        )
     train_idx = _valid_split(graph, "train")
     val_idx = _valid_split(graph, "val")
     test_idx = _valid_split(graph, "test")
@@ -492,8 +521,37 @@ def _submission_metric_payload(metrics: dict[str, Any], dataset: str, model: str
 
 
 def _valid_split(graph: ProcessedGraphData, split_name: str) -> np.ndarray:
-    indices = np.asarray(graph.split.get(split_name, np.array([], dtype=np.int64)), dtype=np.int64)
-    return indices[graph.labels[indices] >= 0]
+    mask = np.asarray(getattr(graph, f"{split_name}_mask", np.zeros(graph.labels.shape[0], dtype=bool)), dtype=bool)
+    if mask.shape != graph.labels.shape:
+        mask = np.zeros(graph.labels.shape[0], dtype=bool)
+        indices = np.asarray(graph.split.get(split_name, np.array([], dtype=np.int64)), dtype=np.int64)
+        indices = indices[(indices >= 0) & (indices < graph.labels.shape[0])]
+        mask[indices] = True
+    return np.flatnonzero(mask & (graph.labels >= 0)).astype(np.int64)
+
+
+def _split_validation_extra(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "train_count": int(status.get("train_count", 0)),
+        "val_count": int(status.get("val_count", 0)),
+        "test_count": int(status.get("test_count", 0)),
+        "num_labeled": int(status.get("num_labeled", 0)),
+        "label_distribution": status.get("label_distribution", {}),
+        "train_class_distribution": status.get("train_class_distribution", {}),
+        "val_class_distribution": status.get("val_class_distribution", {}),
+        "test_class_distribution": status.get("test_class_distribution", {}),
+    }
+
+
+def _metadata_dataset(path: Path) -> str:
+    metadata_path = path / "metadata.json"
+    if not metadata_path.exists():
+        return ""
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return ""
+    return str(payload.get("dataset", "")).lower()
 
 
 def _positive_scores(classifier: Any, features: np.ndarray) -> np.ndarray:
