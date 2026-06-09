@@ -43,7 +43,7 @@ ABLATION_VARIANTS = {
     "wo_llm_annotation": {
         "trainer_model": "hero_gnn",
         "name": "w/o LLM Annotation",
-        "hero_config": {"use_llm_annotation": False, "use_mechanism_annotation": False},
+        "hero_config": {"use_llm_annotation": False},
     },
     "wo_heterophily_filter": {
         "trainer_model": "hero_gnn",
@@ -58,7 +58,7 @@ ABLATION_VARIANTS = {
     "wo_gated_fusion": {
         "trainer_model": "hero_gnn",
         "name": "w/o Gated Fusion",
-        "hero_config": {"use_gated_fusion": False, "fusion_type": "concat_linear"},
+        "hero_config": {"use_gated_fusion": False, "fusion_type": "no_gate"},
     },
 }
 

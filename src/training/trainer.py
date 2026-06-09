@@ -106,7 +106,7 @@ def _resolve_hero_config(model_name: str, overrides: dict[str, Any] | None = Non
     if not bool(config["use_mechanism_annotation"]):
         config["use_llm_annotation"] = False
     if not bool(config["use_gated_fusion"]) and str(config.get("fusion_type", "gated")) == "gated":
-        config["fusion_type"] = "concat_linear"
+        config["fusion_type"] = "no_gate"
     config["fusion_type"] = str(config.get("fusion_type", "gated"))
     config["llm_annotation_enabled"] = bool(config["use_llm_annotation"])
     return config

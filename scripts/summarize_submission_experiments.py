@@ -31,8 +31,6 @@ TABLE_SPECS = {
     "table_transaction_benchmark": {"datasets": ["elliptic"]},
 }
 EMPTY_TABLES = [
-    "table_llm_labeler_comparison",
-    "table_llm_coverage_sensitivity",
     "table_significance_tests",
 ]
 
@@ -41,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Summarize submission experiment metrics into paper tables.")
     parser.add_argument("--input_dir", default="outputs/submission_experiments")
     parser.add_argument("--ablation_dir", default=None, help="Directory from run_ablation_experiments.py. Defaults to outputs/submission_experiments_ablation.")
+    parser.add_argument("--llm_labeler_dir", default=None, help="Directory from run_labeler_comparison.py.")
+    parser.add_argument("--llm_coverage_dir", default=None, help="Directory from run_llm_coverage_sensitivity.py.")
     parser.add_argument("--output_dir", default="outputs/paper_tables_submission")
     parser.add_argument("--min_seeds", type=int, default=5)
     return parser.parse_args()
@@ -67,6 +67,12 @@ def main() -> None:
         _write_table(ablation_table, output_dir / "table_ablation")
     elif not (output_dir / "table_ablation.csv").exists():
         _write_table(pd.DataFrame(columns=["status", "warning"]), output_dir / "table_ablation")
+    llm_labeler_dir = _resolve_llm_dir(input_dir, args.llm_labeler_dir, "llm_labeler", "outputs/submission_llm_labeler")
+    labeler_table = _llm_labeler_table(llm_labeler_dir, warnings=warnings)
+    _write_table(labeler_table if not labeler_table.empty else _warning_table(f"missing_or_empty_llm_labeler_results:{llm_labeler_dir}"), output_dir / "table_llm_labeler_comparison")
+    llm_coverage_dir = _resolve_llm_dir(input_dir, args.llm_coverage_dir, "llm_coverage", "outputs/submission_llm_coverage")
+    coverage_table = _llm_coverage_table(llm_coverage_dir, warnings=warnings)
+    _write_table(coverage_table if not coverage_table.empty else _warning_table(f"missing_or_empty_llm_coverage_results:{llm_coverage_dir}"), output_dir / "table_llm_coverage_sensitivity")
     for stem in EMPTY_TABLES:
         path = output_dir / f"{stem}.csv"
         if not path.exists():
@@ -105,6 +111,138 @@ def _resolve_ablation_dir(input_dir: Path, explicit: str | None) -> Path:
     if "ablation" in input_dir.name.lower():
         return input_dir
     return Path("outputs/submission_experiments_ablation")
+
+
+def _resolve_llm_dir(input_dir: Path, explicit: str | None, lightcheck_name: str, formal_default: str) -> Path:
+    if explicit:
+        return Path(explicit)
+    sibling = input_dir.parent / lightcheck_name
+    if sibling.exists():
+        return sibling
+    return Path(formal_default)
+
+
+def _llm_labeler_table(labeler_dir: Path, warnings: list[str]) -> pd.DataFrame:
+    rows = _read_llm_labeler_metrics(labeler_dir)
+    if not rows:
+        legacy_csv = labeler_dir / "labeler_comparison_table.csv"
+        if legacy_csv.exists():
+            legacy = pd.read_csv(legacy_csv)
+            return _aggregate_llm_frame(legacy, group_cols=["dataset", "labeler"], min_seeds=1, warnings=warnings, table_name="llm_labeler")
+        warnings.append(f"llm_labeler_dir contains no metrics: {labeler_dir}")
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    return _aggregate_llm_frame(frame, group_cols=["dataset", "labeler"], min_seeds=1, warnings=warnings, table_name="llm_labeler")
+
+
+def _llm_coverage_table(coverage_dir: Path, warnings: list[str]) -> pd.DataFrame:
+    rows = _read_llm_coverage_metrics(coverage_dir)
+    if not rows:
+        legacy_csv = coverage_dir / "coverage_sensitivity_table.csv"
+        if legacy_csv.exists():
+            legacy = pd.read_csv(legacy_csv)
+            return _aggregate_llm_frame(legacy, group_cols=["dataset", "coverage"], min_seeds=1, warnings=warnings, table_name="llm_coverage")
+        warnings.append(f"llm_coverage_dir contains no metrics: {coverage_dir}")
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    if "coverage" in frame:
+        frame["coverage"] = pd.to_numeric(frame["coverage"], errors="coerce")
+    return _aggregate_llm_frame(frame, group_cols=["dataset", "coverage"], min_seeds=1, warnings=warnings, table_name="llm_coverage")
+
+
+def _read_llm_labeler_metrics(labeler_dir: Path) -> list[dict[str, Any]]:
+    if not labeler_dir.exists():
+        return []
+    rows = []
+    for path in sorted(labeler_dir.glob("*/*/seed_*/metrics.json")):
+        payload = _read_metric_payload(path)
+        if not payload:
+            continue
+        payload.setdefault("dataset", path.parents[2].name)
+        payload.setdefault("labeler", path.parents[1].name)
+        payload["_path"] = str(path)
+        rows.append(payload)
+    return rows
+
+
+def _read_llm_coverage_metrics(coverage_dir: Path) -> list[dict[str, Any]]:
+    if not coverage_dir.exists():
+        return []
+    rows = []
+    canonical = sorted(coverage_dir.glob("*/*/seed_*/metrics.json"))
+    legacy = sorted(coverage_dir.glob("coverage_*/*/hero_gnn/seed_*/metrics.json")) if not canonical else []
+    for path in [*canonical, *legacy]:
+        payload = _read_metric_payload(path)
+        if not payload:
+            continue
+        if "dataset" not in payload:
+            payload["dataset"] = path.parents[2].name if "coverage_" not in path.parents[3].name else path.parents[2].name
+        if "coverage" not in payload:
+            payload["coverage"] = _coverage_from_path(path)
+        payload["_path"] = str(path)
+        rows.append(payload)
+    return rows
+
+
+def _read_metric_payload(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _coverage_from_path(path: Path) -> Any:
+    for part in path.parts:
+        if part.startswith("coverage_"):
+            try:
+                return float(part.split("_", 1)[1]) / 100.0
+            except (IndexError, ValueError):
+                return pd.NA
+    return pd.NA
+
+
+def _warning_table(message: str) -> pd.DataFrame:
+    return pd.DataFrame([{"status": "warning", "warning": message}])
+
+
+def _aggregate_llm_frame(
+    frame: pd.DataFrame,
+    group_cols: list[str],
+    min_seeds: int,
+    warnings: list[str],
+    table_name: str,
+) -> pd.DataFrame:
+    if frame.empty or any(col not in frame for col in group_cols):
+        warnings.append(f"{table_name}: missing required columns {group_cols}")
+        return pd.DataFrame()
+    table_rows = []
+    sort_frame = frame.copy()
+    for col in group_cols:
+        if col == "coverage":
+            sort_frame[col] = pd.to_numeric(sort_frame[col], errors="coerce")
+    grouped = sort_frame.groupby(group_cols, dropna=False)
+    for keys, subset in grouped:
+        key_values = keys if isinstance(keys, tuple) else (keys,)
+        row = {col: key_values[idx] for idx, col in enumerate(group_cols)}
+        seed_count = int(subset["seed"].nunique()) if "seed" in subset else int(subset.shape[0])
+        row["seed_count"] = seed_count
+        row["missing_seed_count"] = max(int(min_seeds) - seed_count, 0)
+        row["status"] = "ok" if seed_count else "missing"
+        row["warning"] = ""
+        if seed_count and seed_count < min_seeds:
+            row["warning"] = f"insufficient_seeds:{seed_count}/{min_seeds}"
+        for metric in METRICS:
+            values = _metric_values(subset, metric)
+            row[f"{metric}_mean"] = float(np.mean(values)) if values else pd.NA
+            row[f"{metric}_std"] = float(np.std(values, ddof=1)) if len(values) >= 2 else pd.NA
+            row[f"{metric}_mean_std"] = _mean_std_display(values)
+        for col in ["coverage", "parse_error_count", "risk_relevance_rate", "avg_confidence", "llm_label_coverage_rate", "num_cards", "num_annotations"]:
+            if col in subset and col not in row:
+                numeric = pd.to_numeric(subset[col], errors="coerce").dropna()
+                row[col] = float(numeric.mean()) if not numeric.empty else pd.NA
+        table_rows.append(row)
+    return pd.DataFrame(table_rows)
 
 
 def _ablation_table(ablation_dir: Path, min_seeds: int, warnings: list[str]) -> pd.DataFrame:

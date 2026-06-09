@@ -140,6 +140,8 @@ def _figure5(tables_dir: Path, output_dir: Path, skipped: list[str]) -> None:
     if x.dropna().empty:
         skipped.append("fig_llm_coverage_curve: coverage values are NA.")
         return
+    table = table.assign(_coverage_x=x).sort_values("_coverage_x")
+    x = table["_coverage_x"]
     fig, ax = plt.subplots(figsize=(5.8, 3.4))
     plotted = False
     for metric in ["Macro-F1", "AUROC", "AUPRC"]:
@@ -181,10 +183,16 @@ def _figure6(tables_dir: Path, output_dir: Path, skipped: list[str]) -> None:
 
 
 def _figure7(output_dir: Path, skipped: list[str]) -> None:
-    case = _load_evidence_case()
+    case = _load_evidence_case(output_dir)
     if case is None:
-        skipped.append("fig_evidence_chain_case: no real evidence-chain case with routing_weight and rationale was found.")
+        table_rows = _load_textual_evidence_case_rows()
+        if table_rows:
+            _write_evidence_case_table(output_dir, table_rows)
+            skipped.append("fig_evidence_chain_case: no real routing_weight was found; wrote table_evidence_chain_case instead.")
+        else:
+            skipped.append("fig_evidence_chain_case: no real evidence-chain case with rationale was found.")
         return
+    (output_dir / "evidence_chain_case_source.json").write_text(json.dumps(case, indent=2, sort_keys=True), encoding="utf-8")
     chains = case["chains"][:3]
     fig, ax = plt.subplots(figsize=(7.2, 3.8))
     ax.axis("off")
@@ -192,7 +200,7 @@ def _figure7(output_dir: Path, skipped: list[str]) -> None:
     for idx, chain in enumerate(chains):
         y = 0.82 - idx * 0.28
         nodes = chain.get("chain_nodes", [])
-        neighbor = nodes[-1] if nodes else str(chain.get("neighbor_idx", "neighbor"))
+        neighbor = str(chain.get("neighbor_id", nodes[-1] if nodes else chain.get("neighbor_idx", "neighbor")))
         ax.annotate("", xy=(0.3, y), xytext=(0.12, 0.5), arrowprops={"arrowstyle": "->", "lw": 1.0})
         ax.text(0.45, y, f"{neighbor}\n{chain.get('mechanism', '')}", ha="center", va="center", fontsize=8, bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": "#72b7b2"})
         ax.text(0.78, y, f"w={float(chain['routing_weight']):.3f}\n{str(chain['rationale'])[:48]}", ha="center", va="center", fontsize=7)
@@ -246,8 +254,9 @@ def _read_table(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def _load_evidence_case() -> dict | None:
+def _load_evidence_case(output_dir: Path) -> dict | None:
     candidates = [
+        output_dir / "evidence_chain_case_source.json",
         Path("data/processed/yelp_academic/evidence_chains.jsonl"),
         *Path("outputs").glob("**/*case*.jsonl"),
         *Path("outputs").glob("**/*case*.json"),
@@ -255,14 +264,10 @@ def _load_evidence_case() -> dict | None:
     for path in candidates:
         if not path.exists() or path.is_dir():
             continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except Exception:
-                continue
+        for payload in _json_records(path):
             chains = payload.get("chains") if isinstance(payload, dict) else None
+            if chains is None and isinstance(payload, dict):
+                chains = payload.get("top_chains")
             if not chains:
                 continue
             normalized = []
@@ -275,6 +280,95 @@ def _load_evidence_case() -> dict | None:
             if normalized:
                 return {**payload, "chains": normalized}
     return None
+
+
+def _load_textual_evidence_case_rows() -> list[dict[str, object]]:
+    candidates = [
+        Path("data/processed/yelp_academic/evidence_chains.jsonl"),
+        Path("data/processed/yelp_academic/llm_labels.jsonl"),
+        *Path("outputs").glob("**/examples.jsonl"),
+    ]
+    rows: list[dict[str, object]] = []
+    for path in candidates:
+        if not path.exists() or path.is_dir():
+            continue
+        for payload in _json_records(path):
+            if not isinstance(payload, dict):
+                continue
+            rows.extend(_textual_rows_from_payload(payload))
+            if len(rows) >= 5:
+                return rows[:5]
+    return rows[:5]
+
+
+def _textual_rows_from_payload(payload: dict) -> list[dict[str, object]]:
+    chains = payload.get("chains") or payload.get("top_chains")
+    if isinstance(chains, list):
+        target_id = payload.get("target_id", payload.get("target_idx", ""))
+        rows = []
+        for chain in chains:
+            if not isinstance(chain, dict) or "rationale" not in chain:
+                continue
+            nodes = chain.get("chain_nodes", [])
+            row_target = chain.get("target_id", target_id or (nodes[0] if nodes else ""))
+            rows.append(
+                {
+                    "target_id": row_target,
+                    "neighbor_id": chain.get("neighbor_id", chain.get("neighbor_idx", nodes[-1] if nodes else "")),
+                    "mechanism": chain.get("mechanism", ""),
+                    "risk_relevance": chain.get("risk_relevance", ""),
+                    "confidence": chain.get("confidence", ""),
+                    "rationale": chain.get("rationale", ""),
+                    "kept_or_filtered": chain.get("kept_or_filtered", "kept"),
+                }
+            )
+        return rows
+    if {"target_id", "neighbor_id", "rationale"}.issubset(payload):
+        return [
+            {
+                "target_id": payload.get("target_id", ""),
+                "neighbor_id": payload.get("neighbor_id", ""),
+                "mechanism": payload.get("mechanism", ""),
+                "risk_relevance": payload.get("risk_relevance", ""),
+                "confidence": payload.get("confidence", ""),
+                "rationale": payload.get("rationale", ""),
+                "kept_or_filtered": payload.get("kept_or_filtered", "candidate"),
+            }
+        ]
+    return []
+
+
+def _write_evidence_case_table(output_dir: Path, rows: list[dict[str, object]]) -> None:
+    frame = pd.DataFrame(rows)
+    stem = output_dir / "table_evidence_chain_case"
+    frame.to_csv(stem.with_suffix(".csv"), index=False)
+    stem.with_suffix(".md").write_text(_to_markdown(frame), encoding="utf-8")
+    stem.with_suffix(".tex").write_text(frame.to_latex(index=False, escape=True), encoding="utf-8")
+
+
+def _json_records(path: Path) -> list[dict]:
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            return [payload]
+    except Exception:
+        pass
+    records = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
 
 
 def _has_methods(table: pd.DataFrame, methods: list[str]) -> bool:
@@ -300,6 +394,16 @@ def _metric_column(table: pd.DataFrame, metric: str) -> str | None:
         if candidate in table.columns:
             return candidate
     return None
+
+
+def _to_markdown(frame: pd.DataFrame) -> str:
+    columns = [str(col) for col in frame.columns]
+    if not columns:
+        return "\n"
+    lines = ["| " + " | ".join(columns) + " |", "| " + " | ".join(["---"] * len(columns)) + " |"]
+    for _, row in frame.iterrows():
+        lines.append("| " + " | ".join(str(row[col]) for col in frame.columns) + " |")
+    return "\n".join(lines) + "\n"
 
 
 def _save(fig, output_dir: Path, stem: str) -> None:
