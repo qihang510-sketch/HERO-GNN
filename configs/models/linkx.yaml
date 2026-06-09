@@ -1,0 +1,8 @@
+name: linkx
+display_name: LINKX
+implementation_source: reproduced
+core_components:
+  - feature pathway
+  - sparse structure projection pathway
+  - feature-structure fusion
+forbidden_lite_name: false

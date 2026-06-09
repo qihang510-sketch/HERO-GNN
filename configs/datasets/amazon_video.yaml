@@ -1,0 +1,25 @@
+name: amazon_video
+type: text-rich proxy review graph
+raw_dir: data/raw/amazon_video
+accepted_raw_files:
+  - reviews.json.gz
+  - meta.json.gz
+  - Video_Games.json.gz
+  - meta_Video_Games.json.gz
+  - reviews_Amazon_Instant_Video_5.json.gz
+processed_dir: data/processed/amazon_video
+primary_method: hero_gnn
+label_source: proxy
+models:
+  - mlp
+  - gcn
+  - gat
+  - graphsage
+  - care_gnn
+  - graphconsis
+  - pc_gnn
+  - bwgnn
+  - linkx
+  - dgp
+  - mled
+  - hero_gnn

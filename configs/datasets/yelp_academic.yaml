@@ -1,0 +1,19 @@
+name: yelp_academic
+type: text-rich proxy review graph
+raw_dir: data/raw/yelp_academic
+processed_dir: data/processed/yelp_academic
+primary_method: hero_gnn
+label_source: proxy
+models:
+  - mlp
+  - gcn
+  - gat
+  - graphsage
+  - care_gnn
+  - graphconsis
+  - pc_gnn
+  - bwgnn
+  - linkx
+  - dgp
+  - mled
+  - hero_gnn

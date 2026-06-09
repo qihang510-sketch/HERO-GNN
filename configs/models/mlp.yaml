@@ -1,0 +1,4 @@
+name: mlp
+display_name: MLP
+implementation_source: benchmark
+forbidden_lite_name: false

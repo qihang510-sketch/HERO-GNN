@@ -1,0 +1,8 @@
+name: pc_gnn
+display_name: PC-GNN
+implementation_source: reproduced
+core_components:
+  - imbalance-aware training
+  - positive-class oversampling
+  - graph neighborhood classifier
+forbidden_lite_name: false

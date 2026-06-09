@@ -484,6 +484,8 @@ def train_single_experiment(
         payload["disable_llm_fallback"] = True
     payload.update(stage_times)
     payload["time_total_sec"] = time.perf_counter() - time_total_start
+    np.save(paths["predictions"], eval_test_scores.astype(np.float32))
+    payload["predictions_file"] = str(paths["predictions"])
 
     write_json(paths["metrics"], payload)
     _write_checkpoint(paths["checkpoint"], checkpoint, payload)
@@ -2948,6 +2950,7 @@ def _experiment_paths(
     log_dir.mkdir(parents=True, exist_ok=True)
     return {
         "metrics": result_dir / "metrics.json",
+        "predictions": result_dir / "predictions.npy",
         "checkpoint": checkpoint_dir / "best.pt",
         "log": log_dir / f"seed_{seed}.log",
     }

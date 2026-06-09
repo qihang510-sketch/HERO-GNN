@@ -1,0 +1,8 @@
+name: graphconsis
+display_name: GraphConsis
+implementation_source: reproduced
+core_components:
+  - feature inconsistency
+  - context inconsistency
+  - consistency-weighted aggregation
+forbidden_lite_name: false

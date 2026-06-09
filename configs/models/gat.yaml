@@ -1,0 +1,4 @@
+name: gat
+display_name: GAT
+implementation_source: benchmark
+forbidden_lite_name: false

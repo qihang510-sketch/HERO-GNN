@@ -1,0 +1,4 @@
+name: gcn
+display_name: GCN
+implementation_source: benchmark
+forbidden_lite_name: false

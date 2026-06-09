@@ -1,0 +1,19 @@
+name: fraud_amazon
+aliases:
+  - fraud_amazon_official
+type: official fraud benchmark
+raw_dir: data/raw/fraud_amazon
+processed_dir: data/processed/fraud_amazon_official
+primary_method: hero_official
+label_source: official
+models:
+  - mlp
+  - gcn
+  - gat
+  - graphsage
+  - care_gnn
+  - graphconsis
+  - pc_gnn
+  - bwgnn
+  - linkx
+  - hero_official

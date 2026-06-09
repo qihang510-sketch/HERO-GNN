@@ -1,0 +1,7 @@
+name: bwgnn
+display_name: BWGNN
+implementation_source: reproduced
+core_components:
+  - beta-wavelet-style multi-scale filtering
+  - anomaly classification head
+forbidden_lite_name: false

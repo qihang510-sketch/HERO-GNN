@@ -1,0 +1,8 @@
+name: mled
+display_name: MLED
+implementation_source: reproduced
+requires_existing_annotations: true
+applicable_datasets:
+  - yelp_academic
+  - amazon_video
+forbidden_lite_name: false

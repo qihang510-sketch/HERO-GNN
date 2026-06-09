@@ -1,0 +1,17 @@
+name: elliptic
+type: transaction graph / financial fraud graph
+raw_dir: data/raw/elliptic
+processed_dir: data/processed/elliptic
+primary_method: hero_official
+label_source: official
+unknown_label_policy: kept_as_graph_context_excluded_from_loss
+models:
+  - mlp
+  - gcn
+  - gat
+  - graphsage
+  - bwgnn
+  - linkx
+  - hogrl
+  - rgtan
+  - hero_official

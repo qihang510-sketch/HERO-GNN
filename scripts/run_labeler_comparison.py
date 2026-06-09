@@ -34,8 +34,12 @@ OUTPUT_COLUMNS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare mock and real LLM mechanism label files.")
     parser.add_argument("--dataset", required=True, help="Dataset name.")
-    parser.add_argument("--label_files", nargs="+", required=True, help="JSONL label files to compare.")
+    parser.add_argument("--label_files", nargs="+", default=None, help="JSONL label files to compare.")
+    parser.add_argument("--labelers", nargs="*", default=None, help="Submission alias: labelers to compare, e.g. rule qwen.")
+    parser.add_argument("--seeds", nargs="*", type=int, default=None, help="Accepted for submission scripts; label files are seed-independent.")
+    parser.add_argument("--use_existing_annotations", default="true", help="Submission alias. Real LLM calls are not made by this script.")
     parser.add_argument("--out_dir", default="outputs/summary_llm", help="Output summary directory.")
+    parser.add_argument("--output_dir", default=None, help="Alias for --out_dir.")
     parser.add_argument("--out_file", default=None, help="Optional explicit CSV path.")
     parser.add_argument("--results_root", default="outputs/results_llm_comparison", help="Root containing tagged HERO-GNN results.")
     return parser.parse_args()
@@ -43,10 +47,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.output_dir or args.out_dir)
+    label_files = [Path(path) for path in args.label_files] if args.label_files else _resolve_label_files(args.dataset, args.labelers)
     rows = build_comparison_rows(
         args.dataset,
-        [Path(path) for path in args.label_files],
+        label_files,
         out_dir=out_dir,
         results_root=Path(args.results_root),
     )
@@ -54,6 +59,30 @@ def main() -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_csv(out_file, index=False)
     print(f"Wrote labeler comparison to {out_file}")
+
+
+def _resolve_label_files(dataset: str, labelers: list[str] | None) -> list[Path]:
+    processed_dir = Path("data/processed") / dataset
+    requested = [str(labeler).lower() for labeler in (labelers or ["rule", "qwen"])]
+    files: list[Path] = []
+    for labeler in requested:
+        candidates: list[Path]
+        if labeler in {"rule", "mock"}:
+            candidates = [
+                processed_dir / "llm_labels.jsonl",
+                processed_dir / "llm_labels_mock.jsonl",
+                *sorted(processed_dir.glob("*mock*.jsonl")),
+            ]
+        elif labeler in {"qwen", "local_qwen", "qwen2.5", "qwen2p5_7b"}:
+            candidates = [*sorted(processed_dir.glob("*qwen*.jsonl")), *sorted(processed_dir.glob("*Qwen*.jsonl"))]
+        else:
+            candidates = [*sorted(processed_dir.glob(f"*{labeler}*.jsonl"))]
+        found = next((path for path in candidates if path.exists()), None)
+        if found is None:
+            print(f"[WARNING] Missing existing annotations for labeler={labeler} dataset={dataset}; no fake row will be generated.")
+            continue
+        files.append(found)
+    return list(dict.fromkeys(files))
 
 
 def build_comparison_rows(

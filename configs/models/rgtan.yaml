@@ -1,0 +1,6 @@
+name: rgtan
+display_name: RGTAN
+implementation_source: reproduced
+applicable_datasets:
+  - elliptic
+forbidden_lite_name: false

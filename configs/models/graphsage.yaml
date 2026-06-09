@@ -1,0 +1,4 @@
+name: graphsage
+display_name: GraphSAGE
+implementation_source: benchmark
+forbidden_lite_name: false

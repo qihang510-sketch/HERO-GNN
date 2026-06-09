@@ -1,0 +1,19 @@
+name: fraud_yelp
+aliases:
+  - fraud_yelp_official
+type: official fraud benchmark
+raw_dir: data/raw/fraud_yelp
+processed_dir: data/processed/fraud_yelp_official
+primary_method: hero_official
+label_source: official
+models:
+  - mlp
+  - gcn
+  - gat
+  - graphsage
+  - care_gnn
+  - graphconsis
+  - pc_gnn
+  - bwgnn
+  - linkx
+  - hero_official

@@ -1,0 +1,8 @@
+name: care_gnn
+display_name: CARE-GNN
+implementation_source: reproduced
+core_components:
+  - relation-aware neighbor selection
+  - prediction-aware similarity
+  - per-relation neighbor budget
+forbidden_lite_name: false

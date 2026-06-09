@@ -37,7 +37,7 @@ def preprocess_amazon_video(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    review_path = raw_dir / "reviews_Amazon_Instant_Video_5.json.gz"
+    review_path = _resolve_amazon_review_path(raw_dir)
     _require_files([review_path])
 
     reviews = _read_gzip_records(review_path, max_records=max_reviews)
@@ -62,6 +62,18 @@ def preprocess_amazon_video(
         final_feature_dim=final_feature_dim,
     )
     return output_dir
+
+
+def _resolve_amazon_review_path(raw_dir: Path) -> Path:
+    candidates = [
+        raw_dir / "reviews.json.gz",
+        raw_dir / "Video_Games.json.gz",
+        raw_dir / "reviews_Amazon_Instant_Video_5.json.gz",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
 
 
 def _read_gzip_records(path: Path, max_records: int | None = None) -> list[dict[str, Any]]:

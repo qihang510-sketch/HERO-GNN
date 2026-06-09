@@ -1,0 +1,6 @@
+name: hogrl
+display_name: HOGRL
+implementation_source: reproduced
+applicable_datasets:
+  - elliptic
+forbidden_lite_name: false

@@ -1,0 +1,7 @@
+name: dgp
+display_name: DGP
+implementation_source: reproduced
+applicable_datasets:
+  - yelp_academic
+  - amazon_video
+forbidden_lite_name: false
