@@ -43,22 +43,22 @@ ABLATION_VARIANTS = {
     "wo_llm_annotation": {
         "trainer_model": "hero_gnn",
         "name": "w/o LLM Annotation",
-        "hero_config": {"use_llm_annotation": False},
+        "hero_config": {"use_llm_annotation": False, "labeler_source": "rule_or_structure"},
     },
     "wo_heterophily_filter": {
         "trainer_model": "hero_gnn",
         "name": "w/o Heterophily Filter",
-        "hero_config": {"use_heterophily_filter": False},
+        "hero_config": {"use_heterophily_filter": False, "heterophily_weight_mode": "uniform"},
     },
     "wo_dual_branch_encoder": {
         "trainer_model": "hero_gnn",
         "name": "w/o Dual-Branch Encoder",
-        "hero_config": {"use_dual_branch_encoder": False},
+        "hero_config": {"use_dual_branch_encoder": False, "encoder_type": "single_branch"},
     },
     "wo_gated_fusion": {
         "trainer_model": "hero_gnn",
         "name": "w/o Gated Fusion",
-        "hero_config": {"use_gated_fusion": False, "fusion_type": "no_gate"},
+        "hero_config": {"use_gated_fusion": False, "fusion_type": "concat_linear"},
     },
 }
 
@@ -111,6 +111,9 @@ def main() -> None:
                 payload["ablation_name"] = str(spec["name"])
                 payload["trainer_model"] = str(spec["trainer_model"])
                 payload["hero_config"] = resolved_config
+                stale_skip = result_dir / "skip_reason.json"
+                if stale_skip.exists():
+                    stale_skip.unlink()
                 write_json(result_dir / "metrics.json", payload)
                 _write_ablation_config(result_dir, dataset, variant, seed, spec, args, resolved_config)
                 prediction_file = metrics.get("predictions_file")

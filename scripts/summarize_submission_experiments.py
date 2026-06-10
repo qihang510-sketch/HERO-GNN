@@ -110,6 +110,9 @@ def _resolve_ablation_dir(input_dir: Path, explicit: str | None) -> Path:
         return Path(explicit)
     if "ablation" in input_dir.name.lower():
         return input_dir
+    sibling = input_dir.parent / "ablation"
+    if sibling.exists():
+        return sibling
     return Path("outputs/submission_experiments_ablation")
 
 
@@ -257,7 +260,8 @@ def _ablation_table(ablation_dir: Path, min_seeds: int, warnings: list[str]) -> 
         warnings.append(f"ablation_dir contains no metrics or skip files: {ablation_dir}")
         return pd.DataFrame()
     table_rows = []
-    for dataset in ABLATION_DATASETS:
+    datasets = _ablation_datasets_present(frame, skip_frame)
+    for dataset in datasets:
         for variant in ABLATION_VARIANTS:
             subset = frame[(frame.get("dataset", pd.Series(dtype=str)) == dataset) & (frame.get("model", pd.Series(dtype=str)) == variant)] if not frame.empty else pd.DataFrame()
             skip_subset = skip_frame[(skip_frame.get("dataset", pd.Series(dtype=str)) == dataset) & (skip_frame.get("model", pd.Series(dtype=str)) == variant)] if not skip_frame.empty else pd.DataFrame()
@@ -285,6 +289,16 @@ def _ablation_table(ablation_dir: Path, min_seeds: int, warnings: list[str]) -> 
                 row[f"{metric}_mean_std"] = _mean_std_display(values)
             table_rows.append(row)
     return pd.DataFrame(table_rows)
+
+
+def _ablation_datasets_present(frame: pd.DataFrame, skip_frame: pd.DataFrame) -> list[str]:
+    datasets: list[str] = []
+    if not frame.empty and "dataset" in frame:
+        datasets.extend(frame["dataset"].dropna().astype(str).tolist())
+    if not skip_frame.empty and "dataset" in skip_frame:
+        datasets.extend(skip_frame["dataset"].dropna().astype(str).tolist())
+    present = [dataset for dataset in ABLATION_DATASETS if dataset in set(datasets)]
+    return present or ABLATION_DATASETS
 
 
 def _ablation_display_name(variant: str) -> str:

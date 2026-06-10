@@ -9,4 +9,7 @@ use_llm_annotation: true
 use_heterophily_filter: true
 use_dual_branch_encoder: true
 use_gated_fusion: true
+heterophily_weight_mode: relevance_confidence
+encoder_type: dual_branch
 fusion_type: gated
+labeler_source: llm_or_mock

@@ -38,8 +38,8 @@ if nn is not None:
             self.min_chain_gate = float(min_chain_gate)
             self.target_encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
             self.homo_encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
-            self.single_branch_encoder = nn.Sequential(nn.Linear(input_dim * 2, hidden_dim), nn.ReLU())
             hetero_input_dim = input_dim if hetero_input_dim is None else int(hetero_input_dim)
+            self.single_branch_encoder = nn.Sequential(nn.Linear(input_dim * 2 + hetero_input_dim, hidden_dim), nn.ReLU())
             mechanism_input_dim = num_mechanisms if mechanism_input_dim is None else int(mechanism_input_dim)
             self.hetero_encoder = nn.Sequential(nn.Linear(hetero_input_dim, hidden_dim), nn.ReLU())
             self.mechanism_encoder = nn.Sequential(nn.Linear(mechanism_input_dim, hidden_dim), nn.ReLU())
@@ -88,13 +88,15 @@ if nn is not None:
             if self.use_dual_branch_encoder:
                 target_repr = self.target_encoder(target_features)
                 homo_repr = self.homo_encoder(homo_neighbor_features)
+                if self.use_heterophily and not zero_hetero:
+                    hetero_repr = self.hetero_encoder(hetero_neighbor_features)
+                else:
+                    hetero_repr = torch.zeros_like(target_repr)
             else:
-                single_repr = self.single_branch_encoder(torch.cat([target_features, homo_neighbor_features], dim=1))
+                hetero_input = hetero_neighbor_features if self.use_heterophily and not zero_hetero else torch.zeros_like(hetero_neighbor_features)
+                single_repr = self.single_branch_encoder(torch.cat([target_features, homo_neighbor_features, hetero_input], dim=1))
                 target_repr = single_repr
                 homo_repr = torch.zeros_like(single_repr)
-            if self.use_heterophily and not zero_hetero:
-                hetero_repr = self.hetero_encoder(hetero_neighbor_features)
-            else:
                 hetero_repr = torch.zeros_like(target_repr)
             if self.use_heterophily and self.use_mechanism and not zero_mechanism:
                 mechanism_repr = self.mechanism_encoder(mechanism_features)

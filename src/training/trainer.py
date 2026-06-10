@@ -66,7 +66,10 @@ HERO_CONFIG_KEYS = (
     "use_heterophily_filter",
     "use_dual_branch_encoder",
     "use_gated_fusion",
+    "heterophily_weight_mode",
+    "encoder_type",
     "fusion_type",
+    "labeler_source",
 )
 DEFAULT_HERO_CONFIG: dict[str, Any] = {
     "use_risk_relevant_heterophily": True,
@@ -76,7 +79,10 @@ DEFAULT_HERO_CONFIG: dict[str, Any] = {
     "use_heterophily_filter": True,
     "use_dual_branch_encoder": True,
     "use_gated_fusion": True,
+    "heterophily_weight_mode": "relevance_confidence",
+    "encoder_type": "dual_branch",
     "fusion_type": "gated",
+    "labeler_source": "llm_or_mock",
 }
 
 
@@ -103,11 +109,23 @@ def _resolve_hero_config(model_name: str, overrides: dict[str, Any] | None = Non
         config["use_mechanism_annotation"] = False
         config["use_evidence_chain"] = False
         config["use_llm_annotation"] = False
+        config["heterophily_weight_mode"] = "disabled"
     if not bool(config["use_mechanism_annotation"]):
         config["use_llm_annotation"] = False
+    if not bool(config["use_llm_annotation"]):
+        config["labeler_source"] = "rule_or_structure"
+    if not bool(config["use_heterophily_filter"]):
+        config["heterophily_weight_mode"] = "uniform"
+    if not bool(config["use_dual_branch_encoder"]):
+        config["encoder_type"] = "single_branch"
     if not bool(config["use_gated_fusion"]) and str(config.get("fusion_type", "gated")) == "gated":
-        config["fusion_type"] = "no_gate"
+        config["fusion_type"] = "concat_linear"
+    if str(config.get("fusion_type", "gated")) == "no_gate":
+        config["fusion_type"] = "concat_linear"
+    config["heterophily_weight_mode"] = str(config.get("heterophily_weight_mode", "relevance_confidence"))
+    config["encoder_type"] = str(config.get("encoder_type", "dual_branch"))
     config["fusion_type"] = str(config.get("fusion_type", "gated"))
+    config["labeler_source"] = str(config.get("labeler_source", "llm_or_mock"))
     config["llm_annotation_enabled"] = bool(config["use_llm_annotation"])
     return config
 
@@ -1777,6 +1795,10 @@ def _write_hero_explanations(
         "branch_mask_hetero": int(variant_debug.get("branch_mask_hetero", 0)),
         "branch_mask_mechanism": int(variant_debug.get("branch_mask_mechanism", 0)),
         "branch_mask_chain": int(variant_debug.get("branch_mask_chain", 0)),
+        "labeler_source": str(variant_debug.get("labeler_source", "")),
+        "heterophily_weight_mode": str(variant_debug.get("heterophily_weight_mode", "")),
+        "encoder_type": str(variant_debug.get("encoder_type", "")),
+        "fusion_type": str(variant_debug.get("fusion_type", "")),
         "num_homophilic_neighbors_used": int(variant_debug.get("num_homophilic_neighbors_used", 0)),
         "num_heterophilic_neighbors_used": int(variant_debug.get("num_heterophilic_neighbors_used", 0)),
         "num_chains_used": int(variant_debug.get("num_chains_used", 0)),
@@ -1909,6 +1931,10 @@ def _write_variant_debug(
         "branch_mask_hetero": int(metrics.get("branch_mask_hetero", 0)),
         "branch_mask_mechanism": int(metrics.get("branch_mask_mechanism", 0)),
         "branch_mask_chain": int(metrics.get("branch_mask_chain", 0)),
+        "labeler_source": str(metrics.get("labeler_source", "")),
+        "heterophily_weight_mode": str(metrics.get("heterophily_weight_mode", "")),
+        "encoder_type": str(metrics.get("encoder_type", "")),
+        "fusion_type": str(metrics.get("fusion_type", "")),
         "num_homophilic_neighbors_used": int(metrics.get("num_homophilic_neighbors_used", 0)),
         "num_heterophilic_neighbors_used": int(metrics.get("num_heterophilic_neighbors_used", 0)),
         "num_chains_used": int(metrics.get("num_chains_used", 0)),
@@ -2641,10 +2667,17 @@ def _numpy_hero_fused_features(
     gated_mechanism = mechanism * mechanism_gate
     gated_chain = chain * chain_gate
     if not use_dual_branch_encoder:
-        target = 0.5 * (target + homo)
-        target_without = 0.5 * (target_without + homo_without)
+        target_parts = [target, homo]
+        target_without_parts = [target_without, homo_without]
+        if use_hetero:
+            target_parts.append(hetero)
+            target_without_parts.append(hetero_without)
+        target = np.mean(np.stack(target_parts, axis=0), axis=0).astype(np.float32)
+        target_without = np.mean(np.stack(target_without_parts, axis=0), axis=0).astype(np.float32)
         homo = np.zeros_like(homo)
         homo_without = np.zeros_like(homo_without)
+        gated_hetero = np.zeros_like(gated_hetero)
+        hetero_without = np.zeros_like(hetero_without)
     zero_hetero = np.zeros_like(gated_hetero, dtype=np.float32)
     zero_mechanism = np.zeros_like(gated_mechanism, dtype=np.float32)
     zero_chain = np.zeros_like(gated_chain, dtype=np.float32)
