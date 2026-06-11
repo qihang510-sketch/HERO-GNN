@@ -1,10 +1,55 @@
 model: hero_gnn
-description: Lightweight random search space for text-rich HERO-GNN tuning.
-search_method: random
+description: Lightweight safe-first search space for text-rich HERO-GNN tuning.
+search_method: safe_first_random
+default_search_mode: safe
 ranking:
-  primary: AUPRC_mean
-  tie_breaker_1: Macro-F1_mean
-  tie_breaker_2: AUROC_mean
+  single_dataset:
+    primary: AUPRC_mean
+    tie_breaker_1: Macro-F1_mean
+    tie_breaker_2: AUROC_mean
+  joint:
+    primary: mean_AUPRC_across_datasets
+    tie_breaker_1: min_AUPRC_across_datasets
+    tie_breaker_2: Macro-F1_mean
+safe_trials:
+  - trial_id: baseline
+    description: Original configs/models/hero_gnn.yaml.
+    overrides: {}
+  - trial_id: only_disable_gated_fusion
+    overrides:
+      use_gated_fusion: false
+      fusion_type: concat_linear
+  - trial_id: only_low_threshold
+    overrides:
+      risk_relevance_threshold: 0.2
+  - trial_id: only_softmax_heterophily
+    overrides:
+      heterophily_weight_mode: softmax
+  - trial_id: only_uniform_heterophily
+    overrides:
+      heterophily_weight_mode: uniform
+  - trial_id: lower_hetero_weight
+    overrides:
+      hetero_branch_weight: 0.4
+  - trial_id: lower_chain_loss
+    overrides:
+      chain_loss_weight: 0.0
+      routing_loss_weight: 0.0
+  - trial_id: no_auxiliary_loss
+    overrides:
+      mechanism_loss_weight: 0.0
+      chain_loss_weight: 0.0
+      routing_loss_weight: 0.0
+  - trial_id: disable_gated_plus_low_threshold
+    overrides:
+      use_gated_fusion: false
+      fusion_type: concat_linear
+      risk_relevance_threshold: 0.2
+  - trial_id: disable_gated_plus_softmax
+    overrides:
+      use_gated_fusion: false
+      fusion_type: concat_linear
+      heterophily_weight_mode: softmax
 search_space:
   fusion_type:
     - gated
