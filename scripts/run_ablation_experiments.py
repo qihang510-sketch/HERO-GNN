@@ -15,7 +15,7 @@ from src.training.submission import (  # noqa: E402
     resolve_processed_dir,
     write_skip,
 )
-from src.training.trainer import _resolve_hero_config, train_single_experiment  # noqa: E402
+from src.training.trainer import HERO_CONFIG_KEYS, _resolve_hero_config, train_single_experiment  # noqa: E402
 from src.utils.io import write_json  # noqa: E402
 
 
@@ -69,9 +69,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--output_dir", default="outputs/submission_experiments_ablation")
     parser.add_argument("--data_root", default="data")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--config", default=None, help="Optional HERO-GNN tuned config used as the base for every ablation variant.")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--hidden_dim", type=int, default=None)
+    parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -80,6 +82,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
+    base_hero_config, base_trainer_config, base_config_source = _load_base_config(args.config)
     for dataset in args.datasets:
         data_dir = resolve_processed_dir(dataset, args.data_root)
         for seed in args.seeds:
@@ -92,16 +95,21 @@ def main() -> None:
                     write_skip(result_dir, dataset, variant, seed, "Missing dataset files. This is expected on local VSCode. Please run on AutoDL or provide data path.")
                     print(f"[skipped] {dataset}/{variant}/seed_{seed}: missing data")
                     continue
-                resolved_config = _resolve_hero_config(str(spec["trainer_model"]), dict(spec.get("hero_config", {})))
+                variant_overrides = dict(spec.get("hero_config", {}))
+                merged_config = {**base_hero_config, **variant_overrides}
+                resolved_config = _resolve_hero_config(str(spec["trainer_model"]), merged_config)
+                warnings = _variant_warnings(variant, base_hero_config, resolved_config)
+                trainer_params = _resolve_trainer_params(args, base_trainer_config, resolved_config)
                 metrics = train_single_experiment(
                     dataset=dataset,
                     model_name=str(spec["trainer_model"]),
                     seed=seed,
                     data_dir=data_dir,
                     output_root=output_dir / "_project_runs",
-                    epochs=args.epochs,
-                    lr=args.lr,
-                    hidden_dim=args.hidden_dim,
+                    epochs=trainer_params["epochs"],
+                    lr=trainer_params["lr"],
+                    hidden_dim=trainer_params["hidden_dim"],
+                    top_k=trainer_params["top_k"],
                     device=args.device,
                     hero_config=resolved_config,
                 )
@@ -111,11 +119,26 @@ def main() -> None:
                 payload["ablation_name"] = str(spec["name"])
                 payload["trainer_model"] = str(spec["trainer_model"])
                 payload["hero_config"] = resolved_config
+                payload["base_config"] = base_config_source
+                if warnings:
+                    payload["warning"] = "; ".join(warnings)
                 stale_skip = result_dir / "skip_reason.json"
                 if stale_skip.exists():
                     stale_skip.unlink()
                 write_json(result_dir / "metrics.json", payload)
-                _write_ablation_config(result_dir, dataset, variant, seed, spec, args, resolved_config)
+                _write_ablation_config(
+                    result_dir=result_dir,
+                    dataset=dataset,
+                    variant=variant,
+                    seed=seed,
+                    spec=spec,
+                    resolved_config=resolved_config,
+                    base_config_source=base_config_source,
+                    base_hero_config=base_hero_config,
+                    variant_overrides=variant_overrides,
+                    trainer_params=trainer_params,
+                    warnings=warnings,
+                )
                 prediction_file = metrics.get("predictions_file")
                 if prediction_file and Path(str(prediction_file)).exists():
                     shutil.copyfile(str(prediction_file), result_dir / "predictions.npy")
@@ -123,17 +146,83 @@ def main() -> None:
                 print(f"[ok] {result_dir / 'metrics.json'}")
 
 
-def _write_ablation_config(result_dir: Path, dataset: str, variant: str, seed: int, spec: dict, args: argparse.Namespace, resolved_config: dict) -> None:
+def _load_base_config(config_path: str | None) -> tuple[dict, dict, str]:
+    if config_path is None:
+        return {}, {}, ""
+    path = Path(config_path)
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    hero_source = payload.get("hero_config") if isinstance(payload.get("hero_config"), dict) else payload
+    hero_config = {key: value for key, value in dict(hero_source).items() if key in HERO_CONFIG_KEYS}
+    trainer_config: dict = {}
+    for source in (payload, hero_source):
+        if not isinstance(source, dict):
+            continue
+        for source_key, target_key in [
+            ("learning_rate", "lr"),
+            ("lr", "lr"),
+            ("epochs", "epochs"),
+            ("hidden_dim", "hidden_dim"),
+            ("top_k", "top_k"),
+        ]:
+            if source_key in source:
+                trainer_config[target_key] = source[source_key]
+    if "neighbor_budget" in hero_config and "top_k" not in trainer_config:
+        trainer_config["top_k"] = hero_config["neighbor_budget"]
+    return hero_config, trainer_config, str(path)
+
+
+def _resolve_trainer_params(args: argparse.Namespace, base_trainer_config: dict, resolved_config: dict) -> dict:
+    top_k_default = int(resolved_config.get("neighbor_budget", 10))
+    return {
+        "epochs": int(args.epochs if args.epochs is not None else base_trainer_config.get("epochs", 50)),
+        "lr": float(args.lr if args.lr is not None else base_trainer_config.get("lr", 0.001)),
+        "hidden_dim": int(args.hidden_dim if args.hidden_dim is not None else base_trainer_config.get("hidden_dim", 64)),
+        "top_k": int(args.top_k if args.top_k is not None else base_trainer_config.get("top_k", top_k_default)),
+    }
+
+
+def _variant_warnings(variant: str, base_hero_config: dict, resolved_config: dict) -> list[str]:
+    warnings = []
+    if variant == "wo_gated_fusion" and base_hero_config:
+        base_gated = bool(base_hero_config.get("use_gated_fusion", True))
+        base_fusion_type = str(base_hero_config.get("fusion_type", "gated"))
+        if not base_gated or base_fusion_type != "gated":
+            warnings.append("base config already disables gated fusion")
+    if variant == "wo_heterophily_filter" and base_hero_config and not bool(base_hero_config.get("use_heterophily_filter", True)):
+        warnings.append("base config already disables heterophily filter")
+    if variant == "wo_dual_branch_encoder" and base_hero_config and not bool(base_hero_config.get("use_dual_branch_encoder", True)):
+        warnings.append("base config already disables dual-branch encoder")
+    return warnings
+
+
+def _write_ablation_config(
+    result_dir: Path,
+    dataset: str,
+    variant: str,
+    seed: int,
+    spec: dict,
+    resolved_config: dict,
+    base_config_source: str,
+    base_hero_config: dict,
+    variant_overrides: dict,
+    trainer_params: dict,
+    warnings: list[str],
+) -> None:
     payload = {
         "dataset": dataset,
+        "base_config": base_config_source,
         "variant": variant,
         "ablation_name": str(spec["name"]),
         "model_name": str(spec["trainer_model"]),
         "seed": int(seed),
-        "epochs": int(args.epochs),
-        "lr": float(args.lr),
-        "hidden_dim": int(args.hidden_dim),
+        "epochs": int(trainer_params["epochs"]),
+        "lr": float(trainer_params["lr"]),
+        "hidden_dim": int(trainer_params["hidden_dim"]),
+        "top_k": int(trainer_params["top_k"]),
+        "base_hero_config": base_hero_config,
+        "variant_overrides": variant_overrides,
         "hero_config": resolved_config,
+        "warning": "; ".join(warnings),
         **resolved_config,
     }
     (result_dir / "config_resolved.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
