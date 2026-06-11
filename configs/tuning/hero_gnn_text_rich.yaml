@@ -1,0 +1,68 @@
+model: hero_gnn
+description: Lightweight random search space for text-rich HERO-GNN tuning.
+search_method: random
+ranking:
+  primary: AUPRC_mean
+  tie_breaker_1: Macro-F1_mean
+  tie_breaker_2: AUROC_mean
+search_space:
+  fusion_type:
+    - gated
+    - concat_linear
+    - mean
+    - fixed_sum
+  use_gated_fusion:
+    - true
+    - false
+  risk_relevance_threshold:
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    - 0.6
+  neighbor_budget:
+    - 5
+    - 10
+    - 15
+    - 20
+    - 30
+  hetero_branch_weight:
+    - 0.2
+    - 0.4
+    - 0.6
+    - 0.8
+    - 1.0
+  heterophily_weight_mode:
+    - relevance_confidence
+    - softmax
+    - uniform
+  mechanism_loss_weight:
+    - 0.0
+    - 0.1
+    - 0.3
+    - 0.5
+  chain_loss_weight:
+    - 0.0
+    - 0.1
+    - 0.3
+    - 0.5
+  routing_loss_weight:
+    - 0.0
+    - 0.1
+    - 0.3
+  learning_rate:
+    - 0.001
+    - 0.0005
+    - 0.0001
+  dropout:
+    - 0.2
+    - 0.3
+    - 0.5
+  weight_decay:
+    - 0.0
+    - 0.00001
+    - 0.0001
+  class_weight_strategy:
+    - none
+    - inverse_frequency
+    - effective_number

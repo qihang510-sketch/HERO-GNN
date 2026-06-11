@@ -27,6 +27,7 @@ if nn is not None:
             mechanism_input_dim: int | None = None,
             chain_input_dim: int | None = None,
             min_chain_gate: float = 0.05,
+            dropout: float = 0.0,
         ) -> None:
             super().__init__()
             self.use_heterophily = use_heterophily
@@ -36,6 +37,7 @@ if nn is not None:
             self.use_gated_fusion = bool(use_gated_fusion)
             self.fusion_type = str(fusion_type or "gated")
             self.min_chain_gate = float(min_chain_gate)
+            self.dropout = nn.Dropout(float(dropout))
             self.target_encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
             self.homo_encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
             hetero_input_dim = input_dim if hetero_input_dim is None else int(hetero_input_dim)
@@ -141,7 +143,7 @@ if nn is not None:
                     final_repr = torch.cat([pooled, pooled, pooled, pooled, pooled], dim=1)
                 else:
                     final_repr = self.concat_fusion(final_repr)
-            logits = self.classifier(final_repr).squeeze(-1)
+            logits = self.classifier(self.dropout(final_repr)).squeeze(-1)
             gates = {
                 "target_gate": torch.ones_like(target_repr),
                 "homo_gate": torch.ones_like(homo_repr),

@@ -70,6 +70,15 @@ HERO_CONFIG_KEYS = (
     "encoder_type",
     "fusion_type",
     "labeler_source",
+    "risk_relevance_threshold",
+    "neighbor_budget",
+    "hetero_branch_weight",
+    "mechanism_loss_weight",
+    "chain_loss_weight",
+    "routing_loss_weight",
+    "dropout",
+    "weight_decay",
+    "class_weight_strategy",
 )
 DEFAULT_HERO_CONFIG: dict[str, Any] = {
     "use_risk_relevant_heterophily": True,
@@ -83,6 +92,15 @@ DEFAULT_HERO_CONFIG: dict[str, Any] = {
     "encoder_type": "dual_branch",
     "fusion_type": "gated",
     "labeler_source": "llm_or_mock",
+    "risk_relevance_threshold": 0.0,
+    "neighbor_budget": 5,
+    "hetero_branch_weight": 1.0,
+    "mechanism_loss_weight": 0.0,
+    "chain_loss_weight": 0.03,
+    "routing_loss_weight": 0.01,
+    "dropout": 0.0,
+    "weight_decay": 0.0001,
+    "class_weight_strategy": "inverse_frequency",
 }
 
 
@@ -114,18 +132,38 @@ def _resolve_hero_config(model_name: str, overrides: dict[str, Any] | None = Non
         config["use_llm_annotation"] = False
     if not bool(config["use_llm_annotation"]):
         config["labeler_source"] = "rule_or_structure"
+    if str(config.get("labeler_source", "")).lower() in {"rule", "mock", "rule_or_structure", "structure"}:
+        config["use_llm_annotation"] = False
     if not bool(config["use_heterophily_filter"]):
         config["heterophily_weight_mode"] = "uniform"
+    if str(config.get("heterophily_weight_mode", "")).lower() == "uniform":
+        config["use_heterophily_filter"] = False
     if not bool(config["use_dual_branch_encoder"]):
         config["encoder_type"] = "single_branch"
+    if str(config.get("encoder_type", "")).lower() == "single_branch":
+        config["use_dual_branch_encoder"] = False
     if not bool(config["use_gated_fusion"]) and str(config.get("fusion_type", "gated")) == "gated":
         config["fusion_type"] = "concat_linear"
     if str(config.get("fusion_type", "gated")) == "no_gate":
         config["fusion_type"] = "concat_linear"
+    if str(config.get("fusion_type", "gated")) in {"concat_linear", "mean", "fixed_sum"}:
+        config["use_gated_fusion"] = False
     config["heterophily_weight_mode"] = str(config.get("heterophily_weight_mode", "relevance_confidence"))
     config["encoder_type"] = str(config.get("encoder_type", "dual_branch"))
     config["fusion_type"] = str(config.get("fusion_type", "gated"))
     config["labeler_source"] = str(config.get("labeler_source", "llm_or_mock"))
+    for key in (
+        "risk_relevance_threshold",
+        "hetero_branch_weight",
+        "mechanism_loss_weight",
+        "chain_loss_weight",
+        "routing_loss_weight",
+        "dropout",
+        "weight_decay",
+    ):
+        config[key] = float(config.get(key, DEFAULT_HERO_CONFIG[key]))
+    config["neighbor_budget"] = int(config.get("neighbor_budget", DEFAULT_HERO_CONFIG["neighbor_budget"]))
+    config["class_weight_strategy"] = str(config.get("class_weight_strategy", "inverse_frequency"))
     config["llm_annotation_enabled"] = bool(config["use_llm_annotation"])
     return config
 
@@ -306,10 +344,18 @@ def train_single_experiment(
         val_labels=graph.labels[val_idx],
         test_labels=graph.labels[test_idx],
     )
-    pos_weight = _pos_weight_from_counts(class_stats["train_num_pos"], class_stats["train_num_neg"])
+    resolved_hero_config = _resolve_hero_config(model_name, hero_config) if model_name in HERO_MODEL_NAMES else {}
+    pos_weight = (
+        _pos_weight_from_strategy(
+            class_stats["train_num_pos"],
+            class_stats["train_num_neg"],
+            str(resolved_hero_config.get("class_weight_strategy", "inverse_frequency")),
+        )
+        if model_name in HERO_MODEL_NAMES
+        else _pos_weight_from_counts(class_stats["train_num_pos"], class_stats["train_num_neg"])
+    )
     print(f"[TRAIN-INFO] dataset={dataset} model={model_name} seed={seed}")
     print(f"[TRAIN-INFO] train_pos={class_stats['train_num_pos']} train_neg={class_stats['train_num_neg']} pos_weight={pos_weight:.6f}")
-    resolved_hero_config = _resolve_hero_config(model_name, hero_config) if model_name in HERO_MODEL_NAMES else {}
     if model_name in HERO_MODEL_NAMES:
         variant_flags = _hero_variant_flags(model_name, resolved_hero_config)
         branch_masks = _hero_branch_masks(model_name, resolved_hero_config)
@@ -351,18 +397,28 @@ def train_single_experiment(
     )
 
     if model_name in HERO_MODEL_NAMES:
+        active_neighbor_budget = int(resolved_hero_config.get("neighbor_budget", heterophilic_topk))
+        active_heterophilic_topk = max(0, active_neighbor_budget)
+        active_candidate_budget = max(int(max_candidates_per_node), active_heterophilic_topk)
+        active_min_chain_quality = (
+            float(resolved_hero_config.get("risk_relevance_threshold", min_chain_quality))
+            if hero_config is not None and "risk_relevance_threshold" in hero_config
+            else float(min_chain_quality)
+        )
+        active_lambda_chain_pos = float(resolved_hero_config.get("chain_loss_weight", lambda_chain_pos))
+        active_lambda_chain_neg = float(resolved_hero_config.get("routing_loss_weight", lambda_chain_neg))
         features, features_without_chains, hero_artifacts = _prepare_hero_features(
             graph=graph,
             data_dir=data_dir,
             model_name=model_name,
             target_indices=np.concatenate([train_idx, val_idx, test_idx]),
             homophilic_topk=homophilic_topk,
-            heterophilic_topk=heterophilic_topk,
+            heterophilic_topk=active_heterophilic_topk,
             max_target_nodes=max_target_nodes,
-            max_candidates_per_node=max_candidates_per_node,
+            max_candidates_per_node=active_candidate_budget,
             topk_chains=topk_chains,
             max_chain_length=max_chain_length,
-            min_chain_quality=min_chain_quality,
+            min_chain_quality=active_min_chain_quality,
             llm_label_file=llm_label_file,
             experiment_tag=experiment_tag,
             llm_labeler=llm_labeler,
@@ -393,9 +449,11 @@ def train_single_experiment(
             use_dual_branch_encoder=bool(resolved_hero_config.get("use_dual_branch_encoder", True)),
             use_gated_fusion=bool(resolved_hero_config.get("use_gated_fusion", True)),
             fusion_type=str(resolved_hero_config.get("fusion_type", "gated")),
-            lambda_chain_pos=float(lambda_chain_pos),
-            lambda_chain_neg=float(lambda_chain_neg),
-            min_chain_quality=float(min_chain_quality),
+            lambda_chain_pos=active_lambda_chain_pos,
+            lambda_chain_neg=active_lambda_chain_neg,
+            min_chain_quality=active_min_chain_quality,
+            dropout=float(resolved_hero_config.get("dropout", 0.0)),
+            weight_decay=float(resolved_hero_config.get("weight_decay", 1e-4)),
             device=device_name,
         )
         stage_times["time_training_sec"] += time.perf_counter() - train_start
@@ -600,6 +658,18 @@ def _pos_weight_from_counts(num_pos: int, num_neg: int) -> float:
     return float(num_neg / max(num_pos, 1))
 
 
+def _pos_weight_from_strategy(num_pos: int, num_neg: int, strategy: str) -> float:
+    strategy = str(strategy or "inverse_frequency").lower()
+    if strategy == "none":
+        return 1.0
+    if strategy == "effective_number":
+        beta = 0.999
+        pos_eff = (1.0 - beta ** max(int(num_pos), 1)) / (1.0 - beta)
+        neg_eff = (1.0 - beta ** max(int(num_neg), 1)) / (1.0 - beta)
+        return float(neg_eff / max(pos_eff, 1e-6))
+    return _pos_weight_from_counts(num_pos, num_neg)
+
+
 def _prepare_features(graph: ProcessedGraphData, model_name: str, top_k: int) -> np.ndarray:
     if model_name == "mlp":
         return graph.features
@@ -661,6 +731,11 @@ def _prepare_hero_features(
     use_mechanism = bool(variant_flags["use_mechanism"])
     use_mock_llm_mechanism = bool(variant_flags["use_mock_llm_mechanism"])
     use_heterophily_filter = bool(resolved_config["use_heterophily_filter"])
+    heterophily_weight_mode = str(resolved_config.get("heterophily_weight_mode", "relevance_confidence"))
+    risk_relevance_threshold = float(resolved_config.get("risk_relevance_threshold", min_chain_quality))
+    hetero_branch_weight = float(resolved_config.get("hetero_branch_weight", 1.0))
+    mechanism_feature_scale = 1.0 + float(resolved_config.get("mechanism_loss_weight", 0.0))
+    chain_feature_scale = 1.0 + float(resolved_config.get("routing_loss_weight", 0.0))
     homo_edges = filter_topk_semantic_edges(graph.edge_index, graph.text_features, top_k=homophilic_topk)
     homo_agg = _neighbor_mean_features(graph.features, homo_edges)
     feature_dims = {
@@ -684,6 +759,8 @@ def _prepare_hero_features(
         "num_raw_chains": 0,
         "num_filtered_chains": 0,
         "chain_filter_keep_rate": 0.0,
+        "effective_heterophilic_topk": int(heterophilic_topk),
+        "max_candidates_per_node": int(max_candidates_per_node),
     }
     if llm_label_file is not None or experiment_tag:
         base_debug.update(
@@ -747,7 +824,11 @@ def _prepare_hero_features(
         labels_by_target=labels_by_target,
         use_mechanism=use_mechanism,
         use_heterophily_filter=use_heterophily_filter,
+        weight_mode=heterophily_weight_mode,
+        min_risk_score=risk_relevance_threshold,
     )
+    hetero_features = (hetero_features * hetero_branch_weight).astype(np.float32)
+    mechanism_features = (mechanism_features * hetero_branch_weight * mechanism_feature_scale).astype(np.float32)
     usage_debug = {
         **base_debug,
         "num_heterophilic_neighbors_used": int(sum(len(labels) for labels in labels_by_target.values())),
@@ -790,7 +871,9 @@ def _prepare_hero_features(
         chains_by_idx,
         use_mechanism=use_mechanism,
         use_heterophily_filter=use_heterophily_filter,
+        weight_mode=heterophily_weight_mode,
     )
+    chain_features = (chain_features * chain_feature_scale).astype(np.float32)
     features = np.concatenate([graph.features, homo_agg, hetero_features, mechanism_features, chain_features], axis=1).astype(np.float32)
     features_without_chains = np.concatenate([graph.features, homo_agg, hetero_features, mechanism_features, zero_chain], axis=1).astype(np.float32)
     raw_count = int(sum(len(chains) for chains in raw_chains_by_idx.values()))
@@ -1298,6 +1381,7 @@ def _chain_feature_matrix(
     chains_by_idx: dict[int, list[dict[str, Any]]],
     use_mechanism: bool,
     use_heterophily_filter: bool = True,
+    weight_mode: str = "relevance_confidence",
 ) -> np.ndarray:
     dim = graph.features.shape[1]
     out_dim = dim + len(schema.EVIDENCE_MECHANISMS) + 2
@@ -1322,8 +1406,7 @@ def _chain_feature_matrix(
             quality = np.array([float(chain.get("chain_quality", 0.0))], dtype=np.float32)
             reps.append(np.concatenate([node_repr, mechanism, score, quality]))
             weights.append(max(float(chain.get("chain_quality", 0.0)), 1e-3) if use_heterophily_filter else 1.0)
-        weight_array = np.asarray(weights, dtype=np.float32)
-        weight_array = weight_array / np.maximum(float(np.sum(weight_array)), 1e-6)
+        weight_array = _normalize_hetero_weights(weights, weight_mode if use_heterophily_filter else "uniform")
         features[target_idx] = np.sum(np.asarray(reps, dtype=np.float32) * weight_array[:, None], axis=0)
     return features
 
@@ -1333,6 +1416,8 @@ def _hetero_feature_matrix(
     labels_by_target: dict[int, list[dict[str, Any]]],
     use_mechanism: bool,
     use_heterophily_filter: bool = True,
+    weight_mode: str = "relevance_confidence",
+    min_risk_score: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     hetero = np.zeros_like(graph.features, dtype=np.float32)
     mechanisms = np.zeros((graph.features.shape[0], len(schema.EVIDENCE_MECHANISMS)), dtype=np.float32)
@@ -1349,6 +1434,8 @@ def _hetero_feature_matrix(
             if neighbor_idx is None or not (0 <= int(neighbor_idx) < graph.features.shape[0]):
                 continue
             score = float(label.get("risk_score", label.get("confidence", 0.0)))
+            if use_heterophily_filter and score < float(min_risk_score):
+                continue
             weight = max(score, 1e-3) if use_heterophily_filter else 1.0
             node_reps.append(graph.features[int(neighbor_idx)])
             weights.append(weight)
@@ -1358,12 +1445,25 @@ def _hetero_feature_matrix(
                 mechanism_reps.append(mechanism)
         if not node_reps:
             continue
-        weight_array = np.asarray(weights, dtype=np.float32)
-        weight_array = weight_array / np.maximum(float(np.sum(weight_array)), 1e-6)
+        weight_array = _normalize_hetero_weights(weights, weight_mode if use_heterophily_filter else "uniform")
         hetero[int(target_idx)] = np.sum(np.asarray(node_reps, dtype=np.float32) * weight_array[:, None], axis=0)
         if use_mechanism and mechanism_reps:
             mechanisms[int(target_idx)] = np.sum(np.asarray(mechanism_reps, dtype=np.float32) * weight_array[:, None], axis=0)
     return hetero, mechanisms
+
+
+def _normalize_hetero_weights(weights: list[float], mode: str) -> np.ndarray:
+    weight_array = np.asarray(weights, dtype=np.float32)
+    if weight_array.size == 0:
+        return weight_array
+    mode = str(mode or "relevance_confidence").lower()
+    if mode == "uniform":
+        return np.full_like(weight_array, 1.0 / max(int(weight_array.size), 1), dtype=np.float32)
+    if mode == "softmax":
+        shifted = weight_array - float(np.max(weight_array))
+        exp = np.exp(shifted)
+        return (exp / np.maximum(float(np.sum(exp)), 1e-6)).astype(np.float32)
+    return (weight_array / np.maximum(float(np.sum(weight_array)), 1e-6)).astype(np.float32)
 
 
 def _edge_index_for_model(graph: ProcessedGraphData, model_name: str, top_k: int) -> np.ndarray:
@@ -2353,6 +2453,8 @@ def _fit_torch_feature_model(
     lambda_chain_pos: float = 0.0,
     lambda_chain_neg: float = 0.0,
     min_chain_quality: float = 0.45,
+    dropout: float = 0.0,
+    weight_decay: float = 1e-4,
     device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     if torch is None:
@@ -2377,6 +2479,7 @@ def _fit_torch_feature_model(
             lambda_chain_pos=lambda_chain_pos if model_name == "hero_gnn" else 0.0,
             lambda_chain_neg=lambda_chain_neg if model_name == "hero_gnn" else 0.0,
             min_chain_quality=min_chain_quality,
+            weight_decay=weight_decay,
         )
 
     from src.models.hero_gnn import HEROGNN
@@ -2403,8 +2506,9 @@ def _fit_torch_feature_model(
         hetero_input_dim=int(feature_dims["hetero_dim"]),
         mechanism_input_dim=int(feature_dims["mechanism_dim"]),
         chain_input_dim=int(feature_dims["chain_dim"]),
+        dropout=float(dropout),
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=float(weight_decay))
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device))
     best_state = None
     best_score = -1.0
@@ -2482,6 +2586,8 @@ def _fit_torch_feature_model(
             "use_dual_branch_encoder": bool(use_dual_branch_encoder),
             "use_gated_fusion": bool(use_gated_fusion),
             "fusion_type": str(fusion_type),
+            "dropout": float(dropout),
+            "weight_decay": float(weight_decay),
         }
     )
     return val_scores, test_scores, scores_without_chains, {
@@ -2513,6 +2619,7 @@ def _fit_numpy_feature_model(
     lambda_chain_pos: float = 0.0,
     lambda_chain_neg: float = 0.0,
     min_chain_quality: float = 0.45,
+    weight_decay: float = 1e-4,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     rng = np.random.default_rng(seed)
     active_lambda_pos = float(lambda_chain_pos) if use_chain else 0.0
@@ -2571,7 +2678,7 @@ def _fit_numpy_feature_model(
         probs = _sigmoid_np(logits)
         errors = (probs - train_y) * sample_weights
         denom = max(float(train_idx.size), 1.0)
-        grad_w = (grad_features.T @ errors) / denom + 1e-4 * weights
+        grad_w = (grad_features.T @ errors) / denom + float(weight_decay) * weights
         grad_b = np.sum(errors) / denom
         if active_lambda_pos > 0.0:
             chain_pos_loss, chain_grad_w, chain_grad_b = _numpy_chain_loss_grad(
@@ -2629,6 +2736,7 @@ def _fit_numpy_feature_model(
             "use_dual_branch_encoder": bool(use_dual_branch_encoder),
             "use_gated_fusion": bool(use_gated_fusion),
             "fusion_type": str(fusion_type),
+            "weight_decay": float(weight_decay),
         }
     )
     return (

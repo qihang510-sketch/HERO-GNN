@@ -23,7 +23,7 @@ from src.training.evaluator import (
     prediction_probability_stats,
     tune_threshold,
 )
-from src.training.trainer import train_single_experiment
+from src.training.trainer import HERO_CONFIG_KEYS, train_single_experiment
 from src.utils.io import write_json
 from src.utils.seed import set_seed
 
@@ -177,6 +177,7 @@ def run_submission_experiment(
     overwrite: bool = False,
     device: str = "auto",
     llm_label_file: str | Path | None = None,
+    config: str | Path | dict[str, Any] | None = None,
 ) -> SubmissionResult:
     dataset = normalize_dataset_name(dataset)
     model = normalize_model_name(model)
@@ -216,6 +217,7 @@ def run_submission_experiment(
                 {"data_dir": str(data_dir), **_split_validation_extra(split_status)},
             )
         if model in HERO_MODELS:
+            hero_config, trainer_overrides, config_source = _load_hero_runtime_config(config)
             return _run_project_hero(
                 dataset=dataset,
                 model=model,
@@ -229,6 +231,9 @@ def run_submission_experiment(
                 top_k=top_k,
                 device=device,
                 llm_label_file=llm_label_file,
+                hero_config=hero_config,
+                trainer_overrides=trainer_overrides,
+                config_source=config_source,
             )
         return _run_reproduced_baseline(
             graph=graph,
@@ -303,6 +308,35 @@ def write_skip(
     return SubmissionResult(dataset, model, seed, "skipped", path, reason)
 
 
+def _load_hero_runtime_config(config: str | Path | dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any], str]:
+    if config is None:
+        return {}, {}, ""
+    if isinstance(config, dict):
+        payload = dict(config)
+        source = str(payload.get("config_source", "inline"))
+    else:
+        path = Path(config)
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        source = str(path)
+    model_payload = payload.get("hero_config") if isinstance(payload.get("hero_config"), dict) else payload
+    hero_config = {key: value for key, value in dict(model_payload).items() if key in HERO_CONFIG_KEYS}
+    trainer_payload = dict(payload.get("trainer", {})) if isinstance(payload.get("trainer"), dict) else {}
+    for source_key, target_key in [
+        ("learning_rate", "lr"),
+        ("lr", "lr"),
+        ("hidden_dim", "hidden_dim"),
+        ("top_k", "top_k"),
+        ("epochs", "epochs"),
+    ]:
+        if source_key in payload:
+            trainer_payload[target_key] = payload[source_key]
+        if source_key in model_payload:
+            trainer_payload[target_key] = model_payload[source_key]
+    if "neighbor_budget" in hero_config and "top_k" not in trainer_payload:
+        trainer_payload["top_k"] = hero_config["neighbor_budget"]
+    return hero_config, trainer_payload, source
+
+
 def _run_project_hero(
     dataset: str,
     model: str,
@@ -316,21 +350,30 @@ def _run_project_hero(
     top_k: int,
     device: str,
     llm_label_file: str | Path | None,
+    hero_config: dict[str, Any] | None = None,
+    trainer_overrides: dict[str, Any] | None = None,
+    config_source: str = "",
 ) -> SubmissionResult:
     trainer_dataset = {"fraud_yelp": "fraud_yelp_official", "fraud_amazon": "fraud_amazon_official"}.get(dataset, dataset)
     internal_root = output_dir / "_project_runs"
+    trainer_overrides = trainer_overrides or {}
+    active_epochs = int(trainer_overrides.get("epochs", epochs))
+    active_lr = float(trainer_overrides.get("lr", lr))
+    active_hidden_dim = int(trainer_overrides.get("hidden_dim", hidden_dim))
+    active_top_k = int(trainer_overrides.get("top_k", top_k))
     metrics = train_single_experiment(
         dataset=trainer_dataset,
         model_name=model,
         seed=seed,
         data_dir=data_dir,
         output_root=internal_root,
-        epochs=epochs,
-        lr=lr,
-        hidden_dim=hidden_dim,
-        top_k=top_k,
+        epochs=active_epochs,
+        lr=active_lr,
+        hidden_dim=active_hidden_dim,
+        top_k=active_top_k,
         llm_label_file=llm_label_file,
         device=device,
+        hero_config=hero_config,
     )
     result_dir.mkdir(parents=True, exist_ok=True)
     converted = _submission_metric_payload(metrics, dataset, model, seed, MODEL_IMPLEMENTATION_SOURCE[model])
@@ -340,7 +383,25 @@ def _run_project_hero(
     prediction_file = metrics.get("predictions_file")
     if prediction_file and Path(str(prediction_file)).exists():
         shutil.copyfile(str(prediction_file), result_dir / "predictions.npy")
-    _write_config(result_dir, dataset, model, seed, data_dir, MODEL_IMPLEMENTATION_SOURCE[model], {"source": "train_single_experiment"})
+    _write_config(
+        result_dir,
+        dataset,
+        model,
+        seed,
+        data_dir,
+        MODEL_IMPLEMENTATION_SOURCE[model],
+        {
+            "source": "train_single_experiment",
+            "config_source": config_source,
+            "hero_config": hero_config or {},
+            "trainer_overrides": {
+                "epochs": active_epochs,
+                "lr": active_lr,
+                "hidden_dim": active_hidden_dim,
+                "top_k": active_top_k,
+            },
+        },
+    )
     _write_log(result_dir, [f"Completed {dataset}/{model}/seed_{seed} via project trainer."])
     return SubmissionResult(dataset, model, seed, "ok", result_dir / "metrics.json")
 

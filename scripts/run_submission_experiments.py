@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--llm_label_file", default=None, help="Optional annotation file for DGP/MLED/HERO text-rich runs.")
+    parser.add_argument("--config", default=None, help="Optional tuned config for hero_gnn/hero_official only.")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -53,6 +54,7 @@ def main() -> None:
                     overwrite=args.overwrite,
                     device=args.device,
                     llm_label_file=args.llm_label_file,
+                    config=args.config,
                 )
                 results.append(result)
                 print(f"[{result.status}] dataset={result.dataset} model={result.model} seed={result.seed} path={result.path} {result.reason}")

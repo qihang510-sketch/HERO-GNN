@@ -2,3 +2,11 @@ name: hero_official
 display_name: HERO-official
 implementation_source: project
 forbidden_lite_name: false
+official_hetero_score: feature_relation_degree
+risk_relevance_threshold: 0.3
+hetero_branch_weight: 0.6
+fusion_type: concat_linear
+class_weight_strategy: inverse_frequency
+learning_rate: 0.001
+dropout: 0.2
+weight_decay: 0.0001

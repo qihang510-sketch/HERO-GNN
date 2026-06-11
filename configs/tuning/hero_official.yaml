@@ -1,0 +1,39 @@
+model: hero_official
+description: Reserved lightweight search space for HERO-official tuning.
+search_method: random
+ranking:
+  primary: AUPRC_mean
+  tie_breaker_1: Macro-F1_mean
+  tie_breaker_2: AUROC_mean
+search_space:
+  official_hetero_score:
+    - feature_deviation_only
+    - relation_aware
+    - feature_relation_degree
+    - feature_relation_degree_rarity
+  risk_relevance_threshold:
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+  hetero_branch_weight:
+    - 0.2
+    - 0.4
+    - 0.6
+    - 0.8
+  fusion_type:
+    - concat_linear
+    - mean
+    - gated
+  class_weight_strategy:
+    - none
+    - inverse_frequency
+    - effective_number
+  learning_rate:
+    - 0.001
+    - 0.0005
+    - 0.0001
+  dropout:
+    - 0.2
+    - 0.3
+    - 0.5
