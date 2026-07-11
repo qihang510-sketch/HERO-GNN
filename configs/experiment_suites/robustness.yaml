@@ -1,0 +1,17 @@
+suite: robustness
+datasets:
+  - yelp_academic
+  - amazon_video
+model: hero
+seeds: [0, 1, 2, 3, 4]
+device: cuda
+output_dir: outputs/submission_unified
+noise_ratios: [0.10, 0.20, 0.30, 0.40]
+perturbations:
+  - random_flip_risk_relevance
+  - random_replace_mechanism_label
+  - confidence_gaussian_noise
+status: runnable_with_existing_or_fallback_annotations
+notes:
+  - uses cached LLM annotations when available; otherwise uses rule-based fallback annotations and marks annotation_source.
+  - all metrics must come from retraining HERO with the perturbed annotation file.

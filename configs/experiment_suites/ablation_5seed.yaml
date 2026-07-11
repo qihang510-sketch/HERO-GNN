@@ -1,0 +1,23 @@
+suite: ablation
+datasets:
+  - yelp_academic
+  - amazon_video
+variants:
+  - hero_gnn
+  - wo_risk_relevant_heterophily
+  - wo_mechanism_annotation
+  - wo_evidence_chain
+  - wo_llm_annotation
+  - wo_heterophily_filter
+  - wo_dual_branch_encoder
+  - wo_gated_fusion
+seeds: [0, 1, 2, 3, 4]
+device: cuda
+output_dir: outputs/submission_unified
+metrics:
+  - Macro-F1
+  - AUROC
+  - AUPRC
+notes:
+  - ablations are currently runnable for text-rich datasets only.
+  - variant names map to scripts.run_ablation_experiments.ABLATION_VARIANTS.

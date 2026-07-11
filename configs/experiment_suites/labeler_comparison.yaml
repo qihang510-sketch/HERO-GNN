@@ -1,0 +1,20 @@
+suite: labeler_comparison
+datasets:
+  - yelp_academic
+  - amazon_video
+labelers:
+  - random_labeler
+  - rule_based_labeler
+  - proxy_labeler
+  - cached_llm_labeler
+  - full_llm_labeler
+seeds: [0, 1, 2, 3, 4]
+device: cuda
+output_dir: outputs/submission_unified
+metrics:
+  - Macro-F1
+  - AUROC
+  - AUPRC
+notes:
+  - cached_llm_labeler runs only when a real cache such as qwen/openai labels exists.
+  - full_llm_labeler requires an explicit label file or --call_full_llm with configured backend.

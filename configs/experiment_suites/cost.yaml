@@ -1,0 +1,22 @@
+suite: cost
+datasets:
+  - yelp_academic
+  - amazon_video
+  - fraud_yelp
+  - fraud_amazon
+  - elliptic
+model: hero
+seeds: [0, 1, 2, 3, 4]
+device: cuda
+output_dir: outputs/submission_unified
+fields:
+  - candidate_cards
+  - annotation_coverage
+  - total_tokens
+  - annotation_time
+  - cache_size
+  - training_time
+  - gpu_cpu_info
+status: runnable_from_existing_logs_and_caches
+notes:
+  - collect from runtime logs, annotation cache metadata, and real training outputs only.

@@ -1,0 +1,21 @@
+suite: faithfulness
+datasets:
+  - yelp_academic
+  - amazon_video
+model: hero
+seeds: [0, 1, 2, 3, 4]
+device: cuda
+output_dir: outputs/submission_unified
+perturbations:
+  - top_k_evidence_edge_removal
+  - random_edge_removal
+  - irrelevant_edge_removal
+  - sufficiency_keep_top_k_evidence_edges
+metrics:
+  - prediction_drop
+  - AUPRC_drop
+  - faithfulness_score
+status: runnable_when_hero_checkpoint_has_hero_artifacts
+notes:
+  - evaluates saved HERO checkpoints under evidence-chain input perturbations.
+  - rows are marked unavailable when checkpoint or hero_artifacts are missing.
