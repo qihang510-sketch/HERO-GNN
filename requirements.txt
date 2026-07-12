@@ -6,4 +6,4 @@ pyyaml
 tqdm
 torch
 pytest
-
+matplotlib

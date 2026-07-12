@@ -13,6 +13,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.advanced_experiment_utils import write_frame  # noqa: E402
+from scripts.paper_artifact_utils import write_latex  # noqa: E402
 from src.training.submission import SUBMISSION_DATASETS, resolve_processed_dir  # noqa: E402
 
 
@@ -86,11 +87,47 @@ def collect_cost_scalability(args: argparse.Namespace) -> pd.DataFrame:
                 }
             )
     table = pd.DataFrame(rows)
+    table = _canonical_cost_table(table)
     write_frame(output_dir / "summary" / "table_cost_scalability.csv", table)
     write_frame(output_dir / "summary" / "table_cost.csv", table)
+    write_latex(output_dir / "summary" / "table_cost_scalability.tex", table)
     write_frame(output_dir / "tables" / "table_cost_scalability.csv", table)
     write_frame(output_dir / "tables" / "table_cost.csv", table)
+    write_latex(output_dir / "tables" / "table_cost_scalability.tex", table)
+    try:
+        from scripts.plot_cost_scalability import plot_cost_scalability
+
+        plot_cost_scalability(output_dir)
+    except Exception as exc:
+        report = output_dir / "summary" / "cost_plot_status.txt"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(f"cost plots unavailable: {type(exc).__name__}: {exc}\n", encoding="utf-8")
     return table
+
+
+def _canonical_cost_table(table: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "dataset",
+        "model",
+        "candidate_cards",
+        "annotated_cards",
+        "annotation_coverage",
+        "avg_tokens_per_card",
+        "total_tokens",
+        "annotation_time_seconds",
+        "cache_size_mb",
+        "train_time_seconds_per_seed",
+        "peak_gpu_memory_mb",
+        "device",
+        "seed_count",
+        "status",
+    ]
+    table = table.copy()
+    for column in columns:
+        if column not in table:
+            table[column] = pd.NA
+    extras = [column for column in table.columns if column not in columns]
+    return table[columns + extras]
 
 
 def _read_metric_rows(input_dir: Path, dataset: str, models: set[str]) -> list[dict[str, Any]]:

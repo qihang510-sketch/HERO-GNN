@@ -12,6 +12,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.run_significance_tests import METRICS, significance_rows  # noqa: E402
+from src.training.submission import DATASET_MODEL_MATRIX, TEXT_RICH_DATASETS  # noqa: E402
 
 
 METRIC_ALIASES = {
@@ -31,6 +32,22 @@ SUMMARY_COLUMNS = [
     "AUPRC",
     "run_dir",
     "metrics_file",
+]
+TEXT_RICH_SET = set(TEXT_RICH_DATASETS)
+TRANSFER_DATASETS = {"fraud_yelp", "fraud_amazon", "elliptic"}
+MEAN_STD_COLUMNS = [
+    "dataset",
+    "model",
+    "seed_count",
+    "Macro-F1_mean",
+    "Macro-F1_std",
+    "Macro-F1_mean_std",
+    "AUROC_mean",
+    "AUROC_std",
+    "AUROC_mean_std",
+    "AUPRC_mean",
+    "AUPRC_std",
+    "AUPRC_mean_std",
 ]
 
 
@@ -56,9 +73,9 @@ def summarize_suite(output_dir: str | Path, min_paired_seeds: int = 3) -> dict[s
 
     all_runs = load_run_records(output_dir)
     missing = missing_runs(output_dir, all_runs)
-    main_table = mean_std_table(all_runs, suite="main")
-    ablation_table = mean_std_table(all_runs, suite="ablation", model_label="variant")
-    transfer_table = _empty_mean_std_table(model_label="model")
+    main_table = mean_std_table(all_runs, suite="main", datasets=TEXT_RICH_SET)
+    ablation_table = mean_std_table(all_runs, suite="ablation", model_label="variant", datasets=TEXT_RICH_SET)
+    transfer_table = mean_std_table(all_runs, suite="main", datasets=TRANSFER_DATASETS)
     sig_table = pd.DataFrame(significance_rows(all_runs, metrics=METRICS, min_paired_seeds=min_paired_seeds))
 
     outputs = {
@@ -169,31 +186,44 @@ def _metric_value(payload: dict[str, Any], metric: str) -> float | None:
     return None
 
 
-def mean_std_table(frame: pd.DataFrame, suite: str, model_label: str = "model") -> pd.DataFrame:
+def mean_std_table(
+    frame: pd.DataFrame,
+    suite: str,
+    model_label: str = "model",
+    datasets: set[str] | None = None,
+) -> pd.DataFrame:
     if frame.empty:
         return _empty_mean_std_table(model_label=model_label)
-    subset = frame[(frame["suite"].astype(str) == suite) & (frame["status"].astype(str).isin(["ok", "exists"]))]
+    suite_mask = frame["suite"].astype(str) == suite
+    if datasets is not None:
+        suite_mask &= frame["dataset"].astype(str).isin(datasets)
+    subset = frame[suite_mask & (frame["status"].astype(str).isin(["ok", "exists"]))]
     if subset.empty:
-        return _empty_mean_std_table(model_label=model_label)
+        return _append_not_applicable_rows(_empty_mean_std_table(model_label=model_label), frame[suite_mask], model_label)
     rows = []
     for (dataset, model), group in subset.groupby(["dataset", "model"], dropna=False):
         row = {
             "dataset": dataset,
-            model_label: model,
             "model": model,
             "seed_count": int(group["seed"].nunique()),
         }
+        if model_label != "model":
+            row[model_label] = model
         for metric in ["Macro-F1", "AUROC", "AUPRC"]:
             values = pd.to_numeric(group[metric], errors="coerce").dropna().to_numpy(dtype=float)
             row[f"{metric}_mean"] = float(np.mean(values)) if values.size else pd.NA
             row[f"{metric}_std"] = float(np.std(values, ddof=1)) if values.size >= 2 else pd.NA
             row[f"{metric}_mean_std"] = _paper_mean_std(values)
         rows.append(row)
-    return pd.DataFrame(rows)
+    table = pd.DataFrame(rows)
+    table = _append_not_applicable_rows(table, frame[suite_mask], model_label)
+    return _ordered_mean_std_columns(table, model_label=model_label)
 
 
 def _empty_mean_std_table(model_label: str) -> pd.DataFrame:
-    columns = ["dataset", model_label, "model", "seed_count"]
+    columns = ["dataset", "model", "seed_count"]
+    if model_label != "model":
+        columns.insert(1, model_label)
     for metric in ["Macro-F1", "AUROC", "AUPRC"]:
         columns.extend([f"{metric}_mean", f"{metric}_std", f"{metric}_mean_std"])
     return pd.DataFrame(columns=columns)
@@ -203,12 +233,52 @@ def _paper_mean_std(values: np.ndarray) -> str:
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
     if values.size == 0:
-        return "missing"
+        return "--"
     mean = float(np.mean(values) * 100.0)
     if values.size < 2:
         return f"{mean:.2f} \u00b1 NA"
     std = float(np.std(values, ddof=1) * 100.0)
     return f"{mean:.2f} \u00b1 {std:.2f}"
+
+
+def _append_not_applicable_rows(table: pd.DataFrame, frame: pd.DataFrame, model_label: str) -> pd.DataFrame:
+    if frame.empty or "skip_reason" not in frame:
+        return _ordered_mean_std_columns(table, model_label=model_label)
+    skip = frame[
+        frame["skip_reason"].astype(str).str.contains("model_not_applicable_to_dataset", na=False)
+    ]
+    if skip.empty:
+        return _ordered_mean_std_columns(table, model_label=model_label)
+    rows = []
+    existing = set()
+    if not table.empty and {"dataset", "model"}.issubset(table.columns):
+        existing = set(zip(table["dataset"].astype(str), table["model"].astype(str)))
+    for (dataset, model), _group in skip.groupby(["dataset", "model"], dropna=False):
+        key = (str(dataset), str(model))
+        if key in existing:
+            continue
+        row = {"dataset": dataset, "model": model, "seed_count": 0}
+        if model_label != "model":
+            row[model_label] = model
+        for metric in ["Macro-F1", "AUROC", "AUPRC"]:
+            row[f"{metric}_mean"] = pd.NA
+            row[f"{metric}_std"] = pd.NA
+            row[f"{metric}_mean_std"] = "--"
+        rows.append(row)
+    if rows:
+        table = pd.concat([table, pd.DataFrame(rows)], ignore_index=True)
+    return _ordered_mean_std_columns(table, model_label=model_label)
+
+
+def _ordered_mean_std_columns(table: pd.DataFrame, model_label: str) -> pd.DataFrame:
+    columns = list(MEAN_STD_COLUMNS)
+    if model_label != "model":
+        columns.insert(1, model_label)
+    for column in columns:
+        if column not in table:
+            table[column] = pd.NA
+    extras = [column for column in table.columns if column not in columns]
+    return table[columns + extras]
 
 
 def _advanced_tables(output_dir: Path) -> dict[str, pd.DataFrame]:

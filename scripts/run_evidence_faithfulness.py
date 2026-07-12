@@ -14,6 +14,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.advanced_experiment_utils import METRICS, metric_summary, write_frame  # noqa: E402
+from scripts.paper_artifact_utils import import_matplotlib, save_figure, write_latex  # noqa: E402
 from src.data import schema  # noqa: E402
 from src.data.loader import load_processed_data  # noqa: E402
 from src.graph.neighbor_retrieval import filter_topk_semantic_edges  # noqa: E402
@@ -79,8 +80,13 @@ def run_faithfulness(args: argparse.Namespace) -> list[dict[str, Any]]:
     write_frame(output_dir / "summary" / "faithfulness_raw.csv", raw)
     write_frame(output_dir / "summary" / "faithfulness_summary.csv", summary)
     write_frame(output_dir / "summary" / "table_faithfulness.csv", table)
+    write_latex(output_dir / "summary" / "table_faithfulness.tex", table)
     write_frame(output_dir / "tables" / "table_faithfulness.csv", table)
-    write_frame(output_dir / "figures" / "faithfulness_bar_data.csv", faithfulness_plot_data(summary))
+    write_latex(output_dir / "tables" / "table_faithfulness.tex", table)
+    plot_data = faithfulness_plot_data(summary)
+    write_frame(output_dir / "figure_data" / "faithfulness_bar_data.csv", plot_data)
+    write_frame(output_dir / "figures" / "faithfulness_bar_data.csv", plot_data)
+    plot_faithfulness(output_dir)
     _write_raw_artifacts(output_dir, rows)
     return rows
 
@@ -262,6 +268,8 @@ def find_checkpoint(input_dir: Path, dataset: str, seed: int, explicit_dir: str 
 def summarize_faithfulness(raw: pd.DataFrame) -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame()
+    if "status" in raw and raw["status"].astype(str).isin(["ok", "exists"]).sum() == 0:
+        return _unavailable_faithfulness_summary(raw)
     summary = metric_summary(raw, ["dataset", "setting", "top_k"])
     drop_cols = ["prediction_probability_drop", *[f"{metric}_drop" for metric in METRICS], "comprehensiveness", "sufficiency"]
     rows = []
@@ -295,11 +303,85 @@ def faithfulness_plot_data(summary: pd.DataFrame) -> pd.DataFrame:
         "Macro-F1_drop_mean",
         "comprehensiveness_mean",
         "sufficiency_mean",
+        "status",
+        "skip_reason",
     ]
     for col in keep:
         if col not in summary:
             summary[col] = pd.NA
     return summary[keep]
+
+
+def plot_faithfulness(output_dir: str | Path) -> None:
+    output_dir = Path(output_dir)
+    path = output_dir / "figure_data" / "faithfulness_bar_data.csv"
+    if not path.exists():
+        path = output_dir / "figures" / "faithfulness_bar_data.csv"
+    try:
+        frame = pd.read_csv(path)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        frame = pd.DataFrame()
+    plt = import_matplotlib()
+    if frame.empty or "AUPRC_drop_mean" not in frame:
+        fig, ax = plt.subplots(figsize=(5.0, 3.0))
+        ax.text(0.5, 0.5, "unavailable", ha="center", va="center")
+        ax.set_axis_off()
+        save_figure(fig, output_dir / "figures" / "fig_evidence_faithfulness.pdf", output_dir / "figures" / "fig_evidence_faithfulness.png")
+        plt.close(fig)
+        return
+    status = frame["status"] if "status" in frame else pd.Series(["ok"] * len(frame), index=frame.index)
+    ok = frame[status.astype(str).isin(["ok", "exists", ""])]
+    ok = ok.copy()
+    ok["AUPRC_drop_mean"] = pd.to_numeric(ok["AUPRC_drop_mean"], errors="coerce")
+    ok["top_k"] = pd.to_numeric(ok["top_k"], errors="coerce")
+    ok = ok.dropna(subset=["AUPRC_drop_mean", "top_k"])
+    if ok.empty:
+        fig, ax = plt.subplots(figsize=(5.0, 3.0))
+        ax.text(0.5, 0.5, "unavailable", ha="center", va="center")
+        ax.set_axis_off()
+        save_figure(fig, output_dir / "figures" / "fig_evidence_faithfulness.pdf", output_dir / "figures" / "fig_evidence_faithfulness.png")
+        plt.close(fig)
+        return
+    settings = [str(value) for value in ok["setting"].dropna().unique()]
+    topks = sorted(int(value) for value in ok["top_k"].dropna().unique())
+    width = 0.8 / max(len(settings), 1)
+    x = np.arange(len(topks), dtype=float)
+    fig, ax = plt.subplots(figsize=(max(5.5, len(topks) * 1.2), 3.2))
+    for offset, setting in enumerate(settings):
+        values = []
+        for topk in topks:
+            subset = ok[(ok["setting"].astype(str) == setting) & (ok["top_k"].astype(int) == topk)]
+            values.append(float(subset["AUPRC_drop_mean"].mean()) if not subset.empty else np.nan)
+        ax.bar(x + (offset - (len(settings) - 1) / 2) * width, values, width=width, label=setting)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(topk) for topk in topks])
+    ax.set_xlabel("top-k evidence edges")
+    ax.set_ylabel("AUPRC drop")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    save_figure(fig, output_dir / "figures" / "fig_evidence_faithfulness.pdf", output_dir / "figures" / "fig_evidence_faithfulness.png")
+    plt.close(fig)
+
+
+def _unavailable_faithfulness_summary(raw: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for keys, group in raw.groupby(["dataset", "setting", "top_k"], dropna=False):
+        row = {name: value for name, value in zip(["dataset", "setting", "top_k"], keys)}
+        row["seed_count"] = int(group["seed"].nunique()) if "seed" in group else int(len(group))
+        row["status"] = group["status"].dropna().iloc[0] if "status" in group and not group["status"].dropna().empty else "unavailable"
+        row["skip_reason"] = group["skip_reason"].dropna().iloc[0] if "skip_reason" in group and not group["skip_reason"].dropna().empty else "checkpoint_or_evidence_missing"
+        for metric in METRICS:
+            row[f"{metric}_mean"] = pd.NA
+            row[f"{metric}_std"] = pd.NA
+            row[f"{metric}_mean_std"] = "--"
+            row[f"{metric}_drop_mean"] = pd.NA
+            row[f"{metric}_drop_std"] = pd.NA
+        for col in ["prediction_probability_drop", "comprehensiveness", "sufficiency"]:
+            row[f"{col}_mean"] = pd.NA
+            row[f"{col}_std"] = pd.NA
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _write_raw_artifacts(output_dir: Path, rows: list[dict[str, Any]]) -> None:

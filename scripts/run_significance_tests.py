@@ -13,6 +13,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.training.submission import DATASET_MODEL_MATRIX  # noqa: E402
+from scripts.paper_artifact_utils import write_latex, write_markdown  # noqa: E402
 
 
 METRICS = ["Macro-F1", "AUROC", "AUPRC"]
@@ -32,24 +33,26 @@ OUTPUT_COLUMNS = [
     "paired_seed_count",
     "p_ttest",
     "p_wilcoxon",
-    "significant_0.05",
+    "significant_0_05",
     "status",
 ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run paired HERO-vs-baseline significance tests from per-seed metrics.")
+    parser.add_argument("--main_dir", default=None, help="Main experiment output directory containing summary/all_raw_runs.csv.")
     parser.add_argument("--input_dir", default="outputs/submission_experiments", help="Suite output directory or raw result directory.")
-    parser.add_argument("--output_dir", default="outputs/paper_tables_submission", help="Directory for significance tables.")
+    parser.add_argument("--output_dir", default=None, help="Directory for significance tables. Defaults to <main_dir>/summary.")
     parser.add_argument("--min_paired_seeds", type=int, default=3)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    frame = read_metric_frame(Path(args.input_dir))
+    input_dir = Path(args.main_dir or args.input_dir)
+    frame = read_metric_frame(input_dir)
     rows = significance_rows(frame, metrics=METRICS, min_paired_seeds=args.min_paired_seeds)
-    out_dir = Path(args.output_dir)
+    out_dir = Path(args.output_dir) if args.output_dir else (input_dir / "summary" if args.main_dir else Path("outputs/paper_tables_submission"))
     out_dir.mkdir(parents=True, exist_ok=True)
     table = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
     _write_table(table, out_dir / "table_significance")
@@ -59,6 +62,13 @@ def main() -> None:
 
 def read_metric_frame(input_dir: str | Path) -> pd.DataFrame:
     input_dir = Path(input_dir)
+    for candidate in [input_dir / "summary" / "all_raw_runs.csv", input_dir / "all_raw_runs.csv"]:
+        if candidate.exists():
+            try:
+                frame = pd.read_csv(candidate)
+            except pd.errors.EmptyDataError:
+                return pd.DataFrame(columns=["suite", "dataset", "model", "seed", "status", "skip_reason", "metrics_file", *METRICS])
+            return _canonical_metric_frame(frame)
     raw_dir = input_dir / "raw" if (input_dir / "raw").exists() else input_dir
     rows: list[dict[str, Any]] = []
     for path in sorted(raw_dir.rglob("metrics.json")):
@@ -87,7 +97,7 @@ def read_metric_frame(input_dir: str | Path) -> pd.DataFrame:
         if row["status"] == "skipped":
             row["status"] = "missing"
         rows.append(row)
-    return pd.DataFrame(rows, columns=["suite", "dataset", "model", "seed", "status", "metrics_file", *METRICS])
+    return pd.DataFrame(rows, columns=["suite", "dataset", "model", "seed", "status", "skip_reason", "metrics_file", *METRICS])
 
 
 def significance_rows(
@@ -134,9 +144,12 @@ def _compare(
         "paired_seed_count": 0,
         "p_ttest": "NA",
         "p_wilcoxon": "NA",
-        "significant_0.05": False,
+        "significant_0_05": False,
         "status": "missing_results",
     }
+    if _is_not_applicable(frame, dataset, baseline_model):
+        base["status"] = "not_applicable"
+        return base
     if metric not in subset:
         return base
     values = subset[["model", "seed", metric]].copy()
@@ -171,7 +184,7 @@ def _compare(
         {
             "p_ttest": p_ttest,
             "p_wilcoxon": p_wilcoxon,
-            "significant_0.05": _significant(p_ttest, p_wilcoxon),
+            "significant_0_05": _significant(p_ttest, p_wilcoxon),
             "status": "ok",
         }
     )
@@ -182,7 +195,7 @@ def _canonical_metric_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=["suite", "dataset", "model", "seed", "status", *METRICS])
     result = frame.copy()
-    for column, default in [("suite", "main"), ("dataset", ""), ("model", ""), ("seed", pd.NA), ("status", "ok")]:
+    for column, default in [("suite", "main"), ("dataset", ""), ("model", ""), ("seed", pd.NA), ("status", "ok"), ("skip_reason", "")]:
         if column not in result:
             result[column] = default
     for metric in METRICS:
@@ -218,6 +231,19 @@ def _baseline_models_for_dataset(dataset: str, frame: pd.DataFrame) -> list[str]
         return [model for model in DATASET_MODEL_MATRIX[dataset] if not _is_hero_model(model)]
     observed = sorted(str(model) for model in frame["model"].dropna().unique())
     return [model for model in observed if not _is_hero_model(model)]
+
+
+def _is_not_applicable(frame: pd.DataFrame, dataset: str, model: str) -> bool:
+    if dataset in DATASET_MODEL_MATRIX and model not in DATASET_MODEL_MATRIX[dataset]:
+        return True
+    if frame.empty or "skip_reason" not in frame:
+        return False
+    skipped = frame[
+        (frame["dataset"].astype(str) == dataset)
+        & (frame["model"].astype(str) == model)
+        & (frame["skip_reason"].astype(str).str.contains("model_not_applicable_to_dataset", na=False))
+    ]
+    return not skipped.empty
 
 
 def _is_hero_model(model: str) -> bool:
@@ -358,8 +384,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_table(table: pd.DataFrame, stem: Path) -> None:
     table.to_csv(stem.with_suffix(".csv"), index=False)
-    stem.with_suffix(".md").write_text(_to_markdown(table), encoding="utf-8")
-    stem.with_suffix(".tex").write_text(table.to_latex(index=False, escape=False), encoding="utf-8")
+    write_markdown(stem.with_suffix(".md"), table)
+    write_latex(stem.with_suffix(".tex"), table)
 
 
 def _to_markdown(table: pd.DataFrame) -> str:

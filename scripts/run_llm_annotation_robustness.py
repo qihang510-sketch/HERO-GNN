@@ -24,6 +24,7 @@ from scripts.advanced_experiment_utils import (  # noqa: E402
     write_frame,
     write_jsonl_labels,
 )
+from scripts.paper_artifact_utils import import_matplotlib, save_figure, write_latex  # noqa: E402
 from src.data import schema  # noqa: E402
 from src.training.submission import processed_ready, resolve_processed_dir  # noqa: E402
 from src.utils.io import write_json  # noqa: E402
@@ -149,7 +150,11 @@ def run_robustness(args: argparse.Namespace) -> list[dict[str, Any]]:
     write_frame(summary_dir / "robustness_plot_data.csv", plot_data)
     write_frame(summary_dir / "table_llm_robustness.csv", summary)
     write_frame(output_dir / "tables" / "table_llm_robustness.csv", summary)
+    write_latex(summary_dir / "table_llm_robustness.tex", summary)
+    write_latex(output_dir / "tables" / "table_llm_robustness.tex", summary)
+    write_frame(output_dir / "figure_data" / "robustness_curve_data.csv", plot_data)
     write_frame(figures_dir / "robustness_curve_data.csv", plot_data)
+    plot_robustness_figures(output_dir)
     return raw_rows
 
 
@@ -210,6 +215,55 @@ def robustness_plot_data(raw: pd.DataFrame) -> pd.DataFrame:
         if column not in rows:
             rows[column] = pd.NA
     return rows[keep]
+
+
+def plot_robustness_figures(output_dir: str | Path) -> None:
+    output_dir = Path(output_dir)
+    curve_path = output_dir / "figure_data" / "robustness_curve_data.csv"
+    if not curve_path.exists():
+        curve_path = output_dir / "figures" / "robustness_curve_data.csv"
+    try:
+        curve = pd.read_csv(curve_path)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        curve = pd.DataFrame()
+    for metric, suffix in [("AUPRC", "auprc"), ("AUROC", "auroc")]:
+        _plot_metric_curve(curve, metric, output_dir / "figures" / f"fig_llm_robustness_{suffix}.pdf", output_dir / "figures" / f"fig_llm_robustness_{suffix}.png")
+
+
+def _plot_metric_curve(curve: pd.DataFrame, metric: str, pdf_path: Path, png_path: Path) -> None:
+    plt = import_matplotlib()
+    datasets = sorted(str(value) for value in curve.get("dataset", pd.Series(dtype=str)).dropna().unique()) if not curve.empty else []
+    if not datasets:
+        datasets = ["unavailable"]
+    fig, axes = plt.subplots(1, len(datasets), figsize=(4.2 * len(datasets), 3.0), squeeze=False)
+    for ax, dataset in zip(axes[0], datasets):
+        if curve.empty or dataset == "unavailable" or metric not in curve:
+            ax.text(0.5, 0.5, "unavailable", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+        status = curve["status"] if "status" in curve else pd.Series(["ok"] * len(curve), index=curve.index)
+        subset = curve[(curve["dataset"].astype(str) == dataset) & (status.astype(str).isin(["ok", "exists"]))]
+        subset = subset.copy()
+        subset[metric] = pd.to_numeric(subset[metric], errors="coerce")
+        subset["noise_ratio"] = pd.to_numeric(subset["noise_ratio"], errors="coerce")
+        plotted = False
+        for noise_type, group in subset.groupby("noise_type", dropna=False):
+            series = group.groupby("noise_ratio", dropna=False)[metric].mean().dropna().sort_index()
+            if series.empty:
+                continue
+            ax.plot(series.index.to_numpy(dtype=float), series.to_numpy(dtype=float), marker="o", linewidth=1.8, label=str(noise_type))
+            plotted = True
+        if not plotted:
+            ax.text(0.5, 0.5, "unavailable", ha="center", va="center")
+        ax.set_title(dataset)
+        ax.set_xlabel("Noise ratio")
+        ax.set_ylabel(metric)
+        ax.grid(True, alpha=0.25)
+        if plotted:
+            ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    save_figure(fig, pdf_path, png_path)
+    plt.close(fig)
 
 
 def _with_metric_drops(raw: pd.DataFrame) -> pd.DataFrame:

@@ -16,6 +16,7 @@ dependencies = [
   "pyyaml",
   "tqdm",
   "torch",
+  "matplotlib",
 ]
 
 [project.optional-dependencies]
@@ -37,4 +38,3 @@ packages = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-

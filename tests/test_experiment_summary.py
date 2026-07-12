@@ -34,6 +34,18 @@ def test_suite_summary_mean_std_and_missing_runs(tmp_path):
     assert missing.iloc[0]["status"] == "missing"
 
 
+def test_transfer_table_has_single_model_column(tmp_path):
+    output_dir = tmp_path / "suite"
+    _write_transfer_run(output_dir, dataset="fraud_yelp", model="mlp", seed=0, auprc=0.7)
+
+    outputs = summarize_suite(output_dir)
+    transfer = outputs["table_transfer_mean_std"]
+
+    assert list(transfer.columns).count("model") == 1
+    assert set(transfer["dataset"]) == {"fraud_yelp"}
+    assert "yelp_academic" not in set(transfer["dataset"])
+
+
 def test_completeness_table_detects_absent_raw_run(tmp_path):
     output_dir = tmp_path / "suite"
     _write_run(output_dir, seed=0, macro_f1=0.70, auroc=0.80, auprc=0.90)
@@ -73,3 +85,21 @@ def _write_run(output_dir, seed: int, macro_f1: float, auroc: float, auprc: floa
 def _write_json(path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_transfer_run(output_dir, dataset: str, model: str, seed: int, auprc: float) -> None:
+    run_dir = output_dir / "raw" / dataset / model / f"seed_{seed}"
+    _write_json(run_dir / "config.json", {"suite": "main", "dataset": dataset, "model": model, "seed": seed})
+    _write_json(
+        run_dir / "metrics.json",
+        {
+            "suite": "main",
+            "dataset": dataset,
+            "model": model,
+            "seed": seed,
+            "status": "ok",
+            "Macro-F1": 0.6,
+            "AUROC": 0.8,
+            "AUPRC": auprc,
+        },
+    )

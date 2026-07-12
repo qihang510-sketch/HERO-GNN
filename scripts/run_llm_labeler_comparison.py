@@ -26,6 +26,7 @@ from scripts.advanced_experiment_utils import (  # noqa: E402
     write_frame,
     write_jsonl_labels,
 )
+from scripts.paper_artifact_utils import import_matplotlib, save_figure, write_latex  # noqa: E402
 from src.training.submission import processed_ready, resolve_processed_dir  # noqa: E402
 from src.utils.io import write_json  # noqa: E402
 
@@ -141,8 +142,12 @@ def run_labeler_comparison(args: argparse.Namespace) -> list[dict[str, Any]]:
     plot = labeler_plot_data(raw)
     write_frame(output_dir / "summary" / "llm_labeler_comparison_raw.csv", raw)
     write_frame(output_dir / "summary" / "table_llm_labeler_comparison.csv", table)
+    write_latex(output_dir / "summary" / "table_llm_labeler_comparison.tex", table)
     write_frame(output_dir / "tables" / "table_llm_labeler_comparison.csv", table)
+    write_latex(output_dir / "tables" / "table_llm_labeler_comparison.tex", table)
+    write_frame(output_dir / "figure_data" / "labeler_comparison_data.csv", plot)
     write_frame(output_dir / "figures" / "labeler_comparison_data.csv", plot)
+    plot_labeler_comparison(output_dir)
     return rows
 
 
@@ -164,6 +169,7 @@ def summarize_labeler_comparison(raw: pd.DataFrame) -> pd.DataFrame:
     meta_rows = []
     for keys, group in raw.groupby(["dataset", "labeler", "annotation_source"], dropna=False):
         row = {name: value for name, value in zip(["dataset", "labeler", "annotation_source"], keys)}
+        row["meta_seed_count"] = int(group["seed"].nunique()) if "seed" in group else int(len(group))
         for col in stat_cols:
             if col not in group:
                 row[col] = pd.NA
@@ -174,9 +180,8 @@ def summarize_labeler_comparison(raw: pd.DataFrame) -> pd.DataFrame:
                 row[col] = float(values.mean()) if not values.empty else pd.NA
         meta_rows.append(row)
     meta = pd.DataFrame(meta_rows)
-    if summary.empty:
-        return meta
-    return meta.merge(summary, on=["dataset", "labeler", "annotation_source"], how="left")
+    table = meta if summary.empty else meta.merge(summary, on=["dataset", "labeler", "annotation_source"], how="left")
+    return _canonical_labeler_table(table)
 
 
 def labeler_plot_data(raw: pd.DataFrame) -> pd.DataFrame:
@@ -197,6 +202,79 @@ def labeler_plot_data(raw: pd.DataFrame) -> pd.DataFrame:
         if column not in raw:
             raw[column] = pd.NA
     return raw[keep]
+
+
+def plot_labeler_comparison(output_dir: str | Path) -> None:
+    output_dir = Path(output_dir)
+    path = output_dir / "figure_data" / "labeler_comparison_data.csv"
+    if not path.exists():
+        path = output_dir / "figures" / "labeler_comparison_data.csv"
+    try:
+        frame = pd.read_csv(path)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        frame = pd.DataFrame()
+    plt = import_matplotlib()
+    datasets = sorted(str(value) for value in frame.get("dataset", pd.Series(dtype=str)).dropna().unique()) if not frame.empty else []
+    if not datasets:
+        datasets = ["unavailable"]
+    fig, axes = plt.subplots(1, len(datasets), figsize=(4.5 * len(datasets), 3.1), squeeze=False)
+    for ax, dataset in zip(axes[0], datasets):
+        if frame.empty or dataset == "unavailable" or "AUPRC" not in frame:
+            ax.text(0.5, 0.5, "unavailable", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+        status = frame["status"] if "status" in frame else pd.Series(["ok"] * len(frame), index=frame.index)
+        subset = frame[(frame["dataset"].astype(str) == dataset) & (status.astype(str).isin(["ok", "exists"]))]
+        subset = subset.copy()
+        subset["AUPRC"] = pd.to_numeric(subset["AUPRC"], errors="coerce")
+        values = subset.groupby("labeler", dropna=False)["AUPRC"].mean().dropna()
+        if values.empty:
+            ax.text(0.5, 0.5, "unavailable", ha="center", va="center")
+            continue
+        ax.bar(np.arange(len(values)), values.to_numpy(dtype=float), color="#4C78A8")
+        ax.set_xticks(np.arange(len(values)))
+        ax.set_xticklabels([str(label) for label in values.index], rotation=30, ha="right")
+        ax.set_ylabel("AUPRC")
+        ax.set_title(dataset)
+        ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    save_figure(fig, output_dir / "figures" / "fig_labeler_comparison_auprc.pdf", output_dir / "figures" / "fig_labeler_comparison_auprc.png")
+    plt.close(fig)
+
+
+def _canonical_labeler_table(table: pd.DataFrame) -> pd.DataFrame:
+    table = table.copy()
+    if "seed_count" not in table and "meta_seed_count" in table:
+        table["seed_count"] = table["meta_seed_count"]
+    elif "seed_count" in table and "meta_seed_count" in table:
+        table["seed_count"] = table["seed_count"].where(table["seed_count"].notna(), table["meta_seed_count"])
+    aliases = {
+        "coverage": "annotation_coverage",
+        "positive_rate": "risk_relevance_positive_rate",
+        "avg_confidence": "average_confidence",
+    }
+    for new_col, old_col in aliases.items():
+        if new_col not in table:
+            table[new_col] = table[old_col] if old_col in table else pd.NA
+    columns = [
+        "dataset",
+        "labeler",
+        "annotation_source",
+        "coverage",
+        "positive_rate",
+        "avg_confidence",
+        "mechanism_distribution",
+        "seed_count",
+        "Macro-F1_mean_std",
+        "AUROC_mean_std",
+        "AUPRC_mean_std",
+        "status",
+    ]
+    for column in columns:
+        if column not in table:
+            table[column] = pd.NA
+    extras = [column for column in table.columns if column not in columns]
+    return table[columns + extras]
 
 
 def _label_specs(

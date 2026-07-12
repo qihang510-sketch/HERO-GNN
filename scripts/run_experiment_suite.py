@@ -36,8 +36,8 @@ from src.training.trainer import _resolve_hero_config, train_single_experiment  
 from src.utils.io import write_json  # noqa: E402
 
 
-SUITES = ("main", "ablation", "robustness", "labeler_comparison", "faithfulness", "cost", "all")
-RUNNABLE_SUITES = ("main", "ablation", "robustness", "labeler_comparison", "faithfulness", "cost")
+SUITES = ("main", "ablation", "robustness", "labeler_comparison", "faithfulness", "sensitivity", "cost", "all")
+RUNNABLE_SUITES = ("main", "ablation", "robustness", "labeler_comparison", "faithfulness", "sensitivity", "cost")
 PLACEHOLDER_SUITES: tuple[str, ...] = ()
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 
@@ -82,6 +82,10 @@ def parse_args() -> argparse.Namespace:
         default=["original_graph", "remove_topk_evidence", "remove_random_edges", "remove_irrelevant_edges", "keep_only_topk_evidence"],
     )
     parser.add_argument("--checkpoint_dir", default=None)
+    parser.add_argument("--sensitivity_k_values", nargs="+", type=int, default=[3, 5, 10, 15, 20])
+    parser.add_argument("--sensitivity_lambda_rel_values", nargs="+", type=float, default=[0.0, 0.1, 0.3, 0.5, 1.0])
+    parser.add_argument("--sensitivity_lambda_chain_values", nargs="+", type=float, default=[0.0, 0.1, 0.3, 0.5, 1.0])
+    parser.add_argument("--sensitivity_confidence_thresholds", nargs="+", type=float, default=[0.0, 0.3, 0.5, 0.7, 0.9])
     return parser.parse_args()
 
 
@@ -109,6 +113,8 @@ def main() -> None:
             results.extend(_run_labeler_comparison_suite(args, output_dir, datasets))
         elif suite == "faithfulness":
             results.extend(_run_faithfulness_suite(args, output_dir, datasets))
+        elif suite == "sensitivity":
+            results.extend(_run_sensitivity_suite(args, output_dir, datasets))
         elif suite == "cost":
             results.extend(_run_cost_suite(args, output_dir, datasets))
         else:
@@ -192,6 +198,8 @@ def _models_for_suite(suite: str, dataset: str, models: list[str] | None) -> lis
             return list(ABLATION_VARIANTS)
         return _dedupe(_normalize_ablation_variant(model) for model in models)
     if suite == "labeler_comparison":
+        return ["hero_gnn"]
+    if suite == "sensitivity":
         return ["hero_gnn"]
     return [_main_model_for_dataset(dataset, "hero")]
 
@@ -463,6 +471,21 @@ def _run_cost_suite(args: argparse.Namespace, output_dir: Path, datasets: list[s
     suite_args.models = args.models or ["hero_gnn", "hero_official"]
     table = collect_cost_scalability(suite_args)
     return _manifest_rows(table.to_dict(orient="records"), "cost")
+
+
+def _run_sensitivity_suite(args: argparse.Namespace, output_dir: Path, datasets: list[str]) -> list[dict[str, Any]]:
+    from scripts.run_sensitivity_analysis import run_sensitivity
+
+    suite_args = argparse.Namespace(**vars(args))
+    suite_args.datasets = datasets
+    suite_args.output_dir = str(output_dir)
+    suite_args.k_values = args.sensitivity_k_values
+    suite_args.lambda_rel_values = args.sensitivity_lambda_rel_values
+    suite_args.lambda_chain_values = args.sensitivity_lambda_chain_values
+    suite_args.confidence_thresholds = args.sensitivity_confidence_thresholds
+    suite_args.quick_test = False
+    rows = run_sensitivity(suite_args)
+    return _manifest_rows(rows, "sensitivity")
 
 
 def _manifest_rows(rows: list[dict[str, Any]], suite: str) -> list[dict[str, Any]]:
