@@ -19,11 +19,82 @@ from src.training.trainer import HERO_CONFIG_KEYS, _resolve_hero_config, train_s
 from src.utils.io import write_json  # noqa: E402
 
 
+DEFAULT_ABLATION_VARIANTS = [
+    "hero_full",
+    "hero_no_llm",
+    "hero_no_mechanism",
+    "hero_no_risk_weighting",
+    "hero_no_relation_loss",
+    "hero_no_chain_consistency",
+    "hero_structure_only",
+    "hero_semantic_only",
+    "hero_no_dual_branch",
+]
+
 ABLATION_VARIANTS = {
+    "hero_full": {
+        "trainer_model": "hero_gnn",
+        "name": "HERO",
+        "hero_config": {},
+    },
     "hero_gnn": {
         "trainer_model": "hero_gnn",
-        "name": "HERO-GNN",
+        "name": "HERO",
         "hero_config": {},
+    },
+    "hero_no_llm": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o LLM Annotation",
+        "hero_config": {"use_llm_annotation": False, "labeler_source": "rule_or_structure"},
+    },
+    "hero_no_mechanism": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Mechanism Annotation",
+        "hero_config": {"use_mechanism_annotation": False, "use_llm_annotation": False},
+    },
+    "hero_no_risk_weighting": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Risk-aware Weighting",
+        "hero_config": {"use_heterophily_filter": False, "heterophily_weight_mode": "uniform"},
+    },
+    "hero_no_relation_loss": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Relation Alignment Loss",
+        "hero_config": {},
+        "status": "unsupported",
+        "fallback": "No explicit relation alignment loss key exists; run equals hero_full unless relation loss is implemented.",
+    },
+    "hero_no_chain_consistency": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Evidence-chain Consistency",
+        "hero_config": {"chain_loss_weight": 0.0, "routing_loss_weight": 0.0},
+    },
+    "hero_structure_only": {
+        "trainer_model": "hero_gnn",
+        "name": "Structure Only",
+        "hero_config": {
+            "use_risk_relevant_heterophily": False,
+            "use_mechanism_annotation": False,
+            "use_evidence_chain": False,
+            "use_llm_annotation": False,
+            "labeler_source": "structure",
+        },
+    },
+    "hero_semantic_only": {
+        "trainer_model": "hero_gnn",
+        "name": "Semantic/Mechanism Only",
+        "hero_config": {
+            "use_mechanism_annotation": True,
+            "use_llm_annotation": True,
+            "use_evidence_chain": True,
+            "heterophily_weight_mode": "relevance_confidence",
+        },
+        "fallback": "Backbone target/homophilic encoders remain present in the current HEROGNN implementation.",
+    },
+    "hero_no_dual_branch": {
+        "trainer_model": "hero_gnn",
+        "name": "w/o Dual-Branch Encoder",
+        "hero_config": {"use_dual_branch_encoder": False, "encoder_type": "single_branch"},
     },
     "wo_risk_relevant_heterophily": {
         "trainer_model": "hero_gnn",
@@ -68,6 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets", nargs="+", default=list(TEXT_RICH_DATASETS), choices=list(TEXT_RICH_DATASETS))
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--output_dir", default="outputs/submission_experiments_ablation")
+    parser.add_argument("--variants", nargs="+", default=DEFAULT_ABLATION_VARIANTS)
     parser.add_argument("--data_root", default="data")
     parser.add_argument("--config", default=None, help="Optional HERO-GNN tuned config used as the base for every ablation variant.")
     parser.add_argument("--epochs", type=int, default=None)
@@ -86,7 +158,9 @@ def main() -> None:
     for dataset in args.datasets:
         data_dir = resolve_processed_dir(dataset, args.data_root)
         for seed in args.seeds:
-            for variant, spec in ABLATION_VARIANTS.items():
+            for variant in args.variants:
+                variant = _normalize_variant_name(variant)
+                spec = ABLATION_VARIANTS[variant]
                 result_dir = output_dir / dataset / variant / f"seed_{seed}"
                 if (result_dir / "metrics.json").exists() and not args.overwrite:
                     print(f"[exists] {result_dir}")
@@ -94,6 +168,11 @@ def main() -> None:
                 if not processed_ready(data_dir):
                     write_skip(result_dir, dataset, variant, seed, "Missing dataset files. This is expected on local VSCode. Please run on AutoDL or provide data path.")
                     print(f"[skipped] {dataset}/{variant}/seed_{seed}: missing data")
+                    continue
+                if spec.get("status") == "unsupported":
+                    reason = str(spec.get("fallback", "unsupported_ablation_variant"))
+                    write_skip(result_dir, dataset, variant, seed, reason)
+                    print(f"[unsupported] {dataset}/{variant}/seed_{seed}: {reason}")
                     continue
                 variant_overrides = dict(spec.get("hero_config", {}))
                 merged_config = {**base_hero_config, **variant_overrides}
@@ -120,6 +199,10 @@ def main() -> None:
                 payload["trainer_model"] = str(spec["trainer_model"])
                 payload["hero_config"] = resolved_config
                 payload["base_config"] = base_config_source
+                if spec.get("status"):
+                    payload["variant_status"] = str(spec.get("status"))
+                if spec.get("fallback"):
+                    payload["fallback"] = str(spec.get("fallback"))
                 if warnings:
                     payload["warning"] = "; ".join(warnings)
                 stale_skip = result_dir / "skip_reason.json"
@@ -151,7 +234,12 @@ def _load_base_config(config_path: str | None) -> tuple[dict, dict, str]:
         return {}, {}, ""
     path = Path(config_path)
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    hero_source = payload.get("hero_config") if isinstance(payload.get("hero_config"), dict) else payload
+    if isinstance(payload.get("hero_config"), dict):
+        hero_source = payload.get("hero_config")
+    elif isinstance(payload.get("hero"), dict):
+        hero_source = payload.get("hero")
+    else:
+        hero_source = payload
     hero_config = {key: value for key, value in dict(hero_source).items() if key in HERO_CONFIG_KEYS}
     trainer_config: dict = {}
     for source in (payload, hero_source):
@@ -169,6 +257,33 @@ def _load_base_config(config_path: str | None) -> tuple[dict, dict, str]:
     if "neighbor_budget" in hero_config and "top_k" not in trainer_config:
         trainer_config["top_k"] = hero_config["neighbor_budget"]
     return hero_config, trainer_config, str(path)
+
+
+def _normalize_variant_name(name: str) -> str:
+    text = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "hero": "hero_full",
+        "full": "hero_full",
+        "full_hero": "hero_full",
+        "wo_llm_annotation": "hero_no_llm",
+        "wo_mechanism_annotation": "hero_no_mechanism",
+        "wo_risk_aware_weighting": "hero_no_risk_weighting",
+        "wo_risk_weighting": "hero_no_risk_weighting",
+        "wo_relation_alignment_loss": "hero_no_relation_loss",
+        "wo_chain_consistency": "hero_no_chain_consistency",
+        "wo_evidence_chain_consistency": "hero_no_chain_consistency",
+        "wo_evidence_chain": "hero_no_chain_consistency",
+        "wo_dual_branch_encoder": "hero_no_dual_branch",
+        "wo_dual_branch": "hero_no_dual_branch",
+        "no_dual_branch": "hero_no_dual_branch",
+        "wo_hetero": "wo_risk_relevant_heterophily",
+        "wo_mechanism": "hero_no_mechanism",
+        "wo_chain": "hero_no_chain_consistency",
+    }
+    canonical = aliases.get(text, text)
+    if canonical not in ABLATION_VARIANTS:
+        raise ValueError(f"unknown_ablation_variant:{name}")
+    return canonical
 
 
 def _resolve_trainer_params(args: argparse.Namespace, base_trainer_config: dict, resolved_config: dict) -> dict:

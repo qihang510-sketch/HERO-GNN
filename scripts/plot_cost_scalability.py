@@ -34,9 +34,14 @@ def main() -> None:
 def plot_cost_scalability(output_dir: str | Path, table_path: str | Path | None = None) -> None:
     output_dir = Path(output_dir)
     table = read_csv_or_empty(table_path or output_dir / "summary" / "table_cost_scalability.csv")
+    if table.empty:
+        table = pd.DataFrame([{"status": "unavailable", "reason": "table_cost_scalability.csv missing or empty"}])
     write_csv(output_dir / "figure_data" / "cost_scalability_data.csv", table)
     for column, ylabel, stem in PLOTS:
         _plot_bar(table, column, ylabel, output_dir / "figures" / f"{stem}.pdf", output_dir / "figures" / f"{stem}.png")
+    report = output_dir / "reports" / "plot_cost_scalability_report.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(f"# plot_cost_scalability\n\n- rows: {len(table)}\n- source: table_cost_scalability.csv\n", encoding="utf-8")
 
 
 def _plot_bar(table: pd.DataFrame, column: str, ylabel: str, pdf_path: Path, png_path: Path) -> None:

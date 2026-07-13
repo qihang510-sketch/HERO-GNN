@@ -12,7 +12,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.run_significance_tests import METRICS, significance_rows  # noqa: E402
-from src.training.submission import DATASET_MODEL_MATRIX, TEXT_RICH_DATASETS  # noqa: E402
+from src.training.submission import DATASET_MODEL_MATRIX, TEXT_RICH_DATASETS, hero_display_name  # noqa: E402
 
 
 METRIC_ALIASES = {
@@ -75,7 +75,7 @@ def summarize_suite(output_dir: str | Path, min_paired_seeds: int = 3) -> dict[s
     missing = missing_runs(output_dir, all_runs)
     main_table = mean_std_table(all_runs, suite="main", datasets=TEXT_RICH_SET)
     ablation_table = mean_std_table(all_runs, suite="ablation", model_label="variant", datasets=TEXT_RICH_SET)
-    transfer_table = mean_std_table(all_runs, suite="main", datasets=TRANSFER_DATASETS)
+    transfer_table = mean_std_table(all_runs, suite={"main", "transfer"}, datasets=TRANSFER_DATASETS)
     sig_table = pd.DataFrame(significance_rows(all_runs, metrics=METRICS, min_paired_seeds=min_paired_seeds))
 
     outputs = {
@@ -188,13 +188,16 @@ def _metric_value(payload: dict[str, Any], metric: str) -> float | None:
 
 def mean_std_table(
     frame: pd.DataFrame,
-    suite: str,
+    suite: str | set[str],
     model_label: str = "model",
     datasets: set[str] | None = None,
 ) -> pd.DataFrame:
     if frame.empty:
         return _empty_mean_std_table(model_label=model_label)
-    suite_mask = frame["suite"].astype(str) == suite
+    if isinstance(suite, set):
+        suite_mask = frame["suite"].astype(str).isin(suite)
+    else:
+        suite_mask = frame["suite"].astype(str) == suite
     if datasets is not None:
         suite_mask &= frame["dataset"].astype(str).isin(datasets)
     subset = frame[suite_mask & (frame["status"].astype(str).isin(["ok", "exists"]))]
@@ -204,11 +207,11 @@ def mean_std_table(
     for (dataset, model), group in subset.groupby(["dataset", "model"], dropna=False):
         row = {
             "dataset": dataset,
-            "model": model,
+            "model": _summary_model_label(model),
             "seed_count": int(group["seed"].nunique()),
         }
         if model_label != "model":
-            row[model_label] = model
+            row[model_label] = _summary_model_label(model)
         for metric in ["Macro-F1", "AUROC", "AUPRC"]:
             values = pd.to_numeric(group[metric], errors="coerce").dropna().to_numpy(dtype=float)
             row[f"{metric}_mean"] = float(np.mean(values)) if values.size else pd.NA
@@ -258,8 +261,9 @@ def _append_not_applicable_rows(table: pd.DataFrame, frame: pd.DataFrame, model_
         if key in existing:
             continue
         row = {"dataset": dataset, "model": model, "seed_count": 0}
+        row["model"] = _summary_model_label(model)
         if model_label != "model":
-            row[model_label] = model
+            row[model_label] = _summary_model_label(model)
         for metric in ["Macro-F1", "AUROC", "AUPRC"]:
             row[f"{metric}_mean"] = pd.NA
             row[f"{metric}_std"] = pd.NA
@@ -279,6 +283,13 @@ def _ordered_mean_std_columns(table: pd.DataFrame, model_label: str) -> pd.DataF
             table[column] = pd.NA
     extras = [column for column in table.columns if column not in columns]
     return table[columns + extras]
+
+
+def _summary_model_label(model: Any) -> str:
+    text = str(model)
+    if text == "hero_full":
+        return "HERO"
+    return hero_display_name(text) if text.startswith("hero_") else text
 
 
 def _advanced_tables(output_dir: Path) -> dict[str, pd.DataFrame]:

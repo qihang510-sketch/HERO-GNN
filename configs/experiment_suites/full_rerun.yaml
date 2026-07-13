@@ -1,0 +1,38 @@
+pipeline:
+  step_order:
+    - quick_test
+    - tune_hero_hyperparams
+    - main
+    - transfer
+    - ablation
+    - significance
+    - robustness
+    - labeler_comparison
+    - faithfulness
+    - sensitivity
+    - cost
+    - final
+defaults:
+  device: cuda
+  seeds: [0, 1, 2, 3, 4]
+  max_parallel: 1
+  skip_existing: true
+  continue_on_error: true
+  save_predictions: true
+  save_embeddings: false
+  save_evidence: true
+quick_test:
+  datasets: [yelp_academic]
+  models: [mlp, gcn, hero]
+  seeds: [0]
+  ablation_variants: [hero_full, hero_no_llm]
+  robustness_noise_ratios: [0.1]
+  faithfulness_topks: [1]
+  sensitivity_neighbor_k: [5, 10]
+outputs:
+  root_pattern: outputs/full_rerun_YYYYMMDD_HHMMSS
+  final_artifacts: outputs/final_artifacts
+notes:
+  - All tables and figures must be rebuilt from raw results, checkpoints, logs, or annotation caches.
+  - Do not edit metrics CSVs by hand.
+  - Hyperparameter tuning selects by validation AUPRC, then validation AUROC, then validation Macro-F1.

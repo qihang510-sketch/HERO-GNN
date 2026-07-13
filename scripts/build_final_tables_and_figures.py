@@ -31,11 +31,13 @@ CSV_TARGETS = {
     "supp_table_llm_robustness": "table_llm_robustness.csv",
     "supp_table_labeler_comparison": "table_llm_labeler_comparison.csv",
     "supp_table_faithfulness": "table_faithfulness.csv",
+    "supp_table_sensitivity": "table_sensitivity.csv",
     "supp_table_cost_scalability": "table_cost_scalability.csv",
     "supp_table_missing_or_skipped_runs": "table_missing_runs.csv",
 }
 
 LATEX_TARGETS = [
+    "table1_dataset_statistics",
     "table2_main_text_rich",
     "table3_transfer",
     "table4_ablation",
@@ -44,6 +46,7 @@ LATEX_TARGETS = [
     "supp_table_llm_robustness",
     "supp_table_labeler_comparison",
     "supp_table_faithfulness",
+    "supp_table_sensitivity",
     "supp_table_cost_scalability",
 ]
 
@@ -51,10 +54,13 @@ LATEX_TARGETS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build final paper tables and figures from real HERO experiment outputs.")
     parser.add_argument("--main_dir", default="outputs/submission_main_20260711_225137")
+    parser.add_argument("--transfer_dir", default=None)
+    parser.add_argument("--significance_dir", default=None)
     parser.add_argument("--ablation_dir", default=None)
     parser.add_argument("--robustness_dir", default=None)
     parser.add_argument("--labeler_dir", default=None)
     parser.add_argument("--faithfulness_dir", default=None)
+    parser.add_argument("--sensitivity_dir", default=None)
     parser.add_argument("--cost_dir", default=None)
     parser.add_argument("--output_dir", default="outputs/final_artifacts")
     parser.add_argument("--data_root", default="data")
@@ -75,30 +81,37 @@ def build_final_artifacts(args: argparse.Namespace) -> dict[str, Path]:
     sources = _source_dirs(args)
 
     main_dir = Path(args.main_dir)
-    all_raw = _read_all_raw(main_dir)
+    transfer_dir = Path(args.transfer_dir) if getattr(args, "transfer_dir", None) else main_dir
+    all_raw = _concat_raw([main_dir, transfer_dir])
+    main_raw = _read_all_raw(main_dir)
+    transfer_raw = _read_all_raw(transfer_dir)
     table1 = dataset_statistics(all_raw, data_root=args.data_root, datasets=list(SUBMISSION_DATASETS))
     write_csv(dirs["tables_csv"] / "table1_dataset_statistics.csv", table1)
+    write_latex(dirs["tables_latex"] / "table1_dataset_statistics.tex", table1)
 
-    table2 = _table_from_source("main", main_dir, "table_main_mean_std.csv", allow_missing, all_raw, datasets=TEXT_RICH_SET)
+    table2 = _table_from_source("main", main_dir, "table_main_mean_std.csv", allow_missing, main_raw, datasets=TEXT_RICH_SET)
     write_csv(dirs["tables_csv"] / "table2_main_text_rich.csv", table2)
-    table3 = _table_from_source("transfer", main_dir, "table_transfer_mean_std.csv", allow_missing, all_raw, datasets=TRANSFER_DATASETS)
+    table3 = _table_from_source("transfer", transfer_dir, "table_transfer_mean_std.csv", allow_missing, transfer_raw, datasets=TRANSFER_DATASETS)
     write_csv(dirs["tables_csv"] / "table3_transfer.csv", table3)
     table4 = _optional_table(Path(args.ablation_dir) if args.ablation_dir else main_dir, "table_ablation_mean_std.csv", "ablation results missing", allow_missing)
     write_csv(dirs["tables_csv"] / "table4_ablation.csv", table4)
     table5 = evidence_case_table(sources, allow_missing)
     write_csv(dirs["tables_csv"] / "table5_evidence_cases.csv", table5)
 
-    significance = _significance_table(main_dir, all_raw, allow_missing)
+    significance_dir = Path(args.significance_dir) if getattr(args, "significance_dir", None) else main_dir
+    significance = _significance_table(significance_dir, all_raw, allow_missing)
     write_csv(dirs["tables_csv"] / "supp_table_significance.csv", significance)
     robustness = _optional_table(Path(args.robustness_dir) if args.robustness_dir else None, "table_llm_robustness.csv", "robustness results missing", allow_missing)
     labeler = _optional_table(Path(args.labeler_dir) if args.labeler_dir else None, "table_llm_labeler_comparison.csv", "labeler comparison results missing", allow_missing)
     faithfulness = _optional_table(Path(args.faithfulness_dir) if args.faithfulness_dir else None, "table_faithfulness.csv", "faithfulness results missing", allow_missing)
+    sensitivity = _optional_table(Path(args.sensitivity_dir) if getattr(args, "sensitivity_dir", None) else None, "table_sensitivity.csv", "sensitivity results missing", allow_missing)
     cost = _optional_table(Path(args.cost_dir) if args.cost_dir else main_dir, "table_cost_scalability.csv", "cost/scalability results missing", allow_missing)
     missing = _missing_table(main_dir, allow_missing)
     for name, frame in [
         ("supp_table_llm_robustness", robustness),
         ("supp_table_labeler_comparison", labeler),
         ("supp_table_faithfulness", faithfulness),
+        ("supp_table_sensitivity", sensitivity),
         ("supp_table_cost_scalability", cost),
         ("supp_table_missing_or_skipped_runs", missing),
     ]:
@@ -109,20 +122,38 @@ def build_final_artifacts(args: argparse.Namespace) -> dict[str, Path]:
         "table3_transfer": table3,
         "table4_ablation": table4,
         "table5_evidence_cases": table5,
+        "table1_dataset_statistics": table1,
         "supp_table_significance": significance,
         "supp_table_llm_robustness": robustness,
         "supp_table_labeler_comparison": labeler,
         "supp_table_faithfulness": faithfulness,
+        "supp_table_sensitivity": sensitivity,
         "supp_table_cost_scalability": cost,
     }
     for name in LATEX_TARGETS:
         write_latex(dirs["tables_latex"] / f"{name}.tex", csv_frames.get(name, pd.DataFrame()), highlight_metrics=name in {"table2_main_text_rich", "table3_transfer", "table4_ablation"})
 
     copied = copy_figures_and_data(sources, dirs)
+    seed_status = _build_seed_stability(main_dir, dirs["root"])
     report.extend(_report_lines(args, table1, csv_frames, missing, copied))
+    report.extend(["", "## Seed Stability", f"- {seed_status}"])
     report_path = dirs["reports"] / "final_artifacts_report.md"
     report_path.write_text("\n".join(report) + "\n", encoding="utf-8")
     return dirs
+
+
+def _build_seed_stability(main_dir: Path, output_dir: Path) -> str:
+    try:
+        from scripts.plot_seed_stability import plot_seed_stability
+
+        plot_seed_stability(main_dir / "summary" / "all_raw_runs.csv", output_dir, datasets=["yelp_academic", "amazon_video"])
+        return "generated from summary/all_raw_runs.csv"
+    except Exception as exc:
+        report = output_dir / "reports" / "seed_stability_error.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        message = f"seed stability unavailable: {type(exc).__name__}: {exc}"
+        report.write_text(message + "\n", encoding="utf-8")
+        return message
 
 
 def dataset_statistics(all_raw: pd.DataFrame, data_root: str | Path = "data", datasets: list[str] | None = None) -> pd.DataFrame:
@@ -141,7 +172,7 @@ def dataset_statistics(all_raw: pd.DataFrame, data_root: str | Path = "data", da
 
 
 def evidence_case_table(sources: list[Path], allow_missing: bool) -> pd.DataFrame:
-    patterns = ["table_evidence_chain_case.csv", "*evidence*case*.csv"]
+    patterns = ["table_evidence_cases.csv", "table_evidence_chain_case.csv", "*evidence*case*.csv"]
     for root in sources:
         if root is None or not root.exists():
             continue
@@ -182,7 +213,8 @@ def copy_figures_and_data(sources: list[Path], dirs: dict[str, Path]) -> list[st
 def _table_from_source(label: str, root: Path, filename: str, allow_missing: bool, all_raw: pd.DataFrame, datasets: set[str]) -> pd.DataFrame:
     table = read_csv_or_empty(root / "summary" / filename)
     if table.empty and not all_raw.empty:
-        table = mean_std_table(all_raw, suite="main", datasets=datasets)
+        suite = {"main", "transfer"} if label == "transfer" else "main"
+        table = mean_std_table(all_raw, suite=suite, datasets=datasets)
     if table.empty:
         if not allow_missing:
             raise FileNotFoundError(f"{label} table missing: {root / 'summary' / filename}")
@@ -227,8 +259,26 @@ def _read_all_raw(main_dir: Path) -> pd.DataFrame:
     return read_csv_or_empty(main_dir / "summary" / "all_raw_runs.csv")
 
 
+def _concat_raw(roots: list[Path]) -> pd.DataFrame:
+    frames = [_read_all_raw(root) for root in roots]
+    frames = [frame for frame in frames if not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).drop_duplicates()
+
+
 def _source_dirs(args: argparse.Namespace) -> list[Path]:
-    values = [args.main_dir, args.ablation_dir, args.robustness_dir, args.labeler_dir, args.faithfulness_dir, args.cost_dir]
+    values = [
+        args.main_dir,
+        getattr(args, "transfer_dir", None),
+        getattr(args, "significance_dir", None),
+        args.ablation_dir,
+        args.robustness_dir,
+        args.labeler_dir,
+        args.faithfulness_dir,
+        getattr(args, "sensitivity_dir", None),
+        args.cost_dir,
+    ]
     return [Path(value) for value in values if value]
 
 
@@ -289,6 +339,7 @@ def _report_lines(args: argparse.Namespace, table1: pd.DataFrame, frames: dict[s
         "# Final Artifact Build Report",
         "",
         f"- main_dir: `{args.main_dir}`",
+        f"- transfer_dir: `{getattr(args, 'transfer_dir', '') or args.main_dir}`",
         f"- output_dir: `{args.output_dir}`",
         f"- allow_missing: `{bool(args.allow_missing or args.quick_test)}`",
         "",

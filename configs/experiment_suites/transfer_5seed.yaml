@@ -1,0 +1,29 @@
+suite: transfer
+datasets:
+  - fraud_yelp
+  - fraud_amazon
+  - elliptic
+models:
+  - mlp
+  - gcn
+  - gat
+  - graphsage
+  - care_gnn
+  - graphconsis
+  - pc_gnn
+  - bwgnn
+  - linkx
+  - dgp
+  - mled
+  - hero
+seeds: [0, 1, 2, 3, 4]
+device: cuda
+output_dir: outputs/submission_unified
+metrics:
+  - Macro-F1
+  - AUROC
+  - AUPRC
+notes:
+  - Weak-text and transfer datasets only.
+  - Non-applicable models must be recorded as model_not_applicable_to_dataset/skipped, not failed.
+  - model=hero maps to hero_full and selects the appropriate HERO trainer backend per dataset.

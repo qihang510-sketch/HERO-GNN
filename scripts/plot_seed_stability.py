@@ -34,6 +34,8 @@ def plot_seed_stability(input_csv: str | Path, output_dir: str | Path, datasets:
     data = seed_stability_data(raw, datasets=datasets or DATASETS)
     write_csv(dirs["figure_data"] / "seed_stability_data.csv", data)
     _plot(data, dirs["figures_pdf"] / "fig_seed_stability_auprc.pdf", dirs["figures_png"] / "fig_seed_stability_auprc.png")
+    figures_dir = Path(output_dir) / "figures"
+    _plot(data, figures_dir / "fig_seed_stability_auprc.pdf", figures_dir / "fig_seed_stability_auprc.png")
     report = dirs["reports"] / "seed_stability_report.md"
     missing = data[data["status"].astype(str) != "ok"] if "status" in data else pd.DataFrame()
     lines = ["# Seed Stability Report", "", f"- input_csv: `{input_csv}`", f"- rows: {len(data)}"]

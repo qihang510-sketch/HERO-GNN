@@ -2,10 +2,19 @@ suite: main
 datasets:
   - yelp_academic
   - amazon_video
-  - fraud_yelp
-  - fraud_amazon
-  - elliptic
-models: null
+models:
+  - mlp
+  - gcn
+  - gat
+  - graphsage
+  - care_gnn
+  - graphconsis
+  - pc_gnn
+  - bwgnn
+  - linkx
+  - dgp
+  - mled
+  - hero
 seeds: [0, 1, 2, 3, 4]
 device: cuda
 output_dir: outputs/submission_unified
@@ -14,5 +23,6 @@ metrics:
   - AUROC
   - AUPRC
 notes:
-  - null models means use the dataset-specific submission matrix in src.training.submission.
+  - Text-rich main results only; transfer datasets are configured in transfer_5seed.yaml.
+  - model=hero maps to hero_full in scripts/run_experiment_suite.py.
   - missing raw results must remain missing or skipped, never imputed.

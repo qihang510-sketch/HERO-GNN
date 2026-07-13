@@ -4,6 +4,7 @@ import logging
 import pickle
 import json
 import time
+import contextlib
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,22 @@ HERO_CONFIG_KEYS = (
     "dropout",
     "weight_decay",
     "class_weight_strategy",
+    "use_class_weight",
+    "loss_type",
+    "focal_gamma",
+    "optimizer",
+    "scheduler",
+    "scheduler_patience",
+    "scheduler_factor",
+    "scheduler_min_lr",
+    "early_stopping_patience",
+    "early_stopping_metric",
+    "risk_weight_temperature",
+)
+VAL_METRIC_KEYS = (
+    ("Macro-F1", "macro_f1"),
+    ("AUROC", "auroc"),
+    ("AUPRC", "auprc"),
 )
 DEFAULT_HERO_CONFIG: dict[str, Any] = {
     "use_risk_relevant_heterophily": True,
@@ -101,6 +118,17 @@ DEFAULT_HERO_CONFIG: dict[str, Any] = {
     "dropout": 0.0,
     "weight_decay": 0.0001,
     "class_weight_strategy": "inverse_frequency",
+    "use_class_weight": True,
+    "loss_type": "bce",
+    "focal_gamma": 2.0,
+    "optimizer": "adamw",
+    "scheduler": "reduce_on_plateau",
+    "scheduler_patience": 10,
+    "scheduler_factor": 0.5,
+    "scheduler_min_lr": 1e-6,
+    "early_stopping_patience": 30,
+    "early_stopping_metric": "AUPRC",
+    "risk_weight_temperature": 1.0,
 }
 
 
@@ -152,6 +180,10 @@ def _resolve_hero_config(model_name: str, overrides: dict[str, Any] | None = Non
     config["encoder_type"] = str(config.get("encoder_type", "dual_branch"))
     config["fusion_type"] = str(config.get("fusion_type", "gated"))
     config["labeler_source"] = str(config.get("labeler_source", "llm_or_mock"))
+    config["optimizer"] = str(config.get("optimizer", DEFAULT_HERO_CONFIG["optimizer"]))
+    config["scheduler"] = str(config.get("scheduler", DEFAULT_HERO_CONFIG["scheduler"]))
+    config["loss_type"] = str(config.get("loss_type", DEFAULT_HERO_CONFIG["loss_type"]))
+    config["early_stopping_metric"] = str(config.get("early_stopping_metric", DEFAULT_HERO_CONFIG["early_stopping_metric"]))
     for key in (
         "risk_relevance_threshold",
         "hetero_branch_weight",
@@ -160,10 +192,17 @@ def _resolve_hero_config(model_name: str, overrides: dict[str, Any] | None = Non
         "routing_loss_weight",
         "dropout",
         "weight_decay",
+        "focal_gamma",
+        "scheduler_factor",
+        "scheduler_min_lr",
+        "risk_weight_temperature",
     ):
         config[key] = float(config.get(key, DEFAULT_HERO_CONFIG[key]))
     config["neighbor_budget"] = int(config.get("neighbor_budget", DEFAULT_HERO_CONFIG["neighbor_budget"]))
+    config["scheduler_patience"] = int(config.get("scheduler_patience", DEFAULT_HERO_CONFIG["scheduler_patience"]))
+    config["early_stopping_patience"] = int(config.get("early_stopping_patience", DEFAULT_HERO_CONFIG["early_stopping_patience"]))
     config["class_weight_strategy"] = str(config.get("class_weight_strategy", "inverse_frequency"))
+    config["use_class_weight"] = bool(config.get("use_class_weight", DEFAULT_HERO_CONFIG["use_class_weight"]))
     config["llm_annotation_enabled"] = bool(config["use_llm_annotation"])
     return config
 
@@ -314,6 +353,9 @@ def train_single_experiment(
     graph = load_processed_data(data_dir)
     official_mode = _is_official_graph(graph, dataset)
     device_name, cuda_available = _resolve_device_name(device)
+    if torch is not None and str(device_name).startswith("cuda") and torch.cuda.is_available():
+        with contextlib.suppress(Exception):
+            torch.cuda.reset_peak_memory_stats(device_name)
     paths = _experiment_paths(output_root, dataset, model_name, seed, experiment_tag=experiment_tag)
     logger = _make_logger(paths["log"], dataset, model_name, seed)
     time_total_start = time.perf_counter()
@@ -344,16 +386,19 @@ def train_single_experiment(
         val_labels=graph.labels[val_idx],
         test_labels=graph.labels[test_idx],
     )
-    resolved_hero_config = _resolve_hero_config(model_name, hero_config) if model_name in HERO_MODEL_NAMES else {}
+    resolved_hero_config = _resolve_hero_config(model_name, hero_config) if model_name in HERO_MODEL_NAMES or model_name in HERO_OFFICIAL_MODEL_NAMES else {}
+    class_weight_enabled = bool(resolved_hero_config.get("use_class_weight", True)) if model_name in HERO_MODEL_NAMES or model_name in HERO_OFFICIAL_MODEL_NAMES else True
     pos_weight = (
         _pos_weight_from_strategy(
             class_stats["train_num_pos"],
             class_stats["train_num_neg"],
             str(resolved_hero_config.get("class_weight_strategy", "inverse_frequency")),
         )
-        if model_name in HERO_MODEL_NAMES
+        if (model_name in HERO_MODEL_NAMES or model_name in HERO_OFFICIAL_MODEL_NAMES) and class_weight_enabled
         else _pos_weight_from_counts(class_stats["train_num_pos"], class_stats["train_num_neg"])
     )
+    if not class_weight_enabled:
+        pos_weight = 1.0
     print(f"[TRAIN-INFO] dataset={dataset} model={model_name} seed={seed}")
     print(f"[TRAIN-INFO] train_pos={class_stats['train_num_pos']} train_neg={class_stats['train_num_neg']} pos_weight={pos_weight:.6f}")
     if model_name in HERO_MODEL_NAMES:
@@ -407,6 +452,7 @@ def train_single_experiment(
         )
         active_lambda_chain_pos = float(resolved_hero_config.get("chain_loss_weight", lambda_chain_pos))
         active_lambda_chain_neg = float(resolved_hero_config.get("routing_loss_weight", lambda_chain_neg))
+        training_control = _hero_training_control(resolved_hero_config)
         features, features_without_chains, hero_artifacts = _prepare_hero_features(
             graph=graph,
             data_dir=data_dir,
@@ -454,6 +500,7 @@ def train_single_experiment(
             min_chain_quality=active_min_chain_quality,
             dropout=float(resolved_hero_config.get("dropout", 0.0)),
             weight_decay=float(resolved_hero_config.get("weight_decay", 1e-4)),
+            **training_control,
             device=device_name,
         )
         stage_times["time_training_sec"] += time.perf_counter() - train_start
@@ -476,6 +523,9 @@ def train_single_experiment(
             heterophilic_topk=heterophilic_topk,
             max_candidates_per_node=max_candidates_per_node,
             enable_official_chain=enable_official_chain,
+            training_control=_hero_training_control(resolved_hero_config),
+            dropout=float(resolved_hero_config.get("dropout", 0.2)),
+            weight_decay=float(resolved_hero_config.get("weight_decay", 1e-4)),
             device=device_name,
         )
         stage_times["time_retrieval_sec"] = float(official_artifacts.get("time_retrieval_sec", 0.0))
@@ -528,8 +578,10 @@ def train_single_experiment(
     threshold_labels = graph.labels[val_idx] if val_idx.size else graph.labels[train_idx]
     threshold_info = tune_threshold(threshold_labels, val_scores, return_info=True)
     best_threshold = float(threshold_info["best_threshold"])
+    validation_metrics = binary_classification_metrics(threshold_labels, val_scores, k=100, threshold=best_threshold)
     metrics = binary_classification_metrics(graph.labels[eval_test_idx], eval_test_scores, k=100, threshold=best_threshold)
     metrics.update(threshold_info)
+    metrics.update(_prefixed_validation_metrics(validation_metrics))
     metrics.update(fixed_threshold_diagnostics(graph.labels[eval_test_idx], eval_test_scores, threshold=0.5))
     metrics.update(prediction_probability_stats(graph.labels[eval_test_idx], eval_test_scores))
     metrics.update(class_stats)
@@ -539,9 +591,12 @@ def train_single_experiment(
     if disable_llm_fallback:
         metrics["disable_llm_fallback"] = True
     metrics["pos_weight"] = float(pos_weight)
+    metrics["class_weight_enabled"] = bool(class_weight_enabled)
     metrics["official_mode"] = bool(official_mode)
     metrics["device"] = device_name
     metrics["cuda_available"] = bool(cuda_available)
+    metrics["peak_gpu_memory_mb"] = _peak_gpu_memory_mb(device_name)
+    metrics.update(_checkpoint_training_metrics(checkpoint))
     metrics.update(_model_metadata(model_name))
     metrics.update({key: bool(value) for key, value in variant_flags.items()})
     if resolved_hero_config:
@@ -621,6 +676,15 @@ def train_single_experiment(
     return payload
 
 
+def _prefixed_validation_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    payload: dict[str, float] = {}
+    for display_key, raw_key in VAL_METRIC_KEYS:
+        value = float(metrics.get(raw_key, metrics.get(display_key, 0.0)))
+        payload[f"val_{display_key}"] = value
+        payload[f"val_{raw_key}"] = value
+    return payload
+
+
 def write_placeholder_result(output_dir: str | Path, experiment_name: str) -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -668,6 +732,47 @@ def _pos_weight_from_strategy(num_pos: int, num_neg: int, strategy: str) -> floa
         neg_eff = (1.0 - beta ** max(int(num_neg), 1)) / (1.0 - beta)
         return float(neg_eff / max(pos_eff, 1e-6))
     return _pos_weight_from_counts(num_pos, num_neg)
+
+
+def _hero_training_control(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "optimizer_name": str(config.get("optimizer", DEFAULT_HERO_CONFIG["optimizer"])),
+        "scheduler_name": str(config.get("scheduler", DEFAULT_HERO_CONFIG["scheduler"])),
+        "scheduler_patience": int(config.get("scheduler_patience", DEFAULT_HERO_CONFIG["scheduler_patience"])),
+        "scheduler_factor": float(config.get("scheduler_factor", DEFAULT_HERO_CONFIG["scheduler_factor"])),
+        "scheduler_min_lr": float(config.get("scheduler_min_lr", DEFAULT_HERO_CONFIG["scheduler_min_lr"])),
+        "early_stopping_patience": int(config.get("early_stopping_patience", DEFAULT_HERO_CONFIG["early_stopping_patience"])),
+        "early_stopping_metric": str(config.get("early_stopping_metric", DEFAULT_HERO_CONFIG["early_stopping_metric"])),
+        "loss_type": str(config.get("loss_type", DEFAULT_HERO_CONFIG["loss_type"])),
+        "focal_gamma": float(config.get("focal_gamma", DEFAULT_HERO_CONFIG["focal_gamma"])),
+    }
+
+
+def _checkpoint_training_metrics(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = checkpoint.get("diagnostics", {}) if isinstance(checkpoint, dict) else {}
+    keys = [
+        "best_epoch",
+        "best_val_AUPRC",
+        "best_val_AUROC",
+        "best_val_Macro-F1",
+        "early_stopped",
+        "epochs_trained",
+        "early_stopping_patience",
+        "optimizer",
+        "scheduler",
+        "loss_type",
+        "selected_by",
+    ]
+    return {key: diagnostics[key] for key in keys if key in diagnostics}
+
+
+def _peak_gpu_memory_mb(device_name: str) -> float | None:
+    if torch is None or not str(device_name).startswith("cuda") or not torch.cuda.is_available():
+        return None
+    try:
+        return float(torch.cuda.max_memory_allocated(device_name) / (1024.0 * 1024.0))
+    except Exception:
+        return None
 
 
 def _prepare_features(graph: ProcessedGraphData, model_name: str, top_k: int) -> np.ndarray:
@@ -733,6 +838,7 @@ def _prepare_hero_features(
     use_heterophily_filter = bool(resolved_config["use_heterophily_filter"])
     heterophily_weight_mode = str(resolved_config.get("heterophily_weight_mode", "relevance_confidence"))
     risk_relevance_threshold = float(resolved_config.get("risk_relevance_threshold", min_chain_quality))
+    risk_weight_temperature = float(resolved_config.get("risk_weight_temperature", 1.0))
     hetero_branch_weight = float(resolved_config.get("hetero_branch_weight", 1.0))
     mechanism_feature_scale = 1.0 + float(resolved_config.get("mechanism_loss_weight", 0.0))
     chain_feature_scale = 1.0 + float(resolved_config.get("routing_loss_weight", 0.0))
@@ -826,6 +932,7 @@ def _prepare_hero_features(
         use_heterophily_filter=use_heterophily_filter,
         weight_mode=heterophily_weight_mode,
         min_risk_score=risk_relevance_threshold,
+        temperature=risk_weight_temperature,
     )
     hetero_features = (hetero_features * hetero_branch_weight).astype(np.float32)
     mechanism_features = (mechanism_features * hetero_branch_weight * mechanism_feature_scale).astype(np.float32)
@@ -872,6 +979,7 @@ def _prepare_hero_features(
         use_mechanism=use_mechanism,
         use_heterophily_filter=use_heterophily_filter,
         weight_mode=heterophily_weight_mode,
+        temperature=risk_weight_temperature,
     )
     chain_features = (chain_features * chain_feature_scale).astype(np.float32)
     features = np.concatenate([graph.features, homo_agg, hetero_features, mechanism_features, chain_features], axis=1).astype(np.float32)
@@ -890,6 +998,7 @@ def _prepare_hero_features(
         "time": timings,
         "feature_dims": feature_dims,
         "min_chain_quality": float(min_chain_quality),
+        "risk_weight_temperature": float(risk_weight_temperature),
         "variant_debug": usage_debug,
         **variant_flags,
     }
@@ -1382,6 +1491,7 @@ def _chain_feature_matrix(
     use_mechanism: bool,
     use_heterophily_filter: bool = True,
     weight_mode: str = "relevance_confidence",
+    temperature: float = 1.0,
 ) -> np.ndarray:
     dim = graph.features.shape[1]
     out_dim = dim + len(schema.EVIDENCE_MECHANISMS) + 2
@@ -1406,7 +1516,7 @@ def _chain_feature_matrix(
             quality = np.array([float(chain.get("chain_quality", 0.0))], dtype=np.float32)
             reps.append(np.concatenate([node_repr, mechanism, score, quality]))
             weights.append(max(float(chain.get("chain_quality", 0.0)), 1e-3) if use_heterophily_filter else 1.0)
-        weight_array = _normalize_hetero_weights(weights, weight_mode if use_heterophily_filter else "uniform")
+        weight_array = _normalize_hetero_weights(weights, weight_mode if use_heterophily_filter else "uniform", temperature=temperature)
         features[target_idx] = np.sum(np.asarray(reps, dtype=np.float32) * weight_array[:, None], axis=0)
     return features
 
@@ -1418,6 +1528,7 @@ def _hetero_feature_matrix(
     use_heterophily_filter: bool = True,
     weight_mode: str = "relevance_confidence",
     min_risk_score: float = 0.0,
+    temperature: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     hetero = np.zeros_like(graph.features, dtype=np.float32)
     mechanisms = np.zeros((graph.features.shape[0], len(schema.EVIDENCE_MECHANISMS)), dtype=np.float32)
@@ -1445,25 +1556,27 @@ def _hetero_feature_matrix(
                 mechanism_reps.append(mechanism)
         if not node_reps:
             continue
-        weight_array = _normalize_hetero_weights(weights, weight_mode if use_heterophily_filter else "uniform")
+        weight_array = _normalize_hetero_weights(weights, weight_mode if use_heterophily_filter else "uniform", temperature=temperature)
         hetero[int(target_idx)] = np.sum(np.asarray(node_reps, dtype=np.float32) * weight_array[:, None], axis=0)
         if use_mechanism and mechanism_reps:
             mechanisms[int(target_idx)] = np.sum(np.asarray(mechanism_reps, dtype=np.float32) * weight_array[:, None], axis=0)
     return hetero, mechanisms
 
 
-def _normalize_hetero_weights(weights: list[float], mode: str) -> np.ndarray:
+def _normalize_hetero_weights(weights: list[float], mode: str, temperature: float = 1.0) -> np.ndarray:
     weight_array = np.asarray(weights, dtype=np.float32)
     if weight_array.size == 0:
         return weight_array
     mode = str(mode or "relevance_confidence").lower()
+    temperature = max(float(temperature), 1e-6)
     if mode == "uniform":
         return np.full_like(weight_array, 1.0 / max(int(weight_array.size), 1), dtype=np.float32)
     if mode == "softmax":
-        shifted = weight_array - float(np.max(weight_array))
+        shifted = (weight_array / temperature) - float(np.max(weight_array / temperature))
         exp = np.exp(shifted)
         return (exp / np.maximum(float(np.sum(exp)), 1e-6)).astype(np.float32)
-    return (weight_array / np.maximum(float(np.sum(weight_array)), 1e-6)).astype(np.float32)
+    adjusted = np.power(np.maximum(weight_array, 1e-6), 1.0 / temperature)
+    return (adjusted / np.maximum(float(np.sum(adjusted)), 1e-6)).astype(np.float32)
 
 
 def _edge_index_for_model(graph: ProcessedGraphData, model_name: str, top_k: int) -> np.ndarray:
@@ -2102,7 +2215,10 @@ def _fit_hero_official_model(
     heterophilic_topk: int,
     max_candidates_per_node: int,
     enable_official_chain: bool,
-    device: str,
+    training_control: dict[str, Any] | None,
+    dropout: float = 0.2,
+    weight_decay: float = 1e-4,
+    device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any], dict[str, Any]]:
     retrieval_start = time.perf_counter()
     features, feature_dims, diagnostics = _prepare_official_features(
@@ -2159,28 +2275,59 @@ def _fit_hero_official_model(
         use_hetero=variant_flags["use_official_hetero"],
         use_relation=variant_flags["use_official_relation"],
         use_feature_deviation=variant_flags["use_official_feature_deviation"],
-        dropout=0.2,
+        dropout=float(dropout),
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device))
+    control = training_control or _hero_training_control({})
+    optimizer = _make_torch_optimizer(model.parameters(), str(control.get("optimizer_name", "adamw")), lr=lr, weight_decay=float(weight_decay))
+    scheduler = _make_torch_scheduler(
+        optimizer,
+        scheduler_name=str(control.get("scheduler_name", "reduce_on_plateau")),
+        epochs=max(1, epochs),
+        patience=int(control.get("scheduler_patience", 10)),
+        factor=float(control.get("scheduler_factor", 0.5)),
+        min_lr=float(control.get("scheduler_min_lr", 1e-6)),
+    )
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device), reduction="none")
     best_state = None
     best_score = -1.0
+    best_epoch = -1
+    best_val_metrics: dict[str, float] = {}
+    stale_epochs = 0
+    early_stopped = False
+    epochs_trained = 0
     for _epoch in range(max(1, epochs)):
+        epochs_trained = _epoch + 1
         model.train()
         optimizer.zero_grad()
         logits = model(target_x, homo_x, hetero_x, deviation_x, relation_x)
-        loss = criterion(logits[train_tensor], y[train_tensor])
+        loss = _binary_training_loss(
+            logits[train_tensor],
+            y[train_tensor],
+            criterion=criterion,
+            loss_type=str(control.get("loss_type", "bce")),
+            focal_gamma=float(control.get("focal_gamma", 2.0)),
+        )
         loss.backward()
         optimizer.step()
 
         model.eval()
         with torch.no_grad():
             logits = model(target_x, homo_x, hetero_x, deviation_x, relation_x)
-            val_scores = torch.sigmoid(logits[val_tensor]).detach().cpu().numpy()
+        val_scores = torch.sigmoid(logits[val_tensor]).detach().cpu().numpy()
         val_metrics = binary_classification_metrics(graph.labels[val_eval_idx], val_scores, k=100)
-        if val_metrics["auprc"] >= best_score:
-            best_score = val_metrics["auprc"]
+        monitor_score = _validation_monitor_score(val_metrics, str(control.get("early_stopping_metric", "AUPRC")))
+        _step_torch_scheduler(scheduler, str(control.get("scheduler_name", "reduce_on_plateau")), monitor_score)
+        if monitor_score >= best_score:
+            best_score = monitor_score
+            best_epoch = int(_epoch + 1)
+            best_val_metrics = dict(val_metrics)
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        if int(control.get("early_stopping_patience", 30)) >= 0 and stale_epochs >= int(control.get("early_stopping_patience", 30)):
+            early_stopped = True
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -2190,7 +2337,24 @@ def _fit_hero_official_model(
         val_scores = torch.sigmoid(logits[val_tensor]).detach().cpu().numpy()
         test_scores = torch.sigmoid(logits[test_tensor]).detach().cpu().numpy()
         diagnostics.update(_official_gate_diagnostics(details, test_tensor))
-    return val_scores, test_scores, {"model_state_dict": best_state, "model_name": model_name, "pos_weight": float(pos_weight)}, {
+    diagnostics.update(
+        {
+            "best_epoch": int(best_epoch),
+            "best_val_AUPRC": float(best_val_metrics.get("auprc", 0.0)),
+            "best_val_AUROC": float(best_val_metrics.get("auroc", 0.0)),
+            "best_val_Macro-F1": float(best_val_metrics.get("macro_f1", 0.0)),
+            "selected_by": f"validation_{str(control.get('early_stopping_metric', 'AUPRC')).upper()}",
+            "early_stopped": bool(early_stopped),
+            "epochs_trained": int(epochs_trained),
+            "early_stopping_patience": int(control.get("early_stopping_patience", 30)),
+            "optimizer": str(control.get("optimizer_name", "adamw")).lower(),
+            "scheduler": str(control.get("scheduler_name", "reduce_on_plateau")).lower(),
+            "loss_type": str(control.get("loss_type", "bce")).lower(),
+            "dropout": float(dropout),
+            "weight_decay": float(weight_decay),
+        }
+    )
+    return val_scores, test_scores, {"model_state_dict": best_state, "model_name": model_name, "pos_weight": float(pos_weight), "diagnostics": diagnostics}, {
         "diagnostics": diagnostics,
         "time_retrieval_sec": retrieval_time,
     }
@@ -2430,6 +2594,62 @@ def _torch_branch_delta_diagnostics(
     }
 
 
+def _make_torch_optimizer(parameters, optimizer_name: str, lr: float, weight_decay: float):
+    name = str(optimizer_name or "adamw").lower()
+    if name == "adam":
+        return torch.optim.Adam(parameters, lr=float(lr), weight_decay=float(weight_decay))
+    if name == "adamw":
+        return torch.optim.AdamW(parameters, lr=float(lr), weight_decay=float(weight_decay))
+    raise ValueError(f"unsupported_optimizer:{optimizer_name}")
+
+
+def _make_torch_scheduler(optimizer, scheduler_name: str, epochs: int, patience: int, factor: float, min_lr: float):
+    name = str(scheduler_name or "none").lower()
+    if name in {"", "none", "off"}:
+        return None
+    if name in {"reduce_on_plateau", "reducelronplateau", "plateau"}:
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            patience=max(int(patience), 0),
+            factor=float(factor),
+            min_lr=float(min_lr),
+        )
+    if name in {"cosine", "cosine_annealing"}:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(int(epochs), 1), eta_min=float(min_lr))
+    raise ValueError(f"unsupported_scheduler:{scheduler_name}")
+
+
+def _step_torch_scheduler(scheduler, scheduler_name: str, monitor_score: float) -> None:
+    if scheduler is None:
+        return
+    name = str(scheduler_name or "none").lower()
+    if name in {"reduce_on_plateau", "reducelronplateau", "plateau"}:
+        scheduler.step(float(monitor_score))
+    else:
+        scheduler.step()
+
+
+def _binary_training_loss(logits, targets, criterion, loss_type: str, focal_gamma: float):
+    bce = criterion(logits, targets)
+    if str(loss_type or "bce").lower() == "focal":
+        probs = torch.sigmoid(logits)
+        pt = torch.where(targets == 1.0, probs, 1.0 - probs)
+        bce = bce * torch.pow(torch.clamp(1.0 - pt, min=0.0, max=1.0), float(focal_gamma))
+    return bce.mean()
+
+
+def _validation_monitor_score(val_metrics: dict[str, Any], metric: str) -> float:
+    key = str(metric or "AUPRC").lower().replace("_", "-")
+    if key in {"auprc", "val-auprc"}:
+        return float(val_metrics.get("auprc", val_metrics.get("AUPRC", 0.0)))
+    if key in {"auroc", "val-auroc"}:
+        return float(val_metrics.get("auroc", val_metrics.get("AUROC", 0.0)))
+    if key in {"macro-f1", "macro_f1", "f1", "val-macro-f1"}:
+        return float(val_metrics.get("macro_f1", val_metrics.get("Macro-F1", 0.0)))
+    return float(val_metrics.get("auprc", val_metrics.get("AUPRC", 0.0)))
+
+
 def _fit_torch_feature_model(
     features: np.ndarray,
     features_without_chains: np.ndarray,
@@ -2455,6 +2675,15 @@ def _fit_torch_feature_model(
     min_chain_quality: float = 0.45,
     dropout: float = 0.0,
     weight_decay: float = 1e-4,
+    optimizer_name: str = "adamw",
+    scheduler_name: str = "reduce_on_plateau",
+    scheduler_patience: int = 10,
+    scheduler_factor: float = 0.5,
+    scheduler_min_lr: float = 1e-6,
+    early_stopping_patience: int = 30,
+    early_stopping_metric: str = "AUPRC",
+    loss_type: str = "bce",
+    focal_gamma: float = 2.0,
     device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     if torch is None:
@@ -2508,19 +2737,39 @@ def _fit_torch_feature_model(
         chain_input_dim=int(feature_dims["chain_dim"]),
         dropout=float(dropout),
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=float(weight_decay))
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device))
+    optimizer = _make_torch_optimizer(model.parameters(), optimizer_name, lr=lr, weight_decay=float(weight_decay))
+    scheduler = _make_torch_scheduler(
+        optimizer,
+        scheduler_name=scheduler_name,
+        epochs=max(1, epochs),
+        patience=int(scheduler_patience),
+        factor=float(scheduler_factor),
+        min_lr=float(scheduler_min_lr),
+    )
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device), reduction="none")
     best_state = None
     best_score = -1.0
+    best_epoch = -1
+    best_val_metrics: dict[str, float] = {}
+    stale_epochs = 0
+    early_stopped = False
     last_chain_pos_loss = 0.0
     last_chain_neg_loss = 0.0
     active_lambda_pos = float(lambda_chain_pos) if model_name == "hero_gnn" and use_chain else 0.0
     active_lambda_neg = float(lambda_chain_neg) if model_name == "hero_gnn" and use_chain else 0.0
+    epochs_trained = 0
     for _epoch in range(max(1, epochs)):
+        epochs_trained = _epoch + 1
         model.train()
         optimizer.zero_grad()
         logits = model(target_x, homo_x, hetero_x, mechanism_x, chain_x)
-        loss = criterion(logits[train_tensor], y[train_tensor])
+        loss = _binary_training_loss(
+            logits[train_tensor],
+            y[train_tensor],
+            criterion=criterion,
+            loss_type=loss_type,
+            focal_gamma=float(focal_gamma),
+        )
         chain_pos_loss = torch.tensor(0.0, dtype=loss.dtype)
         chain_neg_loss = torch.tensor(0.0, dtype=loss.dtype)
         if active_lambda_pos > 0.0 or active_lambda_neg > 0.0:
@@ -2549,9 +2798,19 @@ def _fit_torch_feature_model(
             logits = model(target_x, homo_x, hetero_x, mechanism_x, chain_x)
             val_scores = torch.sigmoid(logits[val_tensor]).cpu().numpy()
         val_metrics = binary_classification_metrics(labels[val_eval_idx], val_scores, k=100)
-        if val_metrics["auprc"] >= best_score:
-            best_score = val_metrics["auprc"]
+        monitor_score = _validation_monitor_score(val_metrics, early_stopping_metric)
+        _step_torch_scheduler(scheduler, scheduler_name, monitor_score)
+        if monitor_score >= best_score:
+            best_score = monitor_score
+            best_epoch = int(_epoch + 1)
+            best_val_metrics = dict(val_metrics)
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        if int(early_stopping_patience) >= 0 and stale_epochs >= int(early_stopping_patience):
+            early_stopped = True
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -2588,6 +2847,17 @@ def _fit_torch_feature_model(
             "fusion_type": str(fusion_type),
             "dropout": float(dropout),
             "weight_decay": float(weight_decay),
+            "optimizer": str(optimizer_name).lower(),
+            "scheduler": str(scheduler_name).lower(),
+            "loss_type": str(loss_type).lower(),
+            "best_epoch": int(best_epoch),
+            "best_val_AUPRC": float(best_val_metrics.get("auprc", 0.0)),
+            "best_val_AUROC": float(best_val_metrics.get("auroc", 0.0)),
+            "best_val_Macro-F1": float(best_val_metrics.get("macro_f1", 0.0)),
+            "selected_by": f"validation_{str(early_stopping_metric).upper()}",
+            "early_stopped": bool(early_stopped),
+            "epochs_trained": int(epochs_trained),
+            "early_stopping_patience": int(early_stopping_patience),
         }
     )
     return val_scores, test_scores, scores_without_chains, {

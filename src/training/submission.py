@@ -32,6 +32,33 @@ TEXT_RICH_DATASETS = ("yelp_academic", "amazon_video")
 OFFICIAL_DATASETS = ("fraud_yelp", "fraud_amazon")
 TRANSACTION_DATASETS = ("elliptic",)
 SUBMISSION_DATASETS = (*TEXT_RICH_DATASETS, *OFFICIAL_DATASETS, *TRANSACTION_DATASETS)
+HERO_FULL_MODEL = "hero_full"
+HERO_TEXT_BASE_MODEL = "hero_gnn"
+HERO_OFFICIAL_BASE_MODEL = "hero_official"
+HERO_EXPERIMENT_VARIANTS = (
+    "hero_full",
+    "hero_no_llm",
+    "hero_no_mechanism",
+    "hero_no_risk_weighting",
+    "hero_no_relation_loss",
+    "hero_no_chain_consistency",
+    "hero_structure_only",
+    "hero_semantic_only",
+    "hero_no_dual_branch",
+)
+HERO_DISPLAY_NAMES = {
+    "hero_full": "HERO",
+    "hero_gnn": "HERO-GNN",
+    "hero_official": "HERO-official",
+    "hero_no_llm": "HERO w/o LLM",
+    "hero_no_mechanism": "HERO w/o mechanism",
+    "hero_no_risk_weighting": "HERO w/o risk weighting",
+    "hero_no_relation_loss": "HERO w/o relation loss",
+    "hero_no_chain_consistency": "HERO w/o chain consistency",
+    "hero_structure_only": "HERO structure only",
+    "hero_semantic_only": "HERO semantic only",
+    "hero_no_dual_branch": "HERO w/o dual branch",
+}
 
 TEXT_RICH_MODELS = (
     "mlp",
@@ -45,7 +72,7 @@ TEXT_RICH_MODELS = (
     "linkx",
     "dgp",
     "mled",
-    "hero_gnn",
+    "hero_full",
 )
 OFFICIAL_MODELS = (
     "mlp",
@@ -57,7 +84,7 @@ OFFICIAL_MODELS = (
     "pc_gnn",
     "bwgnn",
     "linkx",
-    "hero_official",
+    "hero_full",
 )
 TRANSACTION_MODELS = (
     "mlp",
@@ -68,7 +95,7 @@ TRANSACTION_MODELS = (
     "linkx",
     "hogrl",
     "rgtan",
-    "hero_official",
+    "hero_full",
 )
 DATASET_MODEL_MATRIX = {
     "yelp_academic": TEXT_RICH_MODELS,
@@ -97,6 +124,11 @@ MODEL_ALIASES = {
     "HERO-GNN": "hero_gnn",
     "HERO-official": "hero_official",
     "HERO_OFFICIAL": "hero_official",
+    "HERO": "hero_full",
+    "hero": "hero_full",
+    "full_hero": "hero_full",
+    "HERO_FULL": "hero_full",
+    "hero_proxy": "hero_no_llm",
 }
 FORBIDDEN_SUBMISSION_NAMES = {
     "care_gnn_lite",
@@ -127,8 +159,9 @@ MODEL_IMPLEMENTATION_SOURCE = {
     "rgtan": "reproduced",
     "hero_gnn": "project",
     "hero_official": "project",
+    **{variant: "project" for variant in HERO_EXPERIMENT_VARIANTS},
 }
-HERO_MODELS = {"hero_gnn", "hero_official"}
+HERO_MODELS = {"hero_gnn", "hero_official", *HERO_EXPERIMENT_VARIANTS}
 
 
 @dataclass
@@ -164,6 +197,86 @@ def default_models_for_dataset(dataset: str) -> tuple[str, ...]:
     return DATASET_MODEL_MATRIX[dataset]
 
 
+def is_hero_model_name(model: str) -> bool:
+    text = normalize_model_name(model)
+    return text in HERO_MODELS or text.startswith("hero_")
+
+
+def hero_base_model_for_dataset(dataset: str, model: str) -> str:
+    dataset = normalize_dataset_name(dataset)
+    model = normalize_model_name(model)
+    if model in {HERO_TEXT_BASE_MODEL, HERO_OFFICIAL_BASE_MODEL}:
+        return model
+    if model in HERO_EXPERIMENT_VARIANTS or model == "hero":
+        return HERO_TEXT_BASE_MODEL if dataset in TEXT_RICH_DATASETS else HERO_OFFICIAL_BASE_MODEL
+    return model
+
+
+def hero_display_name(model: str) -> str:
+    model = normalize_model_name(model)
+    return HERO_DISPLAY_NAMES.get(model, model)
+
+
+def hero_variant_overrides(model: str) -> dict[str, Any]:
+    model = normalize_model_name(model)
+    if model in {"hero_full", "hero_gnn", "hero_official"}:
+        return {}
+    if model == "hero_no_llm":
+        return {"use_llm_annotation": False, "labeler_source": "rule_or_structure"}
+    if model == "hero_no_mechanism":
+        return {"use_mechanism_annotation": False, "use_llm_annotation": False, "labeler_source": "rule_or_structure"}
+    if model == "hero_no_risk_weighting":
+        return {"heterophily_weight_mode": "uniform", "use_heterophily_filter": False}
+    if model == "hero_no_chain_consistency":
+        return {"chain_loss_weight": 0.0, "routing_loss_weight": 0.0}
+    if model == "hero_structure_only":
+        return {
+            "use_risk_relevant_heterophily": False,
+            "use_mechanism_annotation": False,
+            "use_evidence_chain": False,
+            "use_llm_annotation": False,
+            "labeler_source": "structure",
+        }
+    if model == "hero_semantic_only":
+        return {
+            "use_mechanism_annotation": True,
+            "use_llm_annotation": True,
+            "use_evidence_chain": True,
+            "heterophily_weight_mode": "relevance_confidence",
+        }
+    if model == "hero_no_relation_loss":
+        return {}
+    if model == "hero_no_dual_branch":
+        return {"use_dual_branch_encoder": False, "encoder_type": "single_branch"}
+    return {}
+
+
+def hero_variant_support(model: str) -> dict[str, str]:
+    model = normalize_model_name(model)
+    support = {
+        "risk_card_construction": "supported",
+        "llm_or_proxy_annotation": "supported",
+        "risk_relevance_score": "supported",
+        "mechanism_label_embedding": "supported",
+        "confidence_score": "supported",
+        "text_rating_time_business_features": "supported_if_present_in_processed_data",
+        "structural_branch": "supported",
+        "semantic_mechanism_branch": "supported",
+        "risk_aware_neighbor_weighting": "supported",
+        "relation_alignment_loss": "unsupported",
+        "evidence_chain_extraction": "supported",
+        "chain_consistency_loss": "supported_via_chain_and_routing_losses",
+    }
+    if model == "hero_no_relation_loss":
+        support["relation_alignment_loss"] = "unsupported_noop_variant"
+    if model == "hero_semantic_only":
+        support["structural_branch"] = "partial_backbone_still_present"
+    if model == "hero_no_dual_branch":
+        support["structural_branch"] = "single_branch_encoder"
+        support["semantic_mechanism_branch"] = "single_branch_encoder"
+    return support
+
+
 def run_submission_experiment(
     dataset: str,
     model: str,
@@ -181,6 +294,8 @@ def run_submission_experiment(
 ) -> SubmissionResult:
     dataset = normalize_dataset_name(dataset)
     model = normalize_model_name(model)
+    is_hero = is_hero_model_name(model)
+    trainer_model = hero_base_model_for_dataset(dataset, model) if is_hero else model
     result_dir = Path(output_dir) / dataset / model / f"seed_{seed}"
     metrics_path = result_dir / "metrics.json"
     skip_path = result_dir / "skip_reason.json"
@@ -192,8 +307,10 @@ def run_submission_experiment(
         return write_skip(result_dir, dataset, model, seed, "forbidden_lite_baseline_name")
     if dataset not in DATASET_MODEL_MATRIX:
         return write_skip(result_dir, dataset, model, seed, "unknown_dataset")
-    if model not in DATASET_MODEL_MATRIX[dataset]:
+    if model not in DATASET_MODEL_MATRIX[dataset] and not is_hero:
         return write_skip(result_dir, dataset, model, seed, "model_not_applicable_to_dataset")
+    if is_hero and trainer_model not in {HERO_TEXT_BASE_MODEL, HERO_OFFICIAL_BASE_MODEL}:
+        return write_skip(result_dir, dataset, model, seed, f"unsupported_hero_variant:{model}")
     data_dir = resolve_processed_dir(dataset, data_root=data_root)
     if not processed_ready(data_dir):
         return write_skip(
@@ -216,11 +333,14 @@ def run_submission_experiment(
                 "processed split has no labeled train/val/test nodes",
                 {"data_dir": str(data_dir), **_split_validation_extra(split_status)},
             )
-        if model in HERO_MODELS:
-            hero_config, trainer_overrides, config_source = _load_hero_runtime_config(config)
+        if is_hero:
+            if trainer_model not in DATASET_MODEL_MATRIX[dataset]:
+                return write_skip(result_dir, dataset, model, seed, "model_not_applicable_to_dataset")
+            hero_config, trainer_overrides, config_source = _load_hero_runtime_config(config, base_model=trainer_model, variant=model)
             return _run_project_hero(
                 dataset=dataset,
                 model=model,
+                trainer_model=trainer_model,
                 seed=seed,
                 data_dir=data_dir,
                 result_dir=result_dir,
@@ -308,38 +428,66 @@ def write_skip(
     return SubmissionResult(dataset, model, seed, "skipped", path, reason)
 
 
-def _load_hero_runtime_config(config: str | Path | dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any], str]:
-    if config is None:
-        return {}, {}, ""
-    if isinstance(config, dict):
-        payload = dict(config)
-        source = str(payload.get("config_source", "inline"))
-    else:
-        path = Path(config)
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        source = str(path)
-    model_payload = payload.get("hero_config") if isinstance(payload.get("hero_config"), dict) else payload
-    hero_config = {key: value for key, value in dict(model_payload).items() if key in HERO_CONFIG_KEYS}
-    trainer_payload = dict(payload.get("trainer", {})) if isinstance(payload.get("trainer"), dict) else {}
-    for source_key, target_key in [
-        ("learning_rate", "lr"),
-        ("lr", "lr"),
-        ("hidden_dim", "hidden_dim"),
-        ("top_k", "top_k"),
-        ("epochs", "epochs"),
-    ]:
-        if source_key in payload:
-            trainer_payload[target_key] = payload[source_key]
-        if source_key in model_payload:
-            trainer_payload[target_key] = model_payload[source_key]
+def _load_hero_runtime_config(
+    config: str | Path | dict[str, Any] | None,
+    base_model: str | None = None,
+    variant: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    payloads: list[tuple[dict[str, Any], str]] = []
+    default_path = _default_hero_config_path(base_model)
+    if default_path is not None and default_path.exists():
+        payloads.append((yaml.safe_load(default_path.read_text(encoding="utf-8")) or {}, str(default_path)))
+    if config is not None:
+        if isinstance(config, dict):
+            payloads.append((dict(config), str(config.get("config_source", "inline"))))
+        else:
+            path = Path(config)
+            payloads.append((yaml.safe_load(path.read_text(encoding="utf-8")) or {}, str(path)))
+    hero_config: dict[str, Any] = {}
+    trainer_payload: dict[str, Any] = {}
+    sources: list[str] = []
+    for payload, source in payloads:
+        sources.append(source)
+        if isinstance(payload.get("hero_config"), dict):
+            model_payload = payload.get("hero_config")
+        elif isinstance(payload.get("hero"), dict):
+            model_payload = payload.get("hero")
+        else:
+            model_payload = payload
+        hero_config.update({key: value for key, value in dict(model_payload).items() if key in HERO_CONFIG_KEYS})
+        if isinstance(payload.get("trainer"), dict):
+            trainer_payload.update(dict(payload.get("trainer", {})))
+        for source_obj in (payload, model_payload):
+            if not isinstance(source_obj, dict):
+                continue
+            for source_key, target_key in [
+                ("learning_rate", "lr"),
+                ("lr", "lr"),
+                ("hidden_dim", "hidden_dim"),
+                ("top_k", "top_k"),
+                ("epochs", "epochs"),
+            ]:
+                if source_key in source_obj:
+                    trainer_payload[target_key] = source_obj[source_key]
+    hero_config.update(hero_variant_overrides(variant or HERO_FULL_MODEL))
     if "neighbor_budget" in hero_config and "top_k" not in trainer_payload:
         trainer_payload["top_k"] = hero_config["neighbor_budget"]
-    return hero_config, trainer_payload, source
+    source_text = ";".join(sources) if sources else "trainer_defaults"
+    if variant:
+        source_text = f"{source_text};variant={normalize_model_name(variant)}"
+    return hero_config, trainer_payload, source_text
+
+
+def _default_hero_config_path(base_model: str | None) -> Path | None:
+    if base_model not in {HERO_TEXT_BASE_MODEL, HERO_OFFICIAL_BASE_MODEL}:
+        return None
+    return Path("configs") / "models" / f"{base_model}.yaml"
 
 
 def _run_project_hero(
     dataset: str,
     model: str,
+    trainer_model: str,
     seed: int,
     data_dir: Path,
     result_dir: Path,
@@ -363,7 +511,7 @@ def _run_project_hero(
     active_top_k = int(trainer_overrides.get("top_k", top_k))
     metrics = train_single_experiment(
         dataset=trainer_dataset,
-        model_name=model,
+        model_name=trainer_model,
         seed=seed,
         data_dir=data_dir,
         output_root=internal_root,
@@ -376,8 +524,13 @@ def _run_project_hero(
         hero_config=hero_config,
     )
     result_dir.mkdir(parents=True, exist_ok=True)
-    converted = _submission_metric_payload(metrics, dataset, model, seed, MODEL_IMPLEMENTATION_SOURCE[model])
+    implementation_source = MODEL_IMPLEMENTATION_SOURCE.get(model, MODEL_IMPLEMENTATION_SOURCE.get(trainer_model, "project"))
+    converted = _submission_metric_payload(metrics, dataset, model, seed, implementation_source)
     converted["trainer_dataset"] = trainer_dataset
+    converted["trainer_model"] = trainer_model
+    converted["display_model"] = hero_display_name(model)
+    converted["hero_variant"] = model
+    converted["hero_variant_support"] = hero_variant_support(model)
     converted["data_dir"] = str(data_dir)
     write_json(result_dir / "metrics.json", converted)
     prediction_file = metrics.get("predictions_file")
@@ -389,10 +542,14 @@ def _run_project_hero(
         model,
         seed,
         data_dir,
-        MODEL_IMPLEMENTATION_SOURCE[model],
+        implementation_source,
         {
             "source": "train_single_experiment",
             "config_source": config_source,
+            "requested_model": model,
+            "trainer_model": trainer_model,
+            "display_model": hero_display_name(model),
+            "hero_variant_support": hero_variant_support(model),
             "hero_config": hero_config or {},
             "trainer_overrides": {
                 "epochs": active_epochs,

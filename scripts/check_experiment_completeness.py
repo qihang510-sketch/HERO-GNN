@@ -9,7 +9,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.run_experiment_suite import _expected_runs, _expand_suites  # noqa: E402
+from scripts.run_experiment_suite import DEFAULT_SEEDS, _expected_runs, _expand_suites  # noqa: E402
 from scripts.summarize_experiment_suite import expected_runs_from_config, load_run_records, missing_runs  # noqa: E402
 from src.training.submission import SUBMISSION_DATASETS, normalize_dataset_name  # noqa: E402
 
@@ -17,7 +17,7 @@ from src.training.submission import SUBMISSION_DATASETS, normalize_dataset_name 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check completeness of unified HERO experiment outputs.")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--suite", default=None, choices=["main", "ablation", "robustness", "labeler_comparison", "faithfulness", "cost", "all"])
+    parser.add_argument("--suite", default=None, choices=["main", "transfer", "ablation", "robustness", "labeler_comparison", "faithfulness", "sensitivity", "cost", "all"])
     parser.add_argument("--datasets", nargs="+", default=None)
     parser.add_argument("--models", nargs="*", default=None)
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
@@ -54,21 +54,26 @@ def completeness_table(
             observed[(str(row.suite), str(row.dataset), str(row.model), int(row.seed))] = row
     rows = []
     for item in expected:
-        key = (str(item["suite"]), str(item["dataset"]), str(item["model"]), int(item["seed"]))
+        seed = _seed_value(item.get("seed"))
+        key = (str(item["suite"]), str(item["dataset"]), str(item["model"]), seed)
         row = observed.get(key)
         if row is None:
-            rows.append({**item, "status": "missing", "reason": "raw_result_absent"})
+            rows.append({**item, "seed": seed, "status": "missing", "reason": "raw_result_absent"})
         elif str(row.status) not in {"ok", "exists"}:
-            rows.append({**item, "status": str(row.status), "reason": str(getattr(row, "skip_reason", ""))})
+            rows.append({**item, "seed": seed, "status": str(row.status), "reason": str(getattr(row, "skip_reason", ""))})
     return pd.DataFrame(rows, columns=["suite", "dataset", "model", "seed", "status", "reason"])
 
 
 def _expected_from_args_or_config(args: argparse.Namespace, output_dir: Path) -> list[dict[str, Any]]:
     if args.suite or args.datasets or args.models is not None or args.seeds:
         suites = _expand_suites(args.suite or "main")
-        datasets = [normalize_dataset_name(dataset) for dataset in (args.datasets or list(SUBMISSION_DATASETS))]
-        seeds = args.seeds or [0, 1, 2, 3, 4]
-        return _expected_runs(suites=suites, datasets=datasets, models=args.models, seeds=seeds)
+        suite_args = argparse.Namespace(
+            datasets=[normalize_dataset_name(dataset) for dataset in args.datasets] if args.datasets else None,
+            models=args.models,
+            variants=None,
+            seeds=args.seeds or list(DEFAULT_SEEDS),
+        )
+        return _expected_runs(suites=suites, args=suite_args)
     return expected_runs_from_config(output_dir)
 
 
@@ -85,10 +90,12 @@ def _print_missing_commands(table: pd.DataFrame, output_dir: Path, write_file: b
     commands = []
     grouped = table.groupby(["suite", "dataset", "model"], dropna=False)
     for (suite, dataset, model), group in grouped:
-        seeds = " ".join(str(int(seed)) for seed in sorted(group["seed"].astype(int).unique()))
+        seed_values = sorted(_seed_value(seed) for seed in group["seed"].unique())
+        seed_values = [seed for seed in seed_values if seed >= 0]
+        seed_arg = f"--seeds {' '.join(str(seed) for seed in seed_values)} " if seed_values else ""
         command = (
             f"python scripts/run_experiment_suite.py --suite {suite} "
-            f"--datasets {dataset} --models {model} --seeds {seeds} "
+            f"--datasets {dataset} --models {model} {seed_arg}"
             f"--output_dir {output_dir} --skip_existing"
         )
         commands.append(command)
@@ -100,6 +107,15 @@ def _print_missing_commands(table: pd.DataFrame, output_dir: Path, write_file: b
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(commands) + "\n", encoding="utf-8")
         print(f"Wrote rerun commands to {path}")
+
+
+def _seed_value(value: Any) -> int:
+    try:
+        if value is None or value == "":
+            return -1
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
 
 
 if __name__ == "__main__":
