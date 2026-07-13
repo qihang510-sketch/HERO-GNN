@@ -1,6 +1,6 @@
 import pandas as pd
 
-from scripts.run_sensitivity_analysis import plot_sensitivity, summarize_sensitivity
+from scripts.run_sensitivity_analysis import _coerce_values, _first_present, _sensitivity_specs, plot_sensitivity, summarize_sensitivity
 
 
 def test_sensitivity_missing_data_summarizes_unavailable(tmp_path):
@@ -51,3 +51,17 @@ def test_sensitivity_plots_from_fake_csv(tmp_path):
     assert (output_dir / "figures" / "fig_sensitivity_k.pdf").exists()
     assert (output_dir / "figures" / "fig_sensitivity_lambda_rel.pdf").exists()
     assert (output_dir / "figures" / "fig_sensitivity_lambda_heatmap.pdf").exists()
+
+
+def test_sensitivity_none_parameters_fall_back_without_int_none():
+    class Args:
+        k_values = [None, pd.NA, 5, 10]
+        lambda_rel_values = [None, pd.NA, 0.0]
+        lambda_chain_values = [None, pd.NA, 0.0]
+        confidence_thresholds = [None, pd.NA, 0.3]
+
+    specs = _sensitivity_specs(Args())
+    k_specs = [spec for spec in specs if spec["parameter"] == "candidate_neighbor_k"]
+    assert [spec["candidate_neighbor_k"] for spec in k_specs] == [5, 10]
+    assert _coerce_values([None, pd.NA], [5, 10], int) == [5, 10]
+    assert _first_present(None, pd.NA, 5) == 5

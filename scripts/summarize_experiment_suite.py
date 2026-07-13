@@ -129,9 +129,9 @@ def _read_run_dir(run_dir: Path, raw_dir: Path) -> dict[str, Any] | None:
     for source in [config, metrics, skip, runtime]:
         payload.update({key: value for key, value in source.items() if value is not None})
     dataset, model, seed, suite = _infer_identity(run_dir, raw_dir, payload)
-    if not dataset or model is None or seed is None:
+    if _is_missing_scalar(dataset) or _is_missing_scalar(model) or seed is None:
         return None
-    status = str(payload.get("status", "") or "")
+    status = _safe_str(payload.get("status", ""))
     has_metrics = metrics and all(_metric_value(metrics, metric) is not None for metric in ["Macro-F1", "AUROC", "AUPRC"])
     if not status:
         status = "ok" if has_metrics else ("missing" if skip else "unknown")
@@ -153,12 +153,12 @@ def _read_run_dir(run_dir: Path, raw_dir: Path) -> dict[str, Any] | None:
 
 
 def _infer_identity(run_dir: Path, raw_dir: Path, payload: dict[str, Any]) -> tuple[str, str | None, int | None, str]:
-    dataset = str(payload.get("dataset", "") or "")
+    dataset = _safe_str(payload.get("dataset", ""))
     model = payload.get("model", payload.get("variant"))
     seed = payload.get("seed")
-    suite = str(payload.get("suite", "") or "")
-    if dataset and model is not None and seed is not None:
-        return dataset, str(model), _safe_int(seed), suite or "main"
+    suite = _safe_str(payload.get("suite", ""))
+    if dataset and not _is_missing_scalar(model) and seed is not None:
+        return dataset, _safe_str(model), _safe_int(seed), suite or "main"
     try:
         parts = run_dir.relative_to(raw_dir).parts
     except ValueError:
@@ -168,9 +168,9 @@ def _infer_identity(run_dir: Path, raw_dir: Path, payload: dict[str, Any]) -> tu
         parts = parts[1:]
     if len(parts) >= 3:
         dataset = dataset or parts[0]
-        model = str(model or parts[1])
+        model = _safe_str(model) if not _is_missing_scalar(model) else str(parts[1])
         seed = _safe_int(seed if seed is not None else str(parts[2]).replace("seed_", ""))
-    return dataset, str(model) if model is not None else None, _safe_int(seed), suite or "main"
+    return dataset, _safe_str(model) if not _is_missing_scalar(model) else None, _safe_int(seed), suite or "main"
 
 
 def _metric_value(payload: dict[str, Any], metric: str) -> float | None:
@@ -257,13 +257,14 @@ def _append_not_applicable_rows(table: pd.DataFrame, frame: pd.DataFrame, model_
     if not table.empty and {"dataset", "model"}.issubset(table.columns):
         existing = set(zip(table["dataset"].astype(str), table["model"].astype(str)))
     for (dataset, model), _group in skip.groupby(["dataset", "model"], dropna=False):
-        key = (str(dataset), str(model))
+        label = _summary_model_label(model)
+        key = (str(dataset), label)
         if key in existing:
             continue
         row = {"dataset": dataset, "model": model, "seed_count": 0}
-        row["model"] = _summary_model_label(model)
+        row["model"] = label
         if model_label != "model":
-            row[model_label] = _summary_model_label(model)
+            row[model_label] = label
         for metric in ["Macro-F1", "AUROC", "AUPRC"]:
             row[f"{metric}_mean"] = pd.NA
             row[f"{metric}_std"] = pd.NA
@@ -286,8 +287,8 @@ def _ordered_mean_std_columns(table: pd.DataFrame, model_label: str) -> pd.DataF
 
 
 def _summary_model_label(model: Any) -> str:
-    text = str(model)
-    if text == "hero_full":
+    text = _safe_str(model)
+    if text in {"hero", "hero_full", "hero_gnn", "hero_official"}:
         return "HERO"
     return hero_display_name(text) if text.startswith("hero_") else text
 
@@ -322,22 +323,28 @@ def missing_runs(output_dir: str | Path, records: pd.DataFrame | None = None) ->
     observed = set()
     if not records.empty:
         for row in records.itertuples(index=False):
-            observed.add((str(row.suite), str(row.dataset), str(row.model), int(row.seed)))
+            seed = _safe_int(getattr(row, "seed", None))
+            if seed is None:
+                continue
+            observed.add((str(row.suite), str(row.dataset), _canonical_model_key(row.model), seed))
             if str(row.status) not in {"ok", "exists"}:
                 rows.append(
                     {
                         "suite": row.suite,
                         "dataset": row.dataset,
                         "model": row.model,
-                        "seed": int(row.seed),
+                        "seed": seed,
                         "status": row.status,
                         "reason": getattr(row, "skip_reason", ""),
                     }
                 )
     for item in expected:
-        key = (str(item["suite"]), str(item["dataset"]), str(item["model"]), int(item["seed"]))
+        seed = _safe_int(item.get("seed"))
+        if seed is None:
+            continue
+        key = (str(item["suite"]), str(item["dataset"]), _canonical_model_key(item["model"]), seed)
         if key not in observed:
-            rows.append({**item, "status": "missing", "reason": "raw_result_absent"})
+            rows.append({**item, "seed": seed, "status": "missing", "reason": "raw_result_absent"})
     return pd.DataFrame(rows, columns=["suite", "dataset", "model", "seed", "status", "reason"])
 
 
@@ -373,9 +380,35 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _safe_int(value: Any) -> int | None:
     try:
+        if _is_missing_scalar(value):
+            return None
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_str(value: Any) -> str:
+    if _is_missing_scalar(value):
+        return ""
+    return str(value)
+
+
+def _is_missing_scalar(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, np.ndarray, pd.Series, pd.DataFrame)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _canonical_model_key(value: Any) -> str:
+    text = _safe_str(value).lower().replace("-", "_")
+    if text in {"hero", "hero_full", "hero_gnn", "hero_official"}:
+        return "hero_full"
+    return text
 
 
 if __name__ == "__main__":

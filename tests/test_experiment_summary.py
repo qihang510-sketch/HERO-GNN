@@ -61,6 +61,24 @@ def test_completeness_table_detects_absent_raw_run(tmp_path):
     assert missing.iloc[0]["reason"] == "raw_result_absent"
 
 
+def test_completeness_uses_manifest_and_hero_aliases(tmp_path):
+    output_dir = tmp_path / "suite"
+    expected = [
+        {"suite": "main", "dataset": "yelp_academic", "model": "hero_full", "seed": 0},
+        {"suite": "main", "dataset": "yelp_academic", "model": "mlp", "seed": 0},
+    ]
+    _write_json(output_dir / "run_manifest.json", {
+        "runs": [
+            {"suite": "main", "dataset": "yelp_academic", "model": "hero_gnn", "seed": 0, "status": "ok"},
+            {"suite": "main", "dataset": "yelp_academic", "model": "mlp", "seed": 0, "status": "ok"},
+        ]
+    })
+
+    missing = completeness_table(output_dir, expected=expected)
+
+    assert missing.empty
+
+
 def _write_run(output_dir, seed: int, macro_f1: float, auroc: float, auprc: float) -> None:
     run_dir = output_dir / "raw" / "yelp_academic" / "mlp" / f"seed_{seed}"
     _write_json(

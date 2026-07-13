@@ -215,7 +215,6 @@ def _run_post_summaries(args: argparse.Namespace, output_dir: Path, suites: list
 def _apply_quick_test(args: argparse.Namespace) -> None:
     if not args.quick_test:
         return
-    args.datasets = ["yelp_academic"]
     args.seeds = [0]
     if args.suite in {"main", "transfer", "all"} and args.models is None:
         args.models = ["mlp", "gcn", "hero"]
@@ -298,6 +297,8 @@ def _expected_runs(
 def _datasets_for_suite(suite: str, args: argparse.Namespace) -> list[str]:
     if suite == "final":
         return ["final_artifacts"]
+    if getattr(args, "quick_test", False):
+        return _quick_test_datasets_for_suite(suite, args)
     if args.datasets:
         return [normalize_dataset_name(dataset) for dataset in args.datasets]
     if suite == "main":
@@ -309,6 +310,22 @@ def _datasets_for_suite(suite: str, args: argparse.Namespace) -> list[str]:
     if suite == "cost":
         return list(SUBMISSION_DATASETS)
     return []
+
+
+def _quick_test_datasets_for_suite(suite: str, args: argparse.Namespace) -> list[str]:
+    requested = [normalize_dataset_name(dataset) for dataset in (args.datasets or [])]
+    if suite == "transfer":
+        transfer = [dataset for dataset in requested if dataset in TRANSFER_DATASETS]
+        return transfer[:1] or ["fraud_yelp"]
+    if suite == "main":
+        main = [dataset for dataset in requested if dataset in TEXT_RICH_MAIN_DATASETS]
+        return main[:1] or ["yelp_academic"]
+    if suite in {"ablation", "robustness", "labeler_comparison", "faithfulness", "sensitivity"}:
+        text_rich = [dataset for dataset in requested if dataset in TEXT_RICH_MAIN_DATASETS]
+        return text_rich[:1] or ["yelp_academic"]
+    if suite == "cost":
+        return requested[:1] or ["yelp_academic"]
+    return requested[:1] or ["yelp_academic"]
 
 
 def _models_for_suite(suite: str, dataset: str, args: argparse.Namespace) -> list[str]:
@@ -336,7 +353,7 @@ def _models_for_suite(suite: str, dataset: str, args: argparse.Namespace) -> lis
 def _main_model_for_dataset(dataset: str, model: str) -> str:
     text = str(model).strip()
     lowered = text.lower().replace("-", "_")
-    if lowered in {"hero", "hero_full", "full_hero", "full"}:
+    if lowered in {"hero", "hero_full", "hero_gnn", "hero_official", "full_hero", "full"}:
         return "hero_full"
     if lowered in {
         "hero_no_llm",
@@ -743,6 +760,9 @@ def _run_cost_suite(args: argparse.Namespace, output_dir: Path, datasets: list[s
 def _run_final_suite(args: argparse.Namespace, output_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     main_dir = Path(args.main_dir or args.input_dir or output_dir)
+    final_output_dir = Path(args.final_output_dir)
+    if bool(args.quick_test) and str(final_output_dir).replace("\\", "/") == "outputs/final_artifacts":
+        final_output_dir = output_dir / "final_artifacts"
     started_at = _timestamp()
     started = time.perf_counter()
     try:
@@ -766,7 +786,7 @@ def _run_final_suite(args: argparse.Namespace, output_dir: Path) -> list[dict[st
             faithfulness_dir=args.faithfulness_dir or str(output_dir),
             sensitivity_dir=args.sensitivity_dir or str(output_dir),
             cost_dir=args.cost_dir or str(output_dir),
-            output_dir=args.final_output_dir,
+            output_dir=str(final_output_dir),
             data_root=args.data_root,
             quick_test=bool(args.quick_test),
             allow_missing=True,
@@ -774,7 +794,7 @@ def _run_final_suite(args: argparse.Namespace, output_dir: Path) -> list[dict[st
         artifacts = build_final_artifacts(final_args)
         status = "ok"
         reason = ""
-        run_dir = Path(args.final_output_dir)
+        run_dir = final_output_dir
         (output_dir / "reports" / "final_artifacts_path.txt").write_text(str(run_dir), encoding="utf-8")
         rows.append(
             {
@@ -824,7 +844,7 @@ def _run_sensitivity_suite(args: argparse.Namespace, output_dir: Path, datasets:
         suite_args.lambda_rel_values = args.sensitivity_lambda_rel_values
         suite_args.lambda_chain_values = args.sensitivity_lambda_chain_values
         suite_args.confidence_thresholds = args.sensitivity_confidence_thresholds
-        suite_args.quick_test = False
+        suite_args.quick_test = bool(args.quick_test)
         rows = run_sensitivity(suite_args)
         return _manifest_rows(rows, "sensitivity")
     except Exception as exc:

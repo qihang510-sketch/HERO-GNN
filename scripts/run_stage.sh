@@ -197,7 +197,9 @@ run_final_artifacts() {
 run_stage() {
   case "$1" in
     quick_test)
-      local args=(--suite all --quick_test --output_dir "$(stage_dir quick_test)" --device "$DEVICE" --data_root "$DATA_ROOT" --max_parallel "$MAX_PARALLEL")
+      local quick_dir
+      quick_dir="$(stage_dir quick_test)"
+      local args=(--suite all --quick_test --output_dir "$quick_dir" --final_output_dir "$quick_dir/final_artifacts" --device "$DEVICE" --data_root "$DATA_ROOT" --max_parallel "$MAX_PARALLEL")
       if [[ "$DRY_RUN" -eq 1 ]]; then args+=(--dry_run); fi
       if [[ "$SKIP_EXISTING" -eq 1 ]]; then args+=(--skip_existing); fi
       run_cmd python scripts/run_experiment_suite.py "${args[@]}"

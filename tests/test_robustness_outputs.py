@@ -1,6 +1,6 @@
 import pandas as pd
 
-from scripts.run_llm_annotation_robustness import plot_robustness_figures
+from scripts.run_llm_annotation_robustness import _json_safe, _safe_number, plot_robustness_figures
 
 
 def test_robustness_plots_from_fake_curve_csv(tmp_path):
@@ -21,3 +21,8 @@ def test_robustness_plots_from_fake_curve_csv(tmp_path):
     assert (output_dir / "figures" / "fig_llm_robustness_auprc.png").exists()
     assert (output_dir / "figures" / "fig_llm_robustness_auroc.pdf").exists()
     assert (output_dir / "figures" / "fig_llm_robustness_auroc.png").exists()
+
+
+def test_robustness_pd_na_helpers_do_not_raise_boolean_ambiguity():
+    assert _safe_number(pd.NA, 0.0) == 0.0
+    assert _json_safe({"annotation_time_seconds": pd.NA})["annotation_time_seconds"] is None

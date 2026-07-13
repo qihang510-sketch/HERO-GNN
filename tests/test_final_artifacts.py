@@ -52,3 +52,30 @@ def test_final_artifacts_build_from_fake_main_outputs(tmp_path):
     assert (out / "tables_csv" / "supp_table_sensitivity.csv").exists()
     assert (out / "tables_latex" / "supp_table_sensitivity.tex").exists()
     assert (out / "reports" / "final_artifacts_report.md").exists()
+    for name in ["tables_csv", "tables_latex", "figures_pdf", "figures_png", "figure_data", "reports"]:
+        assert (out / name).is_dir()
+
+
+def test_final_artifacts_quick_test_creates_directory_structure(tmp_path):
+    out = tmp_path / "final"
+    build_final_artifacts(
+        argparse.Namespace(
+            main_dir=str(tmp_path / "missing_main"),
+            transfer_dir=None,
+            significance_dir=None,
+            ablation_dir=None,
+            robustness_dir=None,
+            labeler_dir=None,
+            faithfulness_dir=None,
+            sensitivity_dir=None,
+            cost_dir=None,
+            output_dir=str(out),
+            data_root=str(tmp_path / "data"),
+            quick_test=True,
+            allow_missing=True,
+        )
+    )
+
+    for name in ["tables_csv", "tables_latex", "figures_pdf", "figures_png", "figure_data", "reports"]:
+        assert (out / name).is_dir()
+    assert (out / "reports" / "final_artifacts_report.md").exists()

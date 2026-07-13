@@ -52,10 +52,16 @@ def main() -> None:
 
 
 def run_sensitivity(args: argparse.Namespace) -> list[dict[str, Any]]:
+    args.datasets = list(getattr(args, "datasets", None) or DEFAULT_DATASETS)
+    args.seeds = _coerce_values(getattr(args, "seeds", None), DEFAULT_SEEDS, int)
+    args.k_values = _coerce_values(getattr(args, "k_values", None), K_VALUES, int)
+    args.lambda_rel_values = _coerce_values(getattr(args, "lambda_rel_values", None), LAMBDA_VALUES, float)
+    args.lambda_chain_values = _coerce_values(getattr(args, "lambda_chain_values", None), LAMBDA_VALUES, float)
+    args.confidence_thresholds = _coerce_values(getattr(args, "confidence_thresholds", None), THRESHOLD_VALUES, float)
     if args.quick_test:
         args.datasets = ["yelp_academic"]
         args.seeds = [0]
-        args.k_values = [3]
+        args.k_values = [5, 10]
         args.lambda_rel_values = [0.0]
         args.lambda_chain_values = [0.0]
         args.confidence_thresholds = [0.3]
@@ -157,7 +163,7 @@ def _run_case(args: argparse.Namespace, output_dir: Path, data_dir: Path, datase
             epochs=int(args.epochs),
             lr=float(args.lr),
             hidden_dim=int(args.hidden_dim),
-            top_k=int(spec.get("top_k", hero_config.get("neighbor_budget", 5))),
+            top_k=int(_first_present(spec.get("top_k"), hero_config.get("neighbor_budget"), 5)),
             device=args.device,
             hero_config=hero_config,
         )
@@ -179,14 +185,16 @@ def _run_case(args: argparse.Namespace, output_dir: Path, data_dir: Path, datase
 
 def _sensitivity_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
-    for value in args.k_values:
+    for value in _coerce_values(getattr(args, "k_values", None), K_VALUES, int):
         specs.append(_spec("candidate_neighbor_k", value, {"neighbor_budget": int(value)}, top_k=int(value), key="neighbor_budget"))
-    for value in args.lambda_rel_values:
+    lambda_rel_values = _coerce_values(getattr(args, "lambda_rel_values", None), LAMBDA_VALUES, float)
+    lambda_chain_values = _coerce_values(getattr(args, "lambda_chain_values", None), LAMBDA_VALUES, float)
+    for value in lambda_rel_values:
         specs.append(_spec("lambda_rel", value, {"mechanism_loss_weight": float(value)}, key="mechanism_loss_weight"))
-    for value in args.confidence_thresholds:
+    for value in _coerce_values(getattr(args, "confidence_thresholds", None), THRESHOLD_VALUES, float):
         specs.append(_spec("confidence_threshold", value, {"risk_relevance_threshold": float(value)}, key="risk_relevance_threshold"))
-    for rel in args.lambda_rel_values:
-        for chain in args.lambda_chain_values:
+    for rel in lambda_rel_values:
+        for chain in lambda_chain_values:
             specs.append(
                 _spec(
                     "lambda_grid",
@@ -209,8 +217,8 @@ def _spec(parameter: str, value: Any, hero_config: dict[str, Any], key: str, top
         "supported": True,
         "supported_config_key": key,
         "top_k": top_k,
-        "lambda_rel": lambda_rel if lambda_rel is not None else (float(value) if parameter == "lambda_rel" else pd.NA),
-        "lambda_chain": lambda_chain if lambda_chain is not None else pd.NA,
+        "lambda_rel": lambda_rel if not _is_missing_scalar(lambda_rel) else (float(value) if parameter == "lambda_rel" else pd.NA),
+        "lambda_chain": lambda_chain if not _is_missing_scalar(lambda_chain) else pd.NA,
         "confidence_threshold": float(value) if parameter == "confidence_threshold" else pd.NA,
         "candidate_neighbor_k": int(value) if parameter == "candidate_neighbor_k" else pd.NA,
     }
@@ -340,13 +348,47 @@ def _read_csv(path: Path) -> pd.DataFrame:
 def _json_safe(payload: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in payload.items():
-        if isinstance(value, np.generic):
-            out[key] = value.item()
-        elif value is pd.NA:
+        if _is_missing_scalar(value):
             out[key] = None
+        elif isinstance(value, np.generic):
+            out[key] = value.item()
         else:
             out[key] = value
     return out
+
+
+def _coerce_values(values: Any, default: list[Any], cast) -> list[Any]:
+    if values is None:
+        values = default
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple, set, np.ndarray, pd.Series)):
+        values = [values]
+    out: list[Any] = []
+    for value in values:
+        if _is_missing_scalar(value):
+            continue
+        try:
+            out.append(cast(value))
+        except (TypeError, ValueError):
+            continue
+    return out or [cast(value) for value in default]
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if not _is_missing_scalar(value):
+            return value
+    return values[-1] if values else None
+
+
+def _is_missing_scalar(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, np.ndarray, pd.Series, pd.DataFrame)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
 
 
 if __name__ == "__main__":

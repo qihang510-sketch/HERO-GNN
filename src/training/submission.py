@@ -48,8 +48,8 @@ HERO_EXPERIMENT_VARIANTS = (
 )
 HERO_DISPLAY_NAMES = {
     "hero_full": "HERO",
-    "hero_gnn": "HERO-GNN",
-    "hero_official": "HERO-official",
+    "hero_gnn": "HERO",
+    "hero_official": "HERO",
     "hero_no_llm": "HERO w/o LLM",
     "hero_no_mechanism": "HERO w/o mechanism",
     "hero_no_risk_weighting": "HERO w/o risk weighting",
@@ -122,7 +122,9 @@ MODEL_ALIASES = {
     "HOGRL": "hogrl",
     "RGTAN": "rgtan",
     "HERO-GNN": "hero_gnn",
+    "hero_gnn": "hero_gnn",
     "HERO-official": "hero_official",
+    "hero_official": "hero_official",
     "HERO_OFFICIAL": "hero_official",
     "HERO": "hero_full",
     "hero": "hero_full",
@@ -334,7 +336,7 @@ def run_submission_experiment(
                 {"data_dir": str(data_dir), **_split_validation_extra(split_status)},
             )
         if is_hero:
-            if trainer_model not in DATASET_MODEL_MATRIX[dataset]:
+            if model not in DATASET_MODEL_MATRIX[dataset] and model not in HERO_MODELS:
                 return write_skip(result_dir, dataset, model, seed, "model_not_applicable_to_dataset")
             hero_config, trainer_overrides, config_source = _load_hero_runtime_config(config, base_model=trainer_model, variant=model)
             return _run_project_hero(

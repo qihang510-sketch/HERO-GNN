@@ -97,9 +97,9 @@ def run_robustness(args: argparse.Namespace) -> list[dict[str, Any]]:
                     write_jsonl_labels(perturbed_file, labels)
                     stats = annotation_stats(
                         labels,
-                        candidate_cards=int(base_stats.get("candidate_cards", len(base_labels))),
+                        candidate_cards=int(_safe_number(base_stats.get("candidate_cards"), len(base_labels))),
                         annotation_source=annotation_source,
-                        annotation_time_seconds=float(base_stats.get("annotation_time_seconds", 0.0) or 0.0),
+                        annotation_time_seconds=float(_safe_number(base_stats.get("annotation_time_seconds"), 0.0)),
                     )
                     try:
                         payload = train_hero_with_labels(
@@ -175,7 +175,8 @@ def perturb_labels(labels: list[dict[str, Any]], noise_type: str, noise_ratio: f
     for index in selected:
         label = perturbed[int(index)]
         if noise_type == "relevance_flip":
-            label["risk_relevance"] = 0 if int(label.get("risk_relevance", 0)) == 1 else 1
+            relevance = int(_safe_number(label.get("risk_relevance"), 0.0))
+            label["risk_relevance"] = 0 if relevance == 1 else 1
         elif noise_type == "mechanism_shuffle":
             current = str(label.get("mechanism", "irrelevant_heterophily"))
             choices = [name for name in mechanisms if name != current] or mechanisms
@@ -273,7 +274,8 @@ def _with_metric_drops(raw: pd.DataFrame) -> pd.DataFrame:
     if raw.empty:
         return rows
     for (dataset, seed, noise_type, source), group in rows.groupby(["dataset", "seed", "noise_type", "annotation_source"], dropna=False):
-        base = group[group["noise_ratio"].astype(float) == 0.0]
+        noise_ratio = pd.to_numeric(group["noise_ratio"], errors="coerce")
+        base = group[noise_ratio == 0.0]
         if base.empty:
             continue
         base_row = base.iloc[0]
@@ -328,7 +330,7 @@ def _write_run_artifacts(run_dir: Path, row: dict[str, Any], args: argparse.Name
 
 def _copy_prediction(row: dict[str, Any], run_dir: Path) -> None:
     source = row.get("predictions_file")
-    if source and Path(str(source)).exists():
+    if not _is_missing_scalar(source) and Path(str(source)).exists():
         shutil.copyfile(str(source), run_dir / "predictions.npy")
 
 
@@ -348,10 +350,13 @@ def _missing_row(dataset: str, seed: int, noise_type: str, ratio: float, annotat
 
 
 def _selected_noise_types(args: argparse.Namespace) -> list[str]:
-    if args.noise_type:
+    if not _is_missing_scalar(getattr(args, "noise_type", None)):
         return [args.noise_type]
-    if args.noise_types:
-        return list(dict.fromkeys(args.noise_types))
+    noise_types = getattr(args, "noise_types", None)
+    if not _is_missing_scalar(noise_types):
+        if isinstance(noise_types, (list, tuple, set)):
+            return list(dict.fromkeys(noise_types)) or list(NOISE_TYPES)
+        return [str(noise_types)]
     return list(NOISE_TYPES)
 
 
@@ -364,7 +369,7 @@ def _ratio_tag(value: float) -> str:
 
 
 def _bounded_ratio(value: float) -> float:
-    return float(min(max(float(value), 0.0), 1.0))
+    return float(min(max(float(_safe_number(value, 0.0)), 0.0), 1.0))
 
 
 def _safe_float(value: Any) -> float:
@@ -374,10 +379,30 @@ def _safe_float(value: Any) -> float:
         return float("nan")
 
 
+def _safe_number(value: Any, default: float) -> float:
+    if _is_missing_scalar(value):
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _is_missing_scalar(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, np.ndarray, pd.Series, pd.DataFrame)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _json_safe(payload: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in payload.items():
-        if pd.isna(value) if not isinstance(value, (list, dict, tuple, np.ndarray)) else False:
+        if _is_missing_scalar(value):
             out[key] = None
         elif isinstance(value, np.generic):
             out[key] = value.item()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
-    records = load_run_records(output_dir)
+    records = load_known_run_records(output_dir)
     expected = _expected_from_args_or_config(args, output_dir)
     if expected:
         _write_expected_config_shadow(output_dir, expected)
@@ -46,22 +47,80 @@ def completeness_table(
     expected: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     if expected is None:
-        return missing_runs(output_dir, records)
-    records = load_run_records(output_dir) if records is None else records
+        return missing_runs(output_dir, load_known_run_records(output_dir, records))
+    records = load_known_run_records(output_dir, records)
     observed = {}
     if not records.empty:
         for row in records.itertuples(index=False):
-            observed[(str(row.suite), str(row.dataset), str(row.model), int(row.seed))] = row
+            seed = _seed_value(getattr(row, "seed", None))
+            if seed < 0:
+                continue
+            key = (str(row.suite), str(row.dataset), _canonical_model_key(getattr(row, "model", "")), seed)
+            previous = observed.get(key)
+            if previous is None or _status_rank(getattr(row, "status", "")) > _status_rank(getattr(previous, "status", "")):
+                observed[key] = row
     rows = []
     for item in expected:
         seed = _seed_value(item.get("seed"))
-        key = (str(item["suite"]), str(item["dataset"]), str(item["model"]), seed)
+        key = (str(item["suite"]), str(item["dataset"]), _canonical_model_key(item["model"]), seed)
         row = observed.get(key)
         if row is None:
             rows.append({**item, "seed": seed, "status": "missing", "reason": "raw_result_absent"})
         elif str(row.status) not in {"ok", "exists"}:
-            rows.append({**item, "seed": seed, "status": str(row.status), "reason": str(getattr(row, "skip_reason", ""))})
+            rows.append({**item, "seed": seed, "status": str(row.status), "reason": _row_reason(row)})
     return pd.DataFrame(rows, columns=["suite", "dataset", "model", "seed", "status", "reason"])
+
+
+def load_known_run_records(output_dir: str | Path, records: pd.DataFrame | None = None) -> pd.DataFrame:
+    output_dir = Path(output_dir)
+    frames: list[pd.DataFrame] = []
+    if records is not None and not records.empty:
+        frames.append(records)
+    scanned = load_run_records(output_dir)
+    if not scanned.empty:
+        frames.append(scanned)
+    for path in [output_dir / "summary" / "all_raw_runs.csv", output_dir / "tables" / "all_raw_runs.csv"]:
+        if path.exists():
+            try:
+                frame = pd.read_csv(path)
+            except pd.errors.EmptyDataError:
+                frame = pd.DataFrame()
+            if not frame.empty:
+                frames.append(frame)
+    for path in [output_dir / "run_manifest.json", output_dir / "summary" / "run_manifest.json"]:
+        frame = _records_from_manifest(path)
+        if not frame.empty:
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame(columns=["suite", "dataset", "model", "seed", "status", "skip_reason"])
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    for column in ["suite", "dataset", "model", "seed", "status", "skip_reason", "reason"]:
+        if column not in combined:
+            combined[column] = ""
+    combined["_canonical_model"] = combined["model"].map(_canonical_model_key)
+    combined["_seed_key"] = combined["seed"].map(_seed_value)
+    combined["_status_rank"] = combined["status"].map(_status_rank)
+    combined = combined.sort_values("_status_rank", ascending=False)
+    combined = combined.drop_duplicates(subset=["suite", "dataset", "_canonical_model", "_seed_key"], keep="first")
+    return combined.drop(columns=["_canonical_model", "_seed_key", "_status_rank"], errors="ignore")
+
+
+def _records_from_manifest(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return pd.DataFrame()
+    rows = payload.get("runs", [])
+    if not isinstance(rows, list):
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    if "skip_reason" not in frame and "reason" in frame:
+        frame["skip_reason"] = frame["reason"]
+    return frame
 
 
 def _expected_from_args_or_config(args: argparse.Namespace, output_dir: Path) -> list[dict[str, Any]]:
@@ -111,11 +170,43 @@ def _print_missing_commands(table: pd.DataFrame, output_dir: Path, write_file: b
 
 def _seed_value(value: Any) -> int:
     try:
-        if value is None or value == "":
+        if value is None:
+            return -1
+        if not isinstance(value, (list, dict, tuple, pd.Series, pd.DataFrame)) and bool(pd.isna(value)):
+            return -1
+        if value == "":
             return -1
         return int(value)
     except (TypeError, ValueError):
         return -1
+
+
+def _canonical_model_key(value: Any) -> str:
+    text = "" if value is None else str(value).strip().lower().replace("-", "_")
+    if text in {"hero", "hero_full", "hero_gnn", "hero_official"}:
+        return "hero_full"
+    return text
+
+
+def _status_rank(status: Any) -> int:
+    text = "" if status is None else str(status)
+    return {"ok": 4, "exists": 4, "skipped": 3, "unavailable": 2, "missing": 1, "failed": 0}.get(text, 1)
+
+
+def _row_reason(row: Any) -> str:
+    for attr in ["skip_reason", "reason"]:
+        value = getattr(row, attr, "")
+        if value is None:
+            continue
+        try:
+            if bool(pd.isna(value)):
+                continue
+        except (TypeError, ValueError):
+            pass
+        text = str(value)
+        if text:
+            return text
+    return ""
 
 
 if __name__ == "__main__":

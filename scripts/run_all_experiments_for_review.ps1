@@ -132,7 +132,8 @@ foreach ($stage in $Stages) {
     Write-Host "========== stage: $stage =========="
     switch ($stage) {
         "quick_test" {
-            $args = @("--suite", "all", "--quick_test") + (Common-Args (Stage-Dir "quick_test"))
+            $quickDir = Stage-Dir "quick_test"
+            $args = @("--suite", "all", "--quick_test") + (Common-Args $quickDir) + @("--final_output_dir", (Join-Path $quickDir "final_artifacts"))
             python scripts/run_experiment_suite.py @args
         }
         "tune_hero" { Run-TuneHero }
