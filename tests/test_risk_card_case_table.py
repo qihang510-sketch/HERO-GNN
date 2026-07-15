@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from scripts.build_risk_card_case_table import build_risk_card_case_table
+from scripts.extract_representative_risk_cards import safe_float
 from scripts.validate_risk_card_cases import validate_risk_card_cases
 
 
@@ -63,7 +64,15 @@ def test_missing_annotation_source_is_unavailable(tmp_path: Path) -> None:
     selected = _read_jsonl(out / "raw" / "selected_cases.jsonl")
     yelp = next(row for row in selected if row["dataset"] == "yelp_academic")
     assert yelp["annotation_source"] == "unavailable"
-    assert yelp["selection_source"] == "heuristic_only"
+    assert yelp["selection_source"] == "graph_only_heuristic"
+    assert yelp["evidence_source"] == "processed_graph_only"
+
+
+def test_safe_float_handles_missing_and_sequences() -> None:
+    assert safe_float("N/A", default=0.25) == 0.25
+    assert safe_float("unavailable", default=0.1) == 0.1
+    assert safe_float([0, 1, 1]) == pytest.approx(2 / 3)
+    assert safe_float(np.array([1.0, 3.0])) == pytest.approx(2.0)
 
 
 def test_validator_accepts_generated_unavailable_rows(tmp_path: Path) -> None:

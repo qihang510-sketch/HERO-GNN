@@ -145,13 +145,18 @@ def extract_representative_risk_cards(
     traces: list[dict[str, Any]] = []
     reports: list[dict[str, Any]] = []
     for dataset in datasets:
-        dataset_cases, dataset_traces, report = _extract_dataset_cases(
-            dataset=dataset,
-            data_root=data_root,
-            source_outputs=source_roots,
-            top_candidates_per_dataset=max(1, int(top_candidates_per_dataset)),
-            top_cases_per_dataset=max(1, int(top_cases_per_dataset)),
-        )
+        try:
+            dataset_cases, dataset_traces, report = _extract_dataset_cases(
+                dataset=dataset,
+                data_root=data_root,
+                source_outputs=source_roots,
+                top_candidates_per_dataset=max(1, int(top_candidates_per_dataset)),
+                top_cases_per_dataset=max(1, int(top_cases_per_dataset)),
+            )
+        except Exception as exc:
+            processed_dir = _resolve_processed_dir(data_root, dataset)
+            reason = f"Risk-card case extraction failed for {dataset}: {type(exc).__name__}: {exc}"
+            dataset_cases, dataset_traces, report = _unavailable_dataset(dataset, reason, processed_dir)
         if strict:
             missing = [
                 (case.get("dataset"), case.get("case_id"), field)
@@ -615,13 +620,17 @@ def _build_graph_only_candidates(
         numeric_gap = _feature_l1(numeric_features, src_i, dst_i, max_l1)
         structural = _metapath_proximity(str(relation))
         suspicious_count = _suspicious_path_count(labels, adjacency.get(src_i, set()), adjacency.get(dst_i, set()))
-        suspicious_score = min(float(suspicious_count) / 3.0, 1.0)
+        neighbor_ratio_score = safe_float(neighbor_ratio, default=0.0)
+        numeric_gap_score = safe_float(numeric_gap, default=0.0)
+        structural_score = safe_float(structural, default=0.0)
+        suspicious_count_score = safe_float(suspicious_count, default=0.0)
+        suspicious_score = min(suspicious_count_score / 3.0, 1.0)
         heuristic_score = _bounded(
             0.30 * label_diff
             + 0.25 * target_risk
-            + 0.15 * structural
-            + 0.15 * numeric_gap
-            + 0.15 * neighbor_ratio
+            + 0.15 * structural_score
+            + 0.15 * numeric_gap_score
+            + 0.15 * neighbor_ratio_score
         )
         candidate = {
             "dataset": dataset,
@@ -632,15 +641,17 @@ def _build_graph_only_candidates(
             "risk_weight_source": "scripts/extract_representative_risk_cards.py:_build_graph_only_candidates",
             "risk_relevance": NA,
             "confidence": NA,
-            "mechanism_candidate": _infer_mechanism(dataset, relation, numeric_gap, suspicious_count, neighbor_ratio),
+            "mechanism_candidate": _infer_mechanism(dataset, relation, numeric_gap_score, int(suspicious_count_score), neighbor_ratio_score),
             "mechanism_description": "Heuristic-only reconstruction from processed graph structure and node features.",
-            "structural_proximity": structural,
-            "behavior_conflict_score": numeric_gap,
+            "structural_proximity": structural_score,
+            "behavior_conflict_score": numeric_gap_score,
             "suspicious_path_score": suspicious_score,
             "suspicious_path_count": suspicious_count,
             "neighbor_fraud_ratio": neighbor_ratio,
-            "selection_source": "heuristic_only",
+            "selection_source": "graph_only_heuristic",
             "reconstruction_source": "processed_graph_only",
+            "annotation_source": "unavailable",
+            "evidence_source": "processed_graph_only",
             "cached_annotation_used": False,
             "qwen_annotation_used": False,
             "hero_risk_weight_used": False,
@@ -722,7 +733,7 @@ def _attach_graph_features(candidate: dict[str, Any], context: dict[str, Any]) -
 
 def _normalize_risk_weights(candidates: list[dict[str, Any]]) -> None:
     values = [_as_optional_float(candidate.get("risk_weight")) for candidate in candidates]
-    finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    finite = [value for value in values if value is not None and math.isfinite(value)]
     if not finite:
         for candidate in candidates:
             candidate["normalized_risk_weight"] = NA
@@ -730,10 +741,10 @@ def _normalize_risk_weights(candidates: list[dict[str, Any]]) -> None:
     min_value = min(finite)
     max_value = max(finite)
     for candidate, value in zip(candidates, values):
-        if value is None or not math.isfinite(float(value)):
+        if value is None or not math.isfinite(value):
             candidate["normalized_risk_weight"] = NA
         elif max_value > min_value:
-            candidate["normalized_risk_weight"] = _bounded((float(value) - min_value) / (max_value - min_value))
+            candidate["normalized_risk_weight"] = _bounded((value - min_value) / (max_value - min_value))
         else:
             candidate["normalized_risk_weight"] = _bounded(value)
 
@@ -847,6 +858,7 @@ def _build_case_record(
     case["cached_annotation_used"] = bool(candidate.get("cached_annotation_used", False))
     case["qwen_annotation_used"] = bool(candidate.get("qwen_annotation_used", False))
     case["annotation_source"] = _annotation_source(candidate)
+    case["evidence_source"] = _value_or_na(candidate.get("evidence_source", "processed_graph_only" if case["reconstruction_source"] == "processed_graph_only" else evidence.get("source_file", NA)))
     case["hero_risk_weight_used"] = bool(candidate.get("hero_risk_weight_used", False))
     case["evidence_chain_used"] = bool(candidate.get("evidence_chain_used", False))
     case["annotation_labeler_version"] = _value_or_na(candidate.get("annotation_labeler_version", NA))
@@ -1506,6 +1518,7 @@ def _candidate_priority(candidate: dict[str, Any]) -> tuple[int, float, float]:
         "cached_annotation": 4,
         "risk_card_cache": 3,
         "hetero_candidate_cache": 2,
+        "graph_only_heuristic": 1,
         "heuristic_only": 1,
     }.get(source, 0)
     risk = _as_float(candidate.get("risk_weight"), 0.0)
@@ -1617,8 +1630,8 @@ def _keep_or_downweight(candidate: dict[str, Any]) -> str:
         return "keep"
     if risk is not None and risk <= 0:
         return "downweight"
-    if str(candidate.get("selection_source")) == "heuristic_only":
-        return "keep (heuristic_only)" if score >= 0.5 else "downweight (heuristic_only)"
+    if str(candidate.get("selection_source")) in {"heuristic_only", "graph_only_heuristic"}:
+        return "keep (graph_only_heuristic)" if score >= 0.5 else "downweight (graph_only_heuristic)"
     return "keep" if score >= 0.5 else "downweight"
 
 
@@ -1656,8 +1669,8 @@ def _risk_summary(case: dict[str, Any], candidate: dict[str, Any]) -> str:
         pieces.append(f"risk_relevance={case['risk_relevance']}")
     if bool(candidate.get("evidence_chain_used")):
         pieces.append("evidence_chain=yes")
-    if str(candidate.get("selection_source")) == "heuristic_only":
-        pieces.append("heuristic_only")
+    if str(candidate.get("selection_source")) in {"heuristic_only", "graph_only_heuristic"}:
+        pieces.append("graph_only_heuristic")
     return "; ".join(pieces)
 
 
@@ -1861,7 +1874,52 @@ def _has_any(record: dict[str, Any], keys: list[str]) -> bool:
     return any(_has_value(record.get(key)) for key in keys)
 
 
+def safe_float(x: Any, default: float = 0.0) -> float:
+    if x is None or x is pd.NA:
+        return float(default)
+    if isinstance(x, str):
+        text = x.strip()
+        if text == "" or text.lower() in {"n/a", "na", "nan", "none", "unavailable", "<na>"}:
+            return float(default)
+        try:
+            numeric = float(text)
+        except ValueError:
+            return float(default)
+        return numeric if math.isfinite(numeric) else float(default)
+    if isinstance(x, np.ndarray):
+        values = x.reshape(-1).tolist()
+        return safe_float(values, default=default)
+    if isinstance(x, (list, tuple, set)):
+        numeric_values: list[float] = []
+        for item in x:
+            value = _as_optional_float(item)
+            if value is not None:
+                numeric_values.append(float(value))
+        if not numeric_values:
+            return float(default)
+        return float(np.mean(numeric_values))
+    if isinstance(x, (np.integer, np.floating)):
+        numeric = float(x)
+        return numeric if math.isfinite(numeric) else float(default)
+    if isinstance(x, (int, float)):
+        numeric = float(x)
+        return numeric if math.isfinite(numeric) else float(default)
+    try:
+        numeric = float(x)
+    except (TypeError, ValueError):
+        return float(default)
+    return numeric if math.isfinite(numeric) else float(default)
+
+
 def _as_optional_float(value: Any) -> float | None:
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return None
+        return safe_float(value, default=0.0)
+    if isinstance(value, (list, tuple, set)):
+        if not value:
+            return None
+        return safe_float(value, default=0.0)
     if not _has_value(value):
         return None
     try:
@@ -1874,8 +1932,7 @@ def _as_optional_float(value: Any) -> float | None:
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
-    numeric = _as_optional_float(value)
-    return default if numeric is None else float(numeric)
+    return safe_float(value, default=default)
 
 
 def _bounded(value: Any) -> float:
