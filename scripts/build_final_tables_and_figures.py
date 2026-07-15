@@ -18,6 +18,7 @@ from scripts.paper_artifact_utils import (  # noqa: E402
     write_latex,
     write_unavailable_csv,
 )
+from scripts.build_risk_card_case_table import build_risk_card_case_table  # noqa: E402
 from scripts.run_significance_tests import METRICS, significance_rows  # noqa: E402
 from scripts.summarize_experiment_suite import TEXT_RICH_SET, TRANSFER_DATASETS, mean_std_table  # noqa: E402
 from src.training.submission import SUBMISSION_DATASETS, resolve_processed_dir  # noqa: E402
@@ -49,6 +50,8 @@ LATEX_TARGETS = [
     "supp_table_sensitivity",
     "supp_table_cost_scalability",
 ]
+
+RISK_CARD_DATASETS = ["yelp_academic", "amazon_video", "fraud_yelp", "fraud_amazon", "elliptic"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -134,12 +137,65 @@ def build_final_artifacts(args: argparse.Namespace) -> dict[str, Path]:
         write_latex(dirs["tables_latex"] / f"{name}.tex", csv_frames.get(name, pd.DataFrame()), highlight_metrics=name in {"table2_main_text_rich", "table3_transfer", "table4_ablation"})
 
     copied = copy_figures_and_data(sources, dirs)
+    risk_card_status = _build_risk_card_cases(args, dirs, sources, allow_missing)
     seed_status = _build_seed_stability(main_dir, dirs["root"])
     report.extend(_report_lines(args, table1, csv_frames, missing, copied))
+    report.extend(["", "## Risk Card Cases", *risk_card_status])
     report.extend(["", "## Seed Stability", f"- {seed_status}"])
     report_path = dirs["reports"] / "final_artifacts_report.md"
     report_path.write_text("\n".join(report) + "\n", encoding="utf-8")
     return dirs
+
+
+def _build_risk_card_cases(args: argparse.Namespace, dirs: dict[str, Path], sources: list[Path], allow_missing: bool) -> list[str]:
+    output_dir = dirs["root"] / "risk_card_cases"
+    source_outputs = [str(path) for path in sources if path and path.exists()]
+    if not source_outputs:
+        source_outputs = [str(dirs["root"])]
+    risk_args = argparse.Namespace(
+        data_root=getattr(args, "data_root", "data"),
+        output_dir=str(output_dir),
+        datasets=RISK_CARD_DATASETS,
+        source_outputs=source_outputs,
+        top_cases_per_dataset=1,
+        include_field_trace=True,
+        write_latex=True,
+        write_markdown=True,
+        strict=False,
+        copy_to_final_artifacts=True,
+        final_artifacts_dir=str(dirs["root"]),
+    )
+    try:
+        paths = build_risk_card_case_table(risk_args)
+    except Exception as exc:
+        if not allow_missing:
+            raise
+        report_path = dirs["reports"] / "RISK_CARD_CASE_REPORT.md"
+        message = (
+            "# Risk Card Case Report\n\n"
+            "status: unavailable\n\n"
+            f"reason: risk-card case generation failed with {type(exc).__name__}: {exc}\n\n"
+            "All risk-card cases are extracted from real data or cached model outputs. Missing fields are marked as N/A rather than imputed.\n"
+        )
+        report_path.write_text(message, encoding="utf-8")
+        for subdir, filename in [
+            ("tables_csv", "supp_table_risk_card_cases_compact.csv"),
+            ("tables_csv", "supp_table_risk_card_field_trace.csv"),
+        ]:
+            write_csv(dirs[subdir] / filename, pd.DataFrame([{"dataset": dataset, "status": "unavailable", "reason": str(exc)} for dataset in RISK_CARD_DATASETS]))
+        for filename in ["supp_table_risk_card_cases_compact.tex", "supp_table_risk_card_field_trace.tex"]:
+            (dirs["tables_latex"] / filename).write_text(
+                "\\begin{tabular}{lll}\n\\toprule\ndataset & status & reason \\\\\n\\midrule\n"
+                + "\n".join(f"{dataset} & unavailable & generation failed \\\\" for dataset in RISK_CARD_DATASETS)
+                + "\n\\bottomrule\n\\end{tabular}\n",
+                encoding="utf-8",
+            )
+        return [f"- unavailable: {type(exc).__name__}: {exc}"]
+    return [
+        f"- compact CSV: `{paths.get('compact_csv', '')}`",
+        f"- field trace CSV: `{paths.get('field_trace_csv', '')}`",
+        f"- copied to final artifacts: `{dirs['root']}`",
+    ]
 
 
 def _build_seed_stability(main_dir: Path, output_dir: Path) -> str:

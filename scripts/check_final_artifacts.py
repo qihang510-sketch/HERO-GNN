@@ -52,11 +52,26 @@ REQUIRED_FIGURE_DATA = {
     "seed stability": "figure_data/seed_stability_data.csv",
     "cost scalability": "figure_data/cost_scalability_data.csv",
 }
+RISK_CARD_DATASETS = {"yelp_academic", "amazon_video", "fraud_yelp", "fraud_amazon", "elliptic"}
+RISK_CARD_TABLES = {
+    "risk card compact": "tables_csv/supp_table_risk_card_cases_compact.csv",
+    "risk card field trace": "tables_csv/supp_table_risk_card_field_trace.csv",
+}
+RISK_CARD_LATEX = {
+    "risk card compact latex": "tables_latex/supp_table_risk_card_cases_compact.tex",
+    "risk card field trace latex": "tables_latex/supp_table_risk_card_field_trace.tex",
+}
+RISK_CARD_REPORTS = {
+    "risk card report": "reports/RISK_CARD_CASE_REPORT.md",
+}
+FORBIDDEN_RISK_CARD_TERMS = ["planning_only", "forecast", "not_for_paper"]
+FORBIDDEN_RISK_CARD_DATA_TERMS = ["fake", "manual_example", "fake_example", "example_id", "hard_coded_example"]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check final HERO paper artifacts and write a final experiment report.")
     parser.add_argument("--output_root", default=None, help="Review rerun root containing stage subdirectories.")
+    parser.add_argument("--output_dir", default=None, help="Alias for --final_dir.")
     parser.add_argument("--final_dir", default=None, help="Final artifacts directory. Defaults to <output_root>/final_artifacts.")
     parser.add_argument("--allow_missing", action="store_true")
     parser.add_argument("--strict", action="store_true", help="Exit 1 if required artifacts are missing.")
@@ -65,8 +80,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.output_dir and not args.final_dir:
+        args.final_dir = args.output_dir
     report_path, rows = check_final_artifacts(args.output_root, args.final_dir, allow_missing=args.allow_missing)
-    missing = [row for row in rows if row["status"] not in {"ok", "available"}]
+    missing = [row for row in rows if row["status"] in {"missing", "failed"}]
     print(f"Wrote final experiment report to {report_path}")
     if args.strict and missing:
         raise SystemExit(1)
@@ -87,6 +104,7 @@ def check_final_artifacts(
     checks.extend(_check_text_files(final, REQUIRED_LATEX, kind="latex"))
     checks.extend(_check_binary_files(final, REQUIRED_FIGURES, kind="figure"))
     checks.extend(_check_csvs(final, REQUIRED_FIGURE_DATA, required_fields=False, kind="figure_data"))
+    checks.extend(_check_risk_card_artifacts(final))
 
     status_counts = _status_counts(root)
     tables = _existing_paths(final, "tables_csv", "*.csv")
@@ -96,6 +114,7 @@ def check_final_artifacts(
     robustness = _table_summary(final / "tables_csv" / "supp_table_llm_robustness.csv", ["dataset", "noise_type", "status"])
     faithfulness = _table_summary(final / "tables_csv" / "supp_table_faithfulness.csv", ["dataset", "setting", "status"])
     cost = _table_summary(final / "tables_csv" / "supp_table_cost_scalability.csv", ["dataset", "model", "status"])
+    risk_cards = _table_summary(final / "tables_csv" / "supp_table_risk_card_cases_compact.csv", ["dataset", "status", "mechanism_candidate"])
     missing = _missing_or_unavailable(final)
 
     report_path = report_dir / "FINAL_EXPERIMENT_REPORT.md"
@@ -138,6 +157,9 @@ def check_final_artifacts(
                 "## Cost Summary",
                 *cost,
                 "",
+                "## Risk Card Case Summary",
+                *risk_cards,
+                "",
                 "## Missing Or Unavailable",
                 *missing,
                 "",
@@ -156,6 +178,81 @@ def check_final_artifacts(
     )
     pd.DataFrame(checks).to_csv(report_dir / "final_artifact_checks.csv", index=False)
     return report_path, checks
+
+
+def _check_risk_card_artifacts(final: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for label, rel in RISK_CARD_TABLES.items():
+        path = final / rel
+        frame = read_csv_or_empty(path)
+        status = "ok"
+        reason = ""
+        if not path.exists():
+            status = "missing"
+            reason = "file_not_found"
+        elif frame.empty:
+            status = "missing"
+            reason = "empty_csv"
+        else:
+            text = frame.to_csv(index=False).lower()
+            forbidden = _forbidden_terms(text, include_data_terms=True)
+            if forbidden:
+                status = "failed"
+                reason = f"forbidden_terms={','.join(forbidden)}"
+            elif "dataset" not in frame.columns:
+                status = "failed"
+                reason = "dataset_column_missing"
+            else:
+                present = set(frame["dataset"].astype(str))
+                missing = sorted(RISK_CARD_DATASETS - present)
+                if missing:
+                    status = "missing"
+                    reason = f"missing_datasets={missing}"
+                elif _contains_missing_markers(frame):
+                    status = "warning"
+                    reason = "contains_NA_or_unavailable_fields"
+        rows.append({"kind": "risk_card", "label": label, "path": str(path), "status": status, "reason": reason, "rows": len(frame)})
+    for label, rel in RISK_CARD_LATEX.items():
+        path = final / rel
+        status = "ok"
+        reason = ""
+        if not path.exists():
+            status = "missing"
+            reason = "file_not_found"
+        else:
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+            forbidden = _forbidden_terms(text, include_data_terms=False)
+            if forbidden:
+                status = "failed"
+                reason = f"forbidden_terms={','.join(forbidden)}"
+            elif "\\begin{tabular}" not in text:
+                status = "missing"
+                reason = "latex_table_not_detected"
+            elif "n/a" in text or "unavailable" in text:
+                status = "warning"
+                reason = "contains_NA_or_unavailable_fields"
+        rows.append({"kind": "risk_card", "label": label, "path": str(path), "status": status, "reason": reason, "rows": ""})
+    for label, rel in RISK_CARD_REPORTS.items():
+        path = final / rel
+        status = "ok"
+        reason = ""
+        if not path.exists():
+            status = "missing"
+            reason = "file_not_found"
+        else:
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+            forbidden = _forbidden_terms(text, include_data_terms=False)
+            if forbidden:
+                status = "failed"
+                reason = f"forbidden_terms={','.join(forbidden)}"
+            elif "all risk-card cases are extracted from real data or cached model outputs" not in text:
+                status = "warning"
+                reason = "integrity_statement_missing"
+            elif "n/a" in text or "unavailable" in text:
+                status = "warning"
+                reason = "contains_NA_or_unavailable_fields"
+        rows.append({"kind": "risk_card", "label": label, "path": str(path), "status": status, "reason": reason, "rows": ""})
+    return rows
 
 
 def _check_csvs(final: Path, mapping: dict[str, str], required_fields: bool, kind: str = "table") -> list[dict[str, Any]]:
@@ -210,6 +307,20 @@ def _check_binary_files(final: Path, mapping: dict[str, str], kind: str) -> list
     return rows
 
 
+def _forbidden_terms(text: str, include_data_terms: bool) -> list[str]:
+    terms = list(FORBIDDEN_RISK_CARD_TERMS)
+    if include_data_terms:
+        terms.extend(FORBIDDEN_RISK_CARD_DATA_TERMS)
+    return [term for term in terms if term in text]
+
+
+def _contains_missing_markers(frame: pd.DataFrame) -> bool:
+    if frame.empty:
+        return False
+    text = frame.fillna("").astype(str).to_csv(index=False).lower()
+    return "n/a" in text or "unavailable" in text
+
+
 def _status_counts(root: Path | None) -> dict[str, int]:
     counts: dict[str, int] = {"total": 0}
     if root is None or not root.exists():
@@ -254,7 +365,7 @@ def _table_summary(path: Path, columns: list[str]) -> list[str]:
     rows = [f"- source: `{path}`, rows={len(frame)}"]
     for column in columns:
         if column in frame:
-            counts = frame[column].astype(str).value_counts(dropna=False).head(5)
+            counts = frame[column].fillna("N/A").astype(str).value_counts(dropna=False).head(5)
             rows.append("- " + column + ": " + ", ".join(f"{idx}={value}" for idx, value in counts.items()))
     return rows
 
@@ -267,9 +378,9 @@ def _missing_or_unavailable(final: Path) -> list[str]:
             rows.append(f"- `{csv}`: empty")
             continue
         if "status" in frame:
-            subset = frame[frame["status"].astype(str).isin(["missing", "unavailable", "insufficient_seeds", "not_applicable"])]
+            subset = frame[frame["status"].astype(str).isin(["missing", "unavailable", "warning", "insufficient_seeds", "not_applicable"])]
             if not subset.empty:
-                rows.append(f"- `{csv}`: {len(subset)} missing/unavailable rows")
+                rows.append(f"- `{csv}`: {len(subset)} warning/missing/unavailable rows")
     return rows or ["- none detected in final tables"]
 
 

@@ -83,6 +83,7 @@ stage_dir() {
     sensitivity) echo "$OUTPUT_ROOT/sensitivity" ;;
     cost) echo "$OUTPUT_ROOT/cost" ;;
     seed_stability|evidence_cases|final_artifacts) echo "$OUTPUT_ROOT/final_artifacts" ;;
+    risk_card_cases) echo "$OUTPUT_ROOT/risk_card_cases" ;;
     *) echo "$OUTPUT_ROOT/$1" ;;
   esac
 }
@@ -104,6 +105,31 @@ suite_for_stage() {
 run_cmd() {
   echo "[run] $*"
   "$@"
+}
+
+csv_escape() {
+  local value="${1//\"/\"\"}"
+  printf '"%s"' "$value"
+}
+
+record_failed_run() {
+  local stage="$1"
+  local code="$2"
+  local command="$3"
+  local reason="$4"
+  local failed="$OUTPUT_ROOT/failed_runs.csv"
+  mkdir -p "$OUTPUT_ROOT"
+  if [[ ! -f "$failed" ]]; then
+    echo "stage,exit_code,command,reason" > "$failed"
+  fi
+  {
+    csv_escape "$stage"
+    printf ',%s,' "$code"
+    csv_escape "$command"
+    printf ','
+    csv_escape "$reason"
+    printf '\n'
+  } >> "$failed"
 }
 
 check_missing_commands() {
@@ -167,6 +193,71 @@ run_evidence_cases() {
   local input="$OUTPUT_ROOT/faithfulness"
   if [[ ! -d "$input" ]]; then input="$OUTPUT_ROOT/main"; fi
   run_cmd python scripts/build_evidence_case_table.py --input_dir "$input" --output_dir "$out"
+  run_risk_card_cases
+}
+
+run_risk_card_cases() {
+  local out
+  out="$(stage_dir risk_card_cases)"
+  local final_out
+  final_out="$(stage_dir final_artifacts)"
+  local log_dir="$OUTPUT_ROOT/logs"
+  local log_file="$log_dir/risk_card_cases.log"
+  local datasets=(yelp_academic amazon_video fraud_yelp fraud_amazon elliptic)
+  local build_cmd=(
+    python scripts/build_risk_card_case_table.py
+    --data_root "$DATA_ROOT"
+    --output_dir "$out"
+    --datasets "${datasets[@]}"
+    --source_outputs "$OUTPUT_ROOT"
+    --top_cases_per_dataset 1
+    --include_field_trace
+    --write_latex
+    --write_markdown
+    --copy_to_final_artifacts
+    --final_artifacts_dir "$final_out"
+  )
+  local validate_cmd=(
+    python scripts/validate_risk_card_cases.py
+    --case_dir "$out"
+    --datasets "${datasets[@]}"
+  )
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] ${build_cmd[*]}"
+    echo "[dry-run] ${validate_cmd[*]}"
+    return
+  fi
+  if [[ "$SKIP_EXISTING" -eq 1 \
+    && -f "$out/tables_csv/table_risk_card_cases_compact.csv" \
+    && -f "$out/tables_csv/table_risk_card_field_trace.csv" \
+    && -f "$final_out/tables_csv/supp_table_risk_card_cases_compact.csv" \
+    && -f "$final_out/tables_csv/supp_table_risk_card_field_trace.csv" ]]; then
+    mkdir -p "$log_dir"
+    echo "[skip] risk_card_cases existing outputs found" | tee "$log_file"
+    return
+  fi
+  mkdir -p "$log_dir" "$out" "$final_out"
+  echo "[run] ${build_cmd[*]}" > "$log_file"
+  if "${build_cmd[@]}" >> "$log_file" 2>&1; then
+    :
+  else
+    local code=$?
+    record_failed_run "risk_card_cases" "$code" "${build_cmd[*]}" "build_risk_card_case_table.py failed; see $log_file"
+    echo "[failed] risk_card_cases build exit_code=$code (see $log_file)" >&2
+    if [[ "$CONTINUE_ON_ERROR" -eq 1 ]]; then return 0; fi
+    return "$code"
+  fi
+  echo "[run] ${validate_cmd[*]}" >> "$log_file"
+  if "${validate_cmd[@]}" >> "$log_file" 2>&1; then
+    :
+  else
+    local code=$?
+    record_failed_run "risk_card_cases" "$code" "${validate_cmd[*]}" "validate_risk_card_cases.py failed; see $log_file"
+    echo "[failed] risk_card_cases validate exit_code=$code (see $log_file)" >&2
+    if [[ "$CONTINUE_ON_ERROR" -eq 1 ]]; then return 0; fi
+    return "$code"
+  fi
+  echo "[ok] risk_card_cases (log: $log_file)"
 }
 
 run_final_artifacts() {
@@ -215,6 +306,7 @@ run_stage() {
     sensitivity) run_suite_stage sensitivity sensitivity ;;
     cost) run_suite_stage cost cost ;;
     seed_stability) run_seed_stability ;;
+    risk_card_cases) run_risk_card_cases ;;
     evidence_cases) run_evidence_cases ;;
     final_artifacts) run_final_artifacts ;;
     *) echo "Unknown stage: $1" >&2; exit 2 ;;
