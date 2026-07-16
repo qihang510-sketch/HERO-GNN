@@ -38,6 +38,17 @@ COMPACT_COLUMNS = [
     "field_provenance_summary",
 ]
 
+PAPER_READY_COLUMNS = [
+    "dataset",
+    "target_neighbor_pair",
+    "relation_or_path",
+    "key_evidence",
+    "derived_cues",
+    "mechanism_candidate",
+    "risk_score_or_confidence",
+    "decision",
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build representative risk-card case tables.")
@@ -74,16 +85,19 @@ def build_risk_card_case_table(args: argparse.Namespace) -> dict[str, Path]:
     write_raw_outputs(result, output_dir)
 
     compact = _compact_table(result, args.datasets)
+    paper_ready = _paper_ready_table(result, args.datasets)
     field_trace = _field_trace_table(result)
 
     paths: dict[str, Path] = {}
     paths["selected_cases"] = dirs["raw"] / "selected_cases.jsonl"
     paths["field_traces_raw"] = dirs["raw"] / "risk_card_field_traces.jsonl"
     paths["compact_csv"] = _write_csv(dirs["tables_csv"] / "table_risk_card_cases_compact.csv", compact)
+    paths["paper_ready_csv"] = _write_csv(dirs["tables_csv"] / "table_risk_card_cases_paper_ready.csv", paper_ready)
     if bool(args.include_field_trace):
         paths["field_trace_csv"] = _write_csv(dirs["tables_csv"] / "table_risk_card_field_trace.csv", field_trace)
     if bool(args.write_markdown):
         paths["compact_markdown"] = _write_markdown(dirs["tables_markdown"] / "table_risk_card_cases_compact.md", compact)
+        paths["paper_ready_markdown"] = _write_markdown(dirs["tables_markdown"] / "table_risk_card_cases_paper_ready.md", paper_ready)
         if bool(args.include_field_trace):
             paths["field_trace_markdown"] = _write_markdown(dirs["tables_markdown"] / "table_risk_card_field_trace.md", field_trace)
     if bool(args.write_latex):
@@ -93,6 +107,13 @@ def build_risk_card_case_table(args: argparse.Namespace) -> dict[str, Path]:
             caption="Representative examples of risk-card construction on five datasets.",
             label="tab:risk_card_cases",
             table_kind="compact",
+        )
+        paths["paper_ready_latex"] = _write_latex(
+            dirs["tables_latex"] / "table_risk_card_cases_paper_ready.tex",
+            paper_ready,
+            caption="Paper-ready representative examples of risk-card construction.",
+            label="tab:risk_card_cases_paper_ready",
+            table_kind="paper_ready",
         )
         if bool(args.include_field_trace):
             paths["field_trace_latex"] = _write_latex(
@@ -106,6 +127,7 @@ def build_risk_card_case_table(args: argparse.Namespace) -> dict[str, Path]:
     if bool(args.copy_to_final_artifacts):
         paths["final_artifacts_dir"] = _copy_to_final_artifacts(paths, Path(args.final_artifacts_dir))
     print(f"Compact table: {paths['compact_csv']}")
+    print(f"Paper-ready table: {paths['paper_ready_csv']}")
     if bool(args.include_field_trace):
         print(f"Field trace table: {paths['field_trace_csv']}")
     print(f"Report: {paths['report']}")
@@ -159,6 +181,28 @@ def _field_trace_table(result: ExtractionResult) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=TRACE_COLUMNS)
 
 
+def _paper_ready_table(result: ExtractionResult, datasets: Iterable[str]) -> pd.DataFrame:
+    rows = []
+    for dataset in datasets:
+        case = _selected_case(result.cases, dataset)
+        rows.append(
+            _fill_row(
+                {
+                    "dataset": dataset,
+                    "target_neighbor_pair": _target_neighbor_pair(case),
+                    "relation_or_path": _paper_relation(case),
+                    "key_evidence": _paper_key_evidence(case),
+                    "derived_cues": _paper_derived_cues(case),
+                    "mechanism_candidate": case.get("mechanism_candidate", NA),
+                    "risk_score_or_confidence": _paper_risk_score(case),
+                    "decision": _paper_decision(case),
+                },
+                PAPER_READY_COLUMNS,
+            )
+        )
+    return pd.DataFrame(rows, columns=PAPER_READY_COLUMNS)
+
+
 def _selected_case(cases: list[dict[str, Any]], dataset: str) -> dict[str, Any]:
     dataset_cases = [case for case in cases if str(case.get("dataset")) == str(dataset)]
     for case in dataset_cases:
@@ -210,6 +254,82 @@ def _provenance_summary(case: dict[str, Any]) -> str:
     return _truncate("; ".join(used), 30)
 
 
+def _target_neighbor_pair(case: dict[str, Any]) -> str:
+    if str(case.get("status", "ok")) == "unavailable":
+        return "unavailable"
+    target = _short_id(case.get("target_id", NA))
+    neighbor = _short_id(case.get("neighbor_id", NA))
+    target_label = case.get("target_label", NA)
+    neighbor_label = case.get("neighbor_label", NA)
+    return _truncate(f"{target}({target_label}) -> {neighbor}({neighbor_label})", 8)
+
+
+def _paper_relation(case: dict[str, Any]) -> str:
+    relation = case.get("raw_path_example", NA)
+    if not _is_present(relation):
+        relation = case.get("relation_type", NA)
+    return _truncate(relation, 12)
+
+
+def _paper_key_evidence(case: dict[str, Any]) -> str:
+    if str(case.get("status", "ok")) == "unavailable":
+        return "unavailable"
+    parts: list[str] = []
+    if _is_present(case.get("target_text_summary")) or _is_present(case.get("neighbor_text_summary")):
+        text_pair = f"text={_truncate(case.get('target_text_summary', NA), 8)} / {_truncate(case.get('neighbor_text_summary', NA), 8)}"
+        parts.append(text_pair)
+    if _is_present(case.get("target_rating")) or _is_present(case.get("neighbor_rating")):
+        parts.append(f"rating={case.get('target_rating', NA)}->{case.get('neighbor_rating', NA)}")
+    if _is_present(case.get("target_time")) or _is_present(case.get("neighbor_time")):
+        parts.append(f"time={case.get('target_time', NA)}->{case.get('neighbor_time', NA)}")
+    if _is_present(case.get("same_item_or_business")):
+        parts.append(f"same_item={case.get('same_item_or_business')}")
+    if _is_present(case.get("raw_edge_type")):
+        parts.append(f"edge={case.get('raw_edge_type')}")
+    if not parts:
+        return NA
+    return _truncate("; ".join(parts), 20)
+
+
+def _paper_derived_cues(case: dict[str, Any]) -> str:
+    if str(case.get("status", "ok")) == "unavailable":
+        return "unavailable"
+    candidates = [
+        ("struct", case.get("structural_proximity")),
+        ("conflict", case.get("behavior_conflict_score")),
+        ("conf", case.get("confidence")),
+        ("nbr_fraud", case.get("neighbor_fraud_ratio")),
+        ("common", case.get("common_neighbor_count")),
+        ("susp_paths", case.get("suspicious_path_count")),
+    ]
+    parts = [f"{name}={_compact_number(value)}" for name, value in candidates if _is_present(value)]
+    return "; ".join(parts[:3]) if parts else NA
+
+
+def _paper_risk_score(case: dict[str, Any]) -> str:
+    for name, key in [
+        ("conf", "confidence"),
+        ("score", "selection_score"),
+        ("risk_rel", "risk_relevance"),
+        ("weight", "normalized_risk_weight"),
+    ]:
+        value = case.get(key)
+        if _is_present(value):
+            return f"{name}={_compact_number(value)}"
+    return "unavailable" if str(case.get("status", "ok")) == "unavailable" else NA
+
+
+def _paper_decision(case: dict[str, Any]) -> str:
+    if str(case.get("status", "ok")) == "unavailable":
+        return "unavailable"
+    decision = str(case.get("keep_or_downweight", "")).lower()
+    if decision.startswith("keep"):
+        return "kept"
+    if decision.startswith("downweight") or decision.startswith("down-weight"):
+        return "down-weighted"
+    return "unavailable"
+
+
 def _write_csv(path: Path, frame: pd.DataFrame) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.fillna(NA).replace("", NA).to_csv(path, index=False)
@@ -249,6 +369,12 @@ def _dataframe_to_latex(frame: pd.DataFrame, caption: str, label: str, table_kin
             "p{0.065\\textwidth}p{0.035\\textwidth}p{0.035\\textwidth}"
             "p{0.050\\textwidth}p{0.095\\textwidth}"
         )
+    elif table_kind == "paper_ready":
+        colspec = (
+            "p{0.070\\textwidth}p{0.110\\textwidth}p{0.100\\textwidth}"
+            "p{0.160\\textwidth}p{0.130\\textwidth}p{0.120\\textwidth}"
+            "p{0.090\\textwidth}p{0.080\\textwidth}"
+        )
     else:
         colspec = (
             "p{0.055\\textwidth}p{0.070\\textwidth}p{0.065\\textwidth}"
@@ -270,7 +396,7 @@ def _dataframe_to_latex(frame: pd.DataFrame, caption: str, label: str, table_kin
         "\\midrule",
     ]
     for _, row in table.iterrows():
-        cells = [_latex_escape(_truncate(row[col], 24 if table_kind == "field_trace" else 22)) for col in table.columns]
+        cells = [_latex_escape(_truncate(row[col], _latex_word_limit(table_kind, str(col)))) for col in table.columns]
         lines.append(" & ".join(cells) + r" \\")
     lines.extend(["\\bottomrule", "\\end{tabular}", "\\end{table*}", ""])
     return "\n".join(lines)
@@ -290,10 +416,13 @@ def _write_report(path: Path, result: ExtractionResult, artifact_paths: dict[str
         "selected_cases",
         "field_traces_raw",
         "compact_csv",
+        "paper_ready_csv",
         "field_trace_csv",
         "compact_latex",
+        "paper_ready_latex",
         "field_trace_latex",
         "compact_markdown",
+        "paper_ready_markdown",
         "field_trace_markdown",
     ]:
         if key in artifact_paths:
@@ -321,6 +450,7 @@ def _write_report(path: Path, result: ExtractionResult, artifact_paths: dict[str
                 f"- field sources: {', '.join(str(item) for item in report.get('source_files', ['unavailable']))}",
                 f"- unavailable fields: {unavailable_text or NA}",
                 f"- used Qwen/local LLM annotation: {bool(report.get('qwen_annotation_used', False))}",
+                f"- annotation_source: {_report_annotation_source(report)}",
                 f"- used cached annotations: {bool(report.get('cached_annotation_used', False))}",
                 f"- used HERO risk weights: {bool(report.get('hero_risk_weight_used', False))}",
                 f"- used evidence chains: {bool(report.get('evidence_chain_used', False))}",
@@ -337,8 +467,10 @@ def _copy_to_final_artifacts(paths: dict[str, Path], final_dir: Path) -> Path:
     final_dir.mkdir(parents=True, exist_ok=True)
     mapping = {
         "compact_csv": final_dir / "tables_csv" / "supp_table_risk_card_cases_compact.csv",
+        "paper_ready_csv": final_dir / "tables_csv" / "supp_table_risk_card_cases_paper_ready.csv",
         "field_trace_csv": final_dir / "tables_csv" / "supp_table_risk_card_field_trace.csv",
         "compact_latex": final_dir / "tables_latex" / "supp_table_risk_card_cases_compact.tex",
+        "paper_ready_latex": final_dir / "tables_latex" / "supp_table_risk_card_cases_paper_ready.tex",
         "field_trace_latex": final_dir / "tables_latex" / "supp_table_risk_card_field_trace.tex",
         "report": final_dir / "reports" / "RISK_CARD_CASE_REPORT.md",
     }
@@ -381,7 +513,54 @@ def _truncate(value: Any, max_words: int = 30) -> str:
     words = text.split()
     if len(words) <= max_words:
         return " ".join(words)
-    return " ".join(words[:max_words]) + " ..."
+    keep_words = max(1, int(max_words) - 1)
+    return " ".join(words[:keep_words]) + " ..."
+
+
+def _short_id(value: Any, max_chars: int = 10) -> str:
+    text = str(_cell(value)).strip()
+    if text.lower() in {"n/a", "nan", "none", "<na>", "unavailable", ""}:
+        return NA if text.lower() != "unavailable" else "unavailable"
+    return text[:max_chars]
+
+
+def _is_present(value: Any) -> bool:
+    text = str(_cell(value)).strip()
+    return text.lower() not in {"", "n/a", "nan", "none", "<na>", "unavailable"}
+
+
+def _compact_number(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if pd.isna(number):
+        return NA
+    return f"{number:.3f}".rstrip("0").rstrip(".")
+
+
+def _latex_word_limit(table_kind: str, column: str) -> int:
+    if table_kind == "field_trace":
+        return 24
+    if table_kind == "paper_ready":
+        if column == "key_evidence":
+            return 20
+        if column in {"derived_cues", "relation_or_path"}:
+            return 14
+        return 12
+    return 22
+
+
+def _report_annotation_source(report: dict[str, Any]) -> str:
+    if not bool(report.get("cached_annotation_used", False)):
+        return "unavailable"
+    candidates = [report.get("annotation_source", NA), report.get("selection_source", NA), report.get("selected_case_id", NA)]
+    candidates.extend(report.get("source_files", []) if isinstance(report.get("source_files", []), list) else [report.get("source_files")])
+    candidates.append(report.get("annotation_labeler_version", NA))
+    text = " ".join(str(item).lower() for item in candidates)
+    if "qwen" in text or "local_qwen" in text:
+        return "cached_local_qwen"
+    return "cached_annotation"
 
 
 def _markdown_cell(value: Any) -> str:

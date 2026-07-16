@@ -82,6 +82,7 @@ stage_dir() {
     faithfulness) echo "$OUTPUT_ROOT/faithfulness" ;;
     sensitivity) echo "$OUTPUT_ROOT/sensitivity" ;;
     cost) echo "$OUTPUT_ROOT/cost" ;;
+    main_cost) echo "$OUTPUT_ROOT/main_cost" ;;
     seed_stability|evidence_cases|final_artifacts) echo "$OUTPUT_ROOT/final_artifacts" ;;
     risk_card_cases) echo "$OUTPUT_ROOT/risk_card_cases" ;;
     *) echo "$OUTPUT_ROOT/$1" ;;
@@ -229,8 +230,10 @@ run_risk_card_cases() {
   fi
   if [[ "$SKIP_EXISTING" -eq 1 \
     && -f "$out/tables_csv/table_risk_card_cases_compact.csv" \
+    && -f "$out/tables_csv/table_risk_card_cases_paper_ready.csv" \
     && -f "$out/tables_csv/table_risk_card_field_trace.csv" \
     && -f "$final_out/tables_csv/supp_table_risk_card_cases_compact.csv" \
+    && -f "$final_out/tables_csv/supp_table_risk_card_cases_paper_ready.csv" \
     && -f "$final_out/tables_csv/supp_table_risk_card_field_trace.csv" ]]; then
     mkdir -p "$log_dir"
     echo "[skip] risk_card_cases existing outputs found" | tee "$log_file"
@@ -258,6 +261,68 @@ run_risk_card_cases() {
     return "$code"
   fi
   echo "[ok] risk_card_cases (log: $log_file)"
+}
+
+run_main_cost() {
+  local out
+  out="$(stage_dir main_cost)"
+  local final_out
+  final_out="$(stage_dir final_artifacts)"
+  local log_dir="$OUTPUT_ROOT/logs"
+  local log_file="$log_dir/main_cost.log"
+  local datasets=(yelp_academic amazon_video)
+  local build_cmd=(
+    python scripts/collect_main_experiment_cost.py
+    --source_outputs "$OUTPUT_ROOT" outputs/submission_main_20260711_225137 outputs/review_rerun_20260713_210101
+    --output_dir "$out"
+    --datasets "${datasets[@]}"
+    --suite_names main main_text_rich
+    --write_latex
+    --write_markdown
+    --copy_to_final_artifacts
+    --final_artifacts_dir "$final_out"
+  )
+  local validate_cmd=(
+    python scripts/validate_main_cost_table.py
+    --cost_dir "$out"
+    --datasets "${datasets[@]}"
+  )
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] ${build_cmd[*]}"
+    echo "[dry-run] ${validate_cmd[*]}"
+    return
+  fi
+  if [[ "$SKIP_EXISTING" -eq 1 \
+    && -f "$out/tables_csv/supp_table_main_experiment_cost.csv" \
+    && -f "$out/tables_csv/supp_table_main_experiment_cost_compact.csv" \
+    && -f "$final_out/tables_csv/supp_table_main_experiment_cost.csv" \
+    && -f "$final_out/tables_csv/supp_table_main_experiment_cost_compact.csv" ]]; then
+    mkdir -p "$log_dir"
+    echo "[skip] main_cost existing outputs found" | tee "$log_file"
+    return
+  fi
+  mkdir -p "$log_dir" "$out" "$final_out"
+  echo "[run] ${build_cmd[*]}" > "$log_file"
+  if "${build_cmd[@]}" >> "$log_file" 2>&1; then
+    :
+  else
+    local code=$?
+    record_failed_run "main_cost" "$code" "${build_cmd[*]}" "collect_main_experiment_cost.py failed; see $log_file"
+    echo "[failed] main_cost build exit_code=$code (see $log_file)" >&2
+    if [[ "$CONTINUE_ON_ERROR" -eq 1 ]]; then return 0; fi
+    return "$code"
+  fi
+  echo "[run] ${validate_cmd[*]}" >> "$log_file"
+  if "${validate_cmd[@]}" >> "$log_file" 2>&1; then
+    :
+  else
+    local code=$?
+    record_failed_run "main_cost" "$code" "${validate_cmd[*]}" "validate_main_cost_table.py failed; see $log_file"
+    echo "[failed] main_cost validate exit_code=$code (see $log_file)" >&2
+    if [[ "$CONTINUE_ON_ERROR" -eq 1 ]]; then return 0; fi
+    return "$code"
+  fi
+  echo "[ok] main_cost (log: $log_file)"
 }
 
 run_final_artifacts() {
@@ -305,6 +370,7 @@ run_stage() {
     faithfulness) run_suite_stage faithfulness faithfulness ;;
     sensitivity) run_suite_stage sensitivity sensitivity ;;
     cost) run_suite_stage cost cost ;;
+    main_cost) run_main_cost ;;
     seed_stability) run_seed_stability ;;
     risk_card_cases) run_risk_card_cases ;;
     evidence_cases) run_evidence_cases ;;

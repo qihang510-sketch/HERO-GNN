@@ -28,17 +28,34 @@ def test_synthetic_yelp_case_generates_compact_and_field_trace(tmp_path: Path) -
     build_risk_card_case_table(_args(data_root, out, final))
 
     compact = pd.read_csv(out / "tables_csv" / "table_risk_card_cases_compact.csv", keep_default_na=False)
+    paper_ready = pd.read_csv(out / "tables_csv" / "table_risk_card_cases_paper_ready.csv", keep_default_na=False)
     trace = pd.read_csv(out / "tables_csv" / "table_risk_card_field_trace.csv", keep_default_na=False)
 
     assert set(compact["dataset"]) == set(DATASETS)
+    assert set(paper_ready["dataset"]) == set(DATASETS)
+    assert list(paper_ready.columns) == [
+        "dataset",
+        "target_neighbor_pair",
+        "relation_or_path",
+        "key_evidence",
+        "derived_cues",
+        "mechanism_candidate",
+        "risk_score_or_confidence",
+        "decision",
+    ]
     yelp = compact[compact["dataset"] == "yelp_academic"].iloc[0]
     assert yelp["target_id"] == "yr_target"
     assert yelp["neighbor_id"] == "yr_neighbor"
+    yelp_paper = paper_ready[paper_ready["dataset"] == "yelp_academic"].iloc[0]
+    assert yelp_paper["target_neighbor_pair"].startswith("yr_target")
+    assert len(str(yelp_paper["key_evidence"]).split()) <= 20
     assert "planning_only" not in compact.to_csv(index=False).lower()
     assert "forecast" not in compact.to_csv(index=False).lower()
     assert {"source_column_or_file", "computation_rule"}.issubset(trace.columns)
     assert (trace.groupby("dataset").size() >= 8).all()
     assert (final / "tables_csv" / "supp_table_risk_card_cases_compact.csv").exists()
+    assert (final / "tables_csv" / "supp_table_risk_card_cases_paper_ready.csv").exists()
+    assert (final / "tables_latex" / "supp_table_risk_card_cases_paper_ready.tex").exists()
     assert (final / "tables_latex" / "supp_table_risk_card_field_trace.tex").exists()
 
 
@@ -246,6 +263,22 @@ def _write_minimal_invalid_case_dir(case_dir: Path, forbidden_value: str) -> Non
         ]
     )
     compact.to_csv(case_dir / "tables_csv" / "table_risk_card_cases_compact.csv", index=False)
+    paper_ready = pd.DataFrame(
+        [
+            {
+                "dataset": dataset,
+                "target_neighbor_pair": "yr_target->yr_neighbor",
+                "relation_or_path": "review-user-review",
+                "key_evidence": forbidden_value if dataset == "yelp_academic" else "N/A",
+                "derived_cues": "N/A",
+                "mechanism_candidate": "N/A",
+                "risk_score_or_confidence": "N/A",
+                "decision": "unavailable",
+            }
+            for dataset in DATASETS
+        ]
+    )
+    paper_ready.to_csv(case_dir / "tables_csv" / "table_risk_card_cases_paper_ready.csv", index=False)
     trace_rows = []
     for dataset in DATASETS:
         for idx in range(8):

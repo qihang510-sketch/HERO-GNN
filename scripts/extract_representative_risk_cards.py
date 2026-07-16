@@ -1287,6 +1287,8 @@ def _dataset_report(
         "unavailable_fields": selected.get("unavailable_fields", []),
         "cached_annotation_used": bool(selected.get("cached_annotation_used", False)),
         "qwen_annotation_used": bool(selected.get("qwen_annotation_used", False)),
+        "annotation_source": selected.get("annotation_source", NA),
+        "annotation_labeler_version": selected.get("annotation_labeler_version", NA),
         "hero_risk_weight_used": bool(selected.get("hero_risk_weight_used", False)),
         "evidence_chain_used": bool(selected.get("evidence_chain_used", False)),
         "evidence_files": evidence_files,

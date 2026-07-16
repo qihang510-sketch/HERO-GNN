@@ -8,7 +8,7 @@ This module builds paper-ready case-study tables showing how HERO constructs ris
 - `fraud_amazon`
 - `elliptic`
 
-It is designed for the main paper or supplementary material. The compact table gives one representative target-neighbor case per dataset, while the field trace table records where each risk-card field came from, how it was computed, and what risk meaning it supports.
+It is designed for the main paper or supplementary material. The paper-ready table is the concise AAAI-friendly version, the compact table keeps a fuller one-row-per-dataset summary, and the field trace table records where each risk-card field came from, how it was computed, and what risk meaning it supports.
 
 ## Inputs
 
@@ -29,18 +29,23 @@ The standalone output directory is usually `outputs/risk_card_cases`:
 - `raw/selected_cases.jsonl`
 - `raw/risk_card_field_traces.jsonl`
 - `tables_csv/table_risk_card_cases_compact.csv`
+- `tables_csv/table_risk_card_cases_paper_ready.csv`
 - `tables_csv/table_risk_card_field_trace.csv`
 - `tables_latex/table_risk_card_cases_compact.tex`
+- `tables_latex/table_risk_card_cases_paper_ready.tex`
 - `tables_latex/table_risk_card_field_trace.tex`
 - `tables_markdown/table_risk_card_cases_compact.md`
+- `tables_markdown/table_risk_card_cases_paper_ready.md`
 - `tables_markdown/table_risk_card_field_trace.md`
 - `reports/RISK_CARD_CASE_REPORT.md`
 
 When copied into final artifacts, the supplement files are:
 
 - `outputs/final_artifacts/tables_csv/supp_table_risk_card_cases_compact.csv`
+- `outputs/final_artifacts/tables_csv/supp_table_risk_card_cases_paper_ready.csv`
 - `outputs/final_artifacts/tables_csv/supp_table_risk_card_field_trace.csv`
 - `outputs/final_artifacts/tables_latex/supp_table_risk_card_cases_compact.tex`
+- `outputs/final_artifacts/tables_latex/supp_table_risk_card_cases_paper_ready.tex`
 - `outputs/final_artifacts/tables_latex/supp_table_risk_card_field_trace.tex`
 - `outputs/final_artifacts/reports/RISK_CARD_CASE_REPORT.md`
 
@@ -100,6 +105,8 @@ python scripts/check_final_artifacts.py --output_dir outputs/final_artifacts
 ```
 
 ## How To Read The Tables
+
+The paper-ready table has one row per dataset and keeps only `dataset`, a truncated `target_neighbor_pair`, relation/path, short evidence, 2-3 derived cues, mechanism, score/confidence, and decision. It avoids long provenance fields and is intended for direct paper placement.
 
 The compact table has one row per dataset. It shows the selected target, neighbor, relation or path, key raw fields, derived cues, mechanism candidate, risk relevance, confidence, and provenance summary.
 

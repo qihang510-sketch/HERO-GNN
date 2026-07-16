@@ -55,14 +55,27 @@ REQUIRED_FIGURE_DATA = {
 RISK_CARD_DATASETS = {"yelp_academic", "amazon_video", "fraud_yelp", "fraud_amazon", "elliptic"}
 RISK_CARD_TABLES = {
     "risk card compact": "tables_csv/supp_table_risk_card_cases_compact.csv",
+    "risk card paper-ready": "tables_csv/supp_table_risk_card_cases_paper_ready.csv",
     "risk card field trace": "tables_csv/supp_table_risk_card_field_trace.csv",
 }
 RISK_CARD_LATEX = {
     "risk card compact latex": "tables_latex/supp_table_risk_card_cases_compact.tex",
+    "risk card paper-ready latex": "tables_latex/supp_table_risk_card_cases_paper_ready.tex",
     "risk card field trace latex": "tables_latex/supp_table_risk_card_field_trace.tex",
 }
 RISK_CARD_REPORTS = {
     "risk card report": "reports/RISK_CARD_CASE_REPORT.md",
+}
+MAIN_COST_TABLES = {
+    "main cost detail": "tables_csv/supp_table_main_experiment_cost.csv",
+    "main cost compact": "tables_csv/supp_table_main_experiment_cost_compact.csv",
+}
+MAIN_COST_LATEX = {
+    "main cost detail latex": "tables_latex/supp_table_main_experiment_cost.tex",
+    "main cost compact latex": "tables_latex/supp_table_main_experiment_cost_compact.tex",
+}
+MAIN_COST_REPORTS = {
+    "main cost report": "reports/MAIN_EXPERIMENT_COST_REPORT.md",
 }
 FORBIDDEN_RISK_CARD_TERMS = ["planning_only", "forecast", "not_for_paper"]
 FORBIDDEN_RISK_CARD_DATA_TERMS = ["fake", "manual_example", "fake_example", "example_id", "hard_coded_example"]
@@ -105,6 +118,7 @@ def check_final_artifacts(
     checks.extend(_check_binary_files(final, REQUIRED_FIGURES, kind="figure"))
     checks.extend(_check_csvs(final, REQUIRED_FIGURE_DATA, required_fields=False, kind="figure_data"))
     checks.extend(_check_risk_card_artifacts(final))
+    checks.extend(_check_main_cost_artifacts(final))
 
     status_counts = _status_counts(root)
     tables = _existing_paths(final, "tables_csv", "*.csv")
@@ -114,7 +128,10 @@ def check_final_artifacts(
     robustness = _table_summary(final / "tables_csv" / "supp_table_llm_robustness.csv", ["dataset", "noise_type", "status"])
     faithfulness = _table_summary(final / "tables_csv" / "supp_table_faithfulness.csv", ["dataset", "setting", "status"])
     cost = _table_summary(final / "tables_csv" / "supp_table_cost_scalability.csv", ["dataset", "model", "status"])
-    risk_cards = _table_summary(final / "tables_csv" / "supp_table_risk_card_cases_compact.csv", ["dataset", "status", "mechanism_candidate"])
+    main_cost = _table_summary(final / "tables_csv" / "supp_table_main_experiment_cost_compact.csv", ["Dataset", "Model", "Status"])
+    risk_cards = _table_summary(final / "tables_csv" / "supp_table_risk_card_cases_paper_ready.csv", ["dataset", "decision", "mechanism_candidate"])
+    if not risk_cards:
+        risk_cards = _table_summary(final / "tables_csv" / "supp_table_risk_card_cases_compact.csv", ["dataset", "status", "mechanism_candidate"])
     missing = _missing_or_unavailable(final)
 
     report_path = report_dir / "FINAL_EXPERIMENT_REPORT.md"
@@ -156,6 +173,9 @@ def check_final_artifacts(
                 "",
                 "## Cost Summary",
                 *cost,
+                "",
+                "## Main Experiment Cost Summary",
+                *main_cost,
                 "",
                 "## Risk Card Case Summary",
                 *risk_cards,
@@ -252,6 +272,90 @@ def _check_risk_card_artifacts(final: Path) -> list[dict[str, Any]]:
                 status = "warning"
                 reason = "contains_NA_or_unavailable_fields"
         rows.append({"kind": "risk_card", "label": label, "path": str(path), "status": status, "reason": reason, "rows": ""})
+    return rows
+
+
+def _check_main_cost_artifacts(final: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for label, rel in MAIN_COST_TABLES.items():
+        path = final / rel
+        frame = read_csv_or_empty(path)
+        status = "ok"
+        reason = ""
+        if not path.exists():
+            status = "missing"
+            reason = "file_not_found"
+        elif frame.empty:
+            status = "missing"
+            reason = "empty_csv"
+        else:
+            text = frame.to_csv(index=False).lower()
+            forbidden = _forbidden_terms(text, include_data_terms=True)
+            if forbidden:
+                status = "failed"
+                reason = f"forbidden_terms={','.join(forbidden)}"
+            elif label.endswith("compact"):
+                required = {"Dataset", "Model", "Status"}
+                missing = sorted(required - set(frame.columns))
+                if missing:
+                    status = "failed"
+                    reason = f"missing_columns={missing}"
+                elif "quick" in text or "mock_fallback" in text:
+                    status = "failed"
+                    reason = "quick_or_mock_in_compact"
+                elif "n/a" in text or "unavailable" in text or "runtime_unavailable" in text:
+                    status = "warning"
+                    reason = "contains_NA_or_unavailable_fields"
+            else:
+                required = {"dataset", "model", "status"}
+                missing = sorted(required - set(frame.columns))
+                if missing:
+                    status = "failed"
+                    reason = f"missing_columns={missing}"
+                elif "n/a" in text or "unavailable" in text or "runtime_unavailable" in text:
+                    status = "warning"
+                    reason = "contains_NA_or_unavailable_fields"
+        rows.append({"kind": "main_cost", "label": label, "path": str(path), "status": status, "reason": reason, "rows": len(frame)})
+    for label, rel in MAIN_COST_LATEX.items():
+        path = final / rel
+        status = "ok"
+        reason = ""
+        if not path.exists():
+            status = "missing"
+            reason = "file_not_found"
+        else:
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+            forbidden = _forbidden_terms(text, include_data_terms=False)
+            if forbidden:
+                status = "failed"
+                reason = f"forbidden_terms={','.join(forbidden)}"
+            elif "\\begin{tabular}" not in text:
+                status = "missing"
+                reason = "latex_table_not_detected"
+            elif "n/a" in text or "unavailable" in text:
+                status = "warning"
+                reason = "contains_NA_or_unavailable_fields"
+        rows.append({"kind": "main_cost", "label": label, "path": str(path), "status": status, "reason": reason, "rows": ""})
+    for label, rel in MAIN_COST_REPORTS.items():
+        path = final / rel
+        status = "ok"
+        reason = ""
+        if not path.exists():
+            status = "missing"
+            reason = "file_not_found"
+        else:
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+            forbidden = [term for term in FORBIDDEN_RISK_CARD_TERMS if term in text]
+            if forbidden:
+                status = "failed"
+                reason = f"forbidden_terms={','.join(forbidden)}"
+            elif "cost values are extracted from logged runtime files and cached artifacts" not in text:
+                status = "warning"
+                reason = "integrity_statement_missing"
+            elif "n/a" in text or "unavailable" in text:
+                status = "warning"
+                reason = "contains_NA_or_unavailable_fields"
+        rows.append({"kind": "main_cost", "label": label, "path": str(path), "status": status, "reason": reason, "rows": ""})
     return rows
 
 

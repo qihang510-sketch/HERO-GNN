@@ -36,11 +36,13 @@ def validate_risk_card_cases(case_dir: str | Path, datasets: list[str]) -> list[
     root = Path(case_dir)
     errors: list[str] = []
     compact_path = root / "tables_csv" / "table_risk_card_cases_compact.csv"
+    paper_ready_path = root / "tables_csv" / "table_risk_card_cases_paper_ready.csv"
     trace_path = root / "tables_csv" / "table_risk_card_field_trace.csv"
     cases_path = root / "raw" / "selected_cases.jsonl"
     report_path = root / "reports" / "RISK_CARD_CASE_REPORT.md"
 
     compact = _read_csv(compact_path, errors)
+    paper_ready = _read_csv(paper_ready_path, errors)
     trace = _read_csv(trace_path, errors)
     cases = _read_jsonl(cases_path, errors)
     report = report_path.read_text(encoding="utf-8") if report_path.exists() else ""
@@ -49,6 +51,8 @@ def validate_risk_card_cases(case_dir: str | Path, datasets: list[str]) -> list[
 
     if compact is not None:
         _validate_compact(compact, datasets, errors)
+    if paper_ready is not None:
+        _validate_paper_ready(paper_ready, datasets, errors)
     if trace is not None:
         _validate_trace(trace, datasets, errors)
     _validate_cases(cases, datasets, report, errors)
@@ -86,6 +90,35 @@ def _validate_trace(trace: pd.DataFrame, datasets: list[str], errors: list[str])
         if count < 8:
             errors.append(f"Field trace table has fewer than 8 rows for {dataset}: {count}.")
     _validate_no_blank_cells(trace, "field trace table", errors)
+
+
+def _validate_paper_ready(frame: pd.DataFrame, datasets: list[str], errors: list[str]) -> None:
+    required = {
+        "dataset",
+        "target_neighbor_pair",
+        "relation_or_path",
+        "key_evidence",
+        "derived_cues",
+        "mechanism_candidate",
+        "risk_score_or_confidence",
+        "decision",
+    }
+    missing_columns = sorted(required - set(frame.columns))
+    if missing_columns:
+        errors.append(f"Paper-ready table missing columns: {missing_columns}")
+        return
+    present = set(frame["dataset"].astype(str))
+    missing = sorted(set(datasets) - present)
+    if missing:
+        errors.append(f"Paper-ready table missing datasets: {missing}")
+    for dataset in datasets:
+        count = int((frame["dataset"].astype(str) == dataset).sum())
+        if count != 1:
+            errors.append(f"Paper-ready table should contain exactly one row for {dataset}, found {count}.")
+    invalid_decisions = sorted(set(frame["decision"].astype(str)) - {"kept", "down-weighted", "unavailable"})
+    if invalid_decisions:
+        errors.append(f"Paper-ready table contains invalid decisions: {invalid_decisions}")
+    _validate_no_blank_cells(frame, "paper-ready table", errors)
 
 
 def _validate_cases(cases: list[dict[str, Any]], datasets: list[str], report: str, errors: list[str]) -> None:
@@ -130,10 +163,13 @@ def _validate_no_blank_cells(frame: pd.DataFrame, name: str, errors: list[str]) 
 def _validate_forbidden_terms(root: Path, errors: list[str]) -> None:
     files = [
         root / "tables_csv" / "table_risk_card_cases_compact.csv",
+        root / "tables_csv" / "table_risk_card_cases_paper_ready.csv",
         root / "tables_csv" / "table_risk_card_field_trace.csv",
         root / "tables_latex" / "table_risk_card_cases_compact.tex",
+        root / "tables_latex" / "table_risk_card_cases_paper_ready.tex",
         root / "tables_latex" / "table_risk_card_field_trace.tex",
         root / "tables_markdown" / "table_risk_card_cases_compact.md",
+        root / "tables_markdown" / "table_risk_card_cases_paper_ready.md",
         root / "tables_markdown" / "table_risk_card_field_trace.md",
         root / "raw" / "selected_cases.jsonl",
         root / "raw" / "risk_card_field_traces.jsonl",
